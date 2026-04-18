@@ -80,12 +80,37 @@ TIME_CONSTANT_TABLE = {
     10: "100 s",
 }
 
+# ---------------------------------------------------------------------------
+# Sensitivity index → volts lookup
+# ---------------------------------------------------------------------------
+
+_SENS_VOLTS = [
+    100e-9, 200e-9, 500e-9,        # 0-2:  nV
+    1e-6, 2e-6, 5e-6,              # 3-5:  µV
+    10e-6, 20e-6, 50e-6,           # 6-8:  µV
+    100e-6, 200e-6, 500e-6,        # 9-11: µV
+    1e-3, 2e-3, 5e-3,              # 12-14: mV
+    10e-3, 20e-3, 50e-3,           # 15-17: mV
+    100e-3, 200e-3, 500e-3,        # 18-20: mV
+    1.0, 2.0, 5.0,                 # 21-23: V
+]
+
+
+def sensitivity_index_to_volts(idx: int) -> float:
+    """Convert a sensitivity index (0–23) to its full-scale voltage."""
+    if 0 <= idx < len(_SENS_VOLTS):
+        return _SENS_VOLTS[idx]
+    return 1.0  # safe fallback
+
 
 class SR530Controller:
     """
     RS232 interface to the SR530 Lock-In Amplifier.
 
     All commands are CR-terminated.  Responses are CR-LF terminated.
+
+    Note: this class is not thread-safe.  If you poll from a background
+    thread while sending commands from the main thread, guard with a lock.
     """
 
     def __init__(
@@ -160,8 +185,7 @@ class SR530Controller:
     # ------------------------------------------------------------------
 
     def get_x_output(self) -> float:
-        """Read the X (in-phase) output as a fraction of full-scale (±1.000).
-        Multiply by the current sensitivity to get volts."""
+        """Read the X (in-phase) output as a fraction of full-scale (±1.000)."""
         return self._query_float("Q1")
 
     def get_y_output(self) -> float:
@@ -209,6 +233,10 @@ class SR530Controller:
     def get_sensitivity_label(self) -> str:
         idx = self.get_sensitivity()
         return SENSITIVITY_TABLE.get(idx, f"unknown ({idx})")
+
+    def get_sensitivity_volts(self) -> float:
+        """Return the current full-scale sensitivity in volts."""
+        return sensitivity_index_to_volts(self.get_sensitivity())
 
     # ------------------------------------------------------------------
     # Time constant
@@ -266,45 +294,52 @@ class SR530Controller:
     # Convenience
     # ------------------------------------------------------------------
 
-    def snapshot(self) -> dict:
-        """Read all key parameters at once."""
-        return {
-            "x": self.get_x_output(),
-            "y": self.get_y_output(),
-            "r": self.get_r_output(),
-            "theta": self.get_theta_output(),
-            "frequency": self.get_frequency(),
-            "phase": self.get_phase(),
-            "sensitivity": self.get_sensitivity_label(),
-            "pre_tc": TIME_CONSTANT_TABLE.get(self.get_pre_time_constant(), "?"),
-            "status": self.get_status(),
-        }
-
     def get_x_volts(self) -> float:
         """Return the X output in real volts (fraction × sensitivity)."""
+        return self.get_x_output() * self.get_sensitivity_volts()
+
+    def snapshot(self) -> dict:
+        """
+        Read all key parameters in a single burst.
+
+        Returns a dict with keys:
+            x, y, r          — fraction of full-scale (±1.000)
+            x_v, y_v, r_v   — same values converted to real volts
+            theta            — phase in degrees
+            frequency        — reference frequency in Hz
+            phase            — reference phase setting in degrees
+            sensitivity_idx  — sensitivity index (0–23)
+            sensitivity      — sensitivity label string
+            sensitivity_v    — full-scale sensitivity in volts
+            pre_tc_idx       — pre-filter TC index
+            pre_tc           — pre-filter TC label string
+            status           — raw status byte
+            overloaded       — bool, input overload flag
+            unlocked         — bool, reference unlock flag
+        """
+        x = self.get_x_output()
+        y = self.get_y_output()
+        r = self.get_r_output()
         sens_idx = self.get_sensitivity()
-        # Convert sensitivity label to volts
-        sens_volts = _sensitivity_index_to_volts(sens_idx)
-        fraction = self.get_x_output()
-        return fraction * sens_volts
-
-
-# ---------------------------------------------------------------------------
-# Helper: convert sensitivity index → volts
-# ---------------------------------------------------------------------------
-
-_SENS_VOLTS = [
-    100e-9, 200e-9, 500e-9,        # 0-2:  nV
-    1e-6, 2e-6, 5e-6,              # 3-5:  µV
-    10e-6, 20e-6, 50e-6,           # 6-8:  µV
-    100e-6, 200e-6, 500e-6,        # 9-11: µV
-    1e-3, 2e-3, 5e-3,              # 12-14: mV
-    10e-3, 20e-3, 50e-3,           # 15-17: mV
-    100e-3, 200e-3, 500e-3,        # 18-20: mV
-    1.0, 2.0, 5.0,                 # 21-23: V
-]
-
-def _sensitivity_index_to_volts(idx: int) -> float:
-    if 0 <= idx < len(_SENS_VOLTS):
-        return _SENS_VOLTS[idx]
-    return 1.0  # safe fallback
+        sens_v = sensitivity_index_to_volts(sens_idx)
+        pre_tc_idx = self.get_pre_time_constant()
+        status = self.get_status()
+        return {
+            "x":              x,
+            "y":              y,
+            "r":              r,
+            "x_v":            x * sens_v,
+            "y_v":            y * sens_v,
+            "r_v":            r * sens_v,
+            "theta":          self.get_theta_output(),
+            "frequency":      self.get_frequency(),
+            "phase":          self.get_phase(),
+            "sensitivity_idx": sens_idx,
+            "sensitivity":    SENSITIVITY_TABLE.get(sens_idx, f"unknown ({sens_idx})"),
+            "sensitivity_v":  sens_v,
+            "pre_tc_idx":     pre_tc_idx,
+            "pre_tc":         TIME_CONSTANT_TABLE.get(pre_tc_idx, "?"),
+            "status":         status,
+            "overloaded":     bool(status & 0x04),
+            "unlocked":       bool(status & 0x08),
+        }

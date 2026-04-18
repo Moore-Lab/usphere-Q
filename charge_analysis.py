@@ -49,6 +49,14 @@ if str(_SCRIPTS_PATH) not in sys.path:
 import checkQ as cq
 import openh5 as h5
 
+# ---------------------------------------------------------------------------
+# SR530 submodule path — imported lazily inside _SR530PollThread.run()
+# ---------------------------------------------------------------------------
+
+_SR530_PATH = Path(__file__).parent / "resources" / "SR530_controller"
+if _SR530_PATH.exists() and str(_SR530_PATH) not in sys.path:
+    sys.path.insert(0, str(_SR530_PATH))
+
 
 # ---------------------------------------------------------------------------
 # Abstract base class
@@ -429,12 +437,12 @@ class LockInSource(ChargeStateSource):
 # ---------------------------------------------------------------------------
 
 class _SR530PollThread(QThread):
-    """Background thread: polls SR530 X output over RS232 at a target rate."""
+    """Background thread: polls SR530 via snapshot() over RS232 at a target rate."""
 
-    voltage_ready = pyqtSignal(float)   # X output in real volts
+    snapshot_ready = pyqtSignal(dict)   # full snapshot dict from SR530Controller
     error = pyqtSignal(str)
 
-    def __init__(self, port: str, poll_hz: float = 30.0):
+    def __init__(self, port: str, poll_hz: float = 10.0):
         super().__init__()
         self._port = port
         self._poll_interval = 1.0 / max(poll_hz, 1.0)
@@ -455,8 +463,8 @@ class _SR530PollThread(QThread):
             while self._running:
                 t0 = time.time()
                 try:
-                    volts = lia.get_x_volts()
-                    self.voltage_ready.emit(volts)
+                    snap = lia.snapshot()
+                    self.snapshot_ready.emit(snap)
                 except Exception as e:
                     self.error.emit(f"SR530 read error: {e}")
                     break
@@ -515,7 +523,7 @@ class SR530SerialSource(ChargeStateSource):
         self._running = True
         self._sample_count = 0
         self._thread = _SR530PollThread(self._serial_port, self._poll_hz)
-        self._thread.voltage_ready.connect(self._handle_voltage)
+        self._thread.snapshot_ready.connect(self._handle_snapshot)
         self._thread.error.connect(self._handle_error)
         self._thread.start()
 
@@ -532,31 +540,41 @@ class SR530SerialSource(ChargeStateSource):
 
     # -- internal --
 
-    def _handle_voltage(self, volts: float):
+    def _handle_snapshot(self, snap: dict):
         self._sample_count += 1
-        polarity = 1.0 if volts >= 0 else -1.0
+        x_v = snap["x_v"]          # X output in real volts
+        polarity = 1.0 if x_v >= 0 else -1.0
+        calibrated = self._volts_per_electron > 0 and self._volts_per_electron != 1.0
 
-        if self._volts_per_electron > 0 and self._volts_per_electron != 1.0:
-            n_charges = volts / self._volts_per_electron
+        if calibrated:
+            n_charges = x_v / self._volts_per_electron
         else:
-            n_charges = volts  # uncalibrated — show raw voltage
+            n_charges = x_v        # uncalibrated — show raw voltage
 
         result = {
-            "charge_e": float(n_charges),
-            "polarity": polarity,
-            "charge_pos": float(n_charges),
-            "polarity_phase": polarity,
-            "phase": 0.0,
-            "drive_scale": 1.0,
-            "f0": 0.0,
-            "timestamp": time.time(),
-            "duration": 0.0,
-            "file": f"sample #{self._sample_count}",
-            "calibrated": self._volts_per_electron > 0
-                          and self._volts_per_electron != 1.0,
-            "raw_voltage": float(volts),
-            "raw": None,
-            "_calibration": None,
+            "charge_e":         float(n_charges),
+            "polarity":         polarity,
+            "charge_pos":       float(n_charges),
+            "polarity_phase":   polarity,
+            "phase":            snap["theta"],
+            "drive_scale":      snap["sensitivity_v"],
+            "f0":               snap["frequency"],
+            "timestamp":        time.time(),
+            "duration":         0.0,
+            "file":             f"sample #{self._sample_count}",
+            "calibrated":       calibrated,
+            # raw SR530 voltages
+            "raw_voltage":      x_v,
+            "raw_y_voltage":    snap["y_v"],
+            "raw_r_voltage":    snap["r_v"],
+            # SR530 status
+            "sr530_theta":      snap["theta"],
+            "sr530_frequency":  snap["frequency"],
+            "sr530_sensitivity":snap["sensitivity"],
+            "sr530_overloaded": snap["overloaded"],
+            "sr530_unlocked":   snap["unlocked"],
+            "raw":              snap,
+            "_calibration":     None,
         }
         self._latest = result
         if self._on_result:
@@ -959,7 +977,9 @@ class AnalysisTab(QWidget):
             thread = self._source._thread
             if thread is not None:
                 thread.voltage_ready.connect(
-                    lambda _v: self._on_new_result(self._source.get_latest())
+                    lambda _v: self._on_new_result(
+                        self._source.get_latest() if self._source is not None else None
+                    )
                 )
                 thread.error.connect(self._on_source_error)
 
@@ -987,8 +1007,10 @@ class AnalysisTab(QWidget):
             self._source.start()
             thread = self._source._thread
             if thread is not None:
-                thread.voltage_ready.connect(
-                    lambda _v: self._on_new_result(self._source.get_latest())
+                thread.snapshot_ready.connect(
+                    lambda _snap: self._on_new_result(
+                        self._source.get_latest() if self._source is not None else None
+                    )
                 )
                 thread.error.connect(self._on_source_error)
 
@@ -1038,13 +1060,29 @@ class AnalysisTab(QWidget):
             raw_v = result.get("raw_voltage", q)
             self._charge_lbl.setText(f"{q:+.3f} e")
             self._corr_detail.setText(f"V_x = {raw_v:+.6f} V")
-            self._fft_detail.setText(f"sample #{result.get('file', '—')}")
+            # Show SR530-specific extras when available
+            if isinstance(self._source, SR530SerialSource):
+                sens = result.get("sr530_sensitivity", "—")
+                theta = result.get("sr530_theta", None)
+                overloaded = result.get("sr530_overloaded", False)
+                unlocked = result.get("sr530_unlocked", False)
+                flags = []
+                if overloaded:
+                    flags.append("OVERLOAD")
+                if unlocked:
+                    flags.append("UNLOCKED")
+                flag_str = f"  ⚠ {', '.join(flags)}" if flags else ""
+                theta_str = f"  θ={theta:.1f}°" if theta is not None else ""
+                self._fft_detail.setText(f"{sens}{theta_str}{flag_str}")
+            else:
+                self._fft_detail.setText(result.get("file", "—"))
         else:
             self._charge_lbl.setText(f"~{abs(q):.2e} (raw)")
             self._corr_detail.setText(f"{q:.4e} (raw, no calibration)")
             self._fft_detail.setText(f"{result['charge_pos']:.4e} (raw)")
 
-        self._f0_lbl.setText(f"{result['f0']:.2f} Hz" if result['f0'] > 0 else "—")
+        f0 = result.get("sr530_frequency") or result["f0"]
+        self._f0_lbl.setText(f"{f0:.2f} Hz" if f0 > 0 else "—")
         self._file_lbl.setText(result.get("file", "—"))
 
         # Color by polarity
