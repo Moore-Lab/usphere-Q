@@ -400,11 +400,17 @@ class _PlaceholderTab(QWidget):
 # Main window
 # ---------------------------------------------------------------------------
 
-class MainWindow(QMainWindow):
-    def __init__(self):
+class ChargeWidget(QWidget):
+    """
+    Embeddable charge-control panel.
+
+    Pass *controller*, *flashlamp*, *filament* to share actuator state
+    with a running QServer instance.  When omitted they are created
+    internally for standalone use.
+    """
+
+    def __init__(self, controller=None, flashlamp=None, filament=None):
         super().__init__()
-        self.setWindowTitle("usphere Charge Control")
-        self.resize(800, 680)
 
         saved = _load_last_configs()
         self._connections_tab = ConnectionsTab(saved)
@@ -474,7 +480,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._calibration_tab, "Calibration")
         tabs.addTab(self._experiment_tab,  "Experiment")
 
-        self.setCentralWidget(tabs)
+        QVBoxLayout(self).addWidget(tabs)
 
     def _sync_actuators(self):
         """Keep the controller's actuator references in sync with connections."""
@@ -507,6 +513,21 @@ class MainWindow(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 
+class ChargeWindow(QMainWindow):
+    """Standalone window wrapper for ChargeWidget."""
+
+    def __init__(self, controller=None, flashlamp=None, filament=None):
+        super().__init__()
+        self.setWindowTitle("usphere Charge Control")
+        self.resize(800, 680)
+        self._widget = ChargeWidget(
+            controller=controller,
+            flashlamp=flashlamp,
+            filament=filament,
+        )
+        self.setCentralWidget(self._widget)
+
+
 def main():
     try:
         import ctypes
@@ -518,7 +539,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    win = MainWindow()
+    win = ChargeWindow()
     win.show()
     sys.exit(app.exec_())
 
