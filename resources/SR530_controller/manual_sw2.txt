@@ -1,0 +1,2009 @@
+
+
+===== PDF PAGE 4 =====
+ii
+Circuit Description
+Introduction
+34
+Signal Amplifier
+34
+Current Amplifier
+34
+Notch Filters
+34
+Bandpass Filter
+34
+Reference Oscillator
+35
+PSD, LP Filters and DC Amplifier
+35
+Analog Output
+36
+A/D's
+36
+D/A's
+36
+Expand 
+36
+Front Panel
+36
+Microprocessor Control
+36
+RS232 Interface
+37
+GPIB Interface
+37
+Power Supplies
+37
+Internal Oscillator
+37
+Calibration and Repair
+Introduction
+38
+Multiplier Adjustments
+38
+Amplifier and Filter Adjustments
+38
+CMRR Adjustment
+38
+Line Notch Filter Adjustment
+39
+2xLine Notch Filter Adjustment
+39
+Repairing Damaged Front-End
+39
+Appendix A: Noise Sources and Cures
+Johnson Noise
+40
+'1/f' Noise
+40
+Noise Spectrum
+40
+Capacitive Coupling
+41
+Inductive Coupling
+41
+Ground Loops
+42
+Microphonics
+42
+Thermocouple Effect
+42
+Appendix B: RS232
+Simplest Case Using the RS232
+43
+Using Control Lines
+43
+Baud Rates
+43
+Stop Bits
+44
+Parity
+44
+Voltage Levels
+44
+'Eavesdropping'
+44
+Appendix C: GPIB
+Introduction to the GPIB
+45
+Bus Description
+45
+Appendix D: Program Examples
+Program Description
+46
+IBM PC, Microsoft Basic, via RS232
+46
+IBM PC, Microsoft Fortran, via RS232
+47
+IBM PC, Microsoft C, via RS232
+49
+IBM PC, Microsoft Basic, via GPIB
+51
+HP-85, HP Basic, via HPIB
+53
+Documentation
+Parts List, Oscillator Board
+55
+Parts List, Main Board
+56
+Parts List, Front Panel Board
+70
+Parts List, Quad Board
+73
+Parts List, Miscellaneous
+77
+Schematic Diagrams
+79
+
+
+===== PDF PAGE 8 =====
+4
+Acquisition Time
+25 Sec at 1 Hz
+6 Sec at 10 Hz
+2 Sec at 10 kHz
+Slew Rate 
+1 decade per 10 S at 1 kHz
+Phase Control
+90° shifts
+Fine shifts in 0.025° steps
+Phase Noise
+0.01° rms at 1 kHz, 100 msec, 12 dB TC
+Phase Drift
+0.1°/°C
+Phase Error
+Less than 1° above 10Hz
+Orthogonality
+90° ± 1°
+Demodulator
+Stability
+5 ppm/°C on LOW dynamic reserve
+50 ppm/°C on NORM dynamic reserve
+500 ppm/°C on HIGH dynamic reserve
+Time Constants
+Pre:
+1msec to 100 sec (6 dB/Octave)
+Post:
+1sec, 0.1 sec, none (6 dB/Octave) or none
+Offset
+Up to 1X full scale (10X on expand)
+Both channels may be offset
+Harmonic Rej
+-55 dB (bandpass filter in)
+Outputs & Interfaces
+Channel 1 Outputs   
+X (RcosØ), X Offset, R (magnitude), R Offset, X Noise, X5 (external D/A)
+Channel 2 Outputs
+Y (RsinØ), Y Offset, Ø (phase shift of signal), Y Noise, X6 (external D/A)
+Output Meters
+2% Precision mirrored analog meter
+Output LCD's
+Four digit auto-ranging LCD display shows same values as the analog meters
+Output BNC's
+±10 V output corresponds to full scale input, <1Ω output impedance
+X Output
+X (RcosØ), ±10 V full scale, < 1Ω output impedance
+Y Output
+Y (RsinØ), ±10 V full scale, < 1Ω output impedance
+Reference LCD
+Four digit LCD display for reference phase shift or frequency
+RS232 
+Interface controls all functions.  Baud rates from 300 to 19.2 K
+GPIB
+Interface controls all functions. ( IEEE-488 Std )
+A/D
+4 BNC inputs with 13 bit resolution (±10.24 V)
+D/A
+2 BNC outputs with 13 bit resolution (±10.24 V)
+Ratio
+Ratio output equals 10X Channel 1 output divided by the Denominator input.
+Internal Oscillator
+Range:
+1 Hz to 100 kHz, 1% accuracy
+Stability:
+150 ppm/°C
+Distortion:
+2% THD
+Amplitude: 1% accuracy, 500 ppm/°C stability
+
+
+===== PDF PAGE 12 =====
+ 
+ 
+8
+Status Byte Definition 
+ 
+Bit Meaning 
+ 
+ 0 Magnitude too small to calculate 
+ 
+phase 
+ 1 Command Parameter is out-of-range 
+ 2 No detectable reference input 
+ 3 PLL is not locked to the reference 
+ 4 Signal Overload 
+ 5 Auto-offset failed: signal too large 
+ 6 SRQ generated 
+ 7 Unrecognized or illegal command 
+ 
+ 
+Configuration Switches
+ 
+There are two banks of 8 switches, SW1 and 
+SW2, located on the rear panel.  SW1 sets the 
+GPIB address and SW2 sets the RS232  
+parameters.  The configuration switches are read 
+continuously and any changes will be effective 
+immediately. 
+ 
+SW1:GPIB Mode Switches 
+ 
+Bit Example 
+Function 
+ 
+1 } up  
+ 
+GPIB Address Switches 
+2 } up  
+ 
+Address 0 to 30 allowed 
+3 } up  
+ 
+'up' for bit = 1 
+4 } down 
+ 
+'down' for bit = 0 
+5 } up  
+ 
+(Most Significant Bit)  
+  
+6 
+down 
+ 
+'down' to echo on RS232    
+ 
+ 
+ 
+ 
+(normally 'up') 
+ 
+7 
+up  
+ 
+Not Used 
+8 
+up  
+ 
+Not Used 
+ 
+ 
+If the GPIB mode switches are set as shown in the 
+example column above, then the lockin will be 
+addressed as GPIB device #23, and all GPIB 
+commands and data will be echoed over the 
+RS232 for de-bugging purposes. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+SW2:RS232  Mode Switches 
+ 
+Bit 1 
+Bit 2 
+Bit 3 
+Baud Rate 
+ 
+up  
+up  
+up  
+19200 
+down 
+up  
+up  
+9600 
+up  
+down 
+up  
+4800 
+down 
+down 
+up  
+2400 
+up  
+up  
+down 
+1200 
+down 
+up  
+down 
+600 
+up  
+down 
+down 
+300 
+ 
+ 
+Bit  
+Setting  
+Explanation 
+ 
+4 
+ 
+up  
+ 
+Odd parity 
+ 
+ 
+down 
+ 
+Even parity 
+ 
+5 
+ 
+up  
+ 
+No parity 
+ 
+ 
+down 
+ 
+Parity enabled 
+ 
+6 
+ 
+up  
+ 
+No echo (for computer) 
+ 
+ 
+down 
+ 
+Echo mode (for terminal)  
+ 
+7 
+ 
+up  
+ 
+Two stop bits 
+ 
+ 
+down 
+ 
+One stop bit 
+ 
+8 
+ 
+ 
+ 
+ 
+unused 
+ 
+Eight data bits are always sent, regardless of the 
+parity setting.  The most significant bit is always  
+zero. 
+ 
+Example:  Bit 1 'down' and all others 'up' for 
+RS232 communication at 9600 baud, no parity, 
+two stop bits, and no echo or prompts by the 
+SR530. 
+ 
+ 
+
+
+===== PDF PAGE 21 =====
+17
+SR530 Guide to Operation
+Rear Panel
+AC Power
+The ac line voltage selector card, line fuse, and
+line cord receptacle are located in the fuse holder
+at the left side of the rear panel.  See the section,
+Preparation for Use at the front of this manual for
+instructions on setting the ac voltage selector and
+choosing the correct fuse.
+GPIB Connector
+The SR530 has an IEEE 488 (GPIB) interface built
+in.  The GPIB address is set using SW1 located to
+the right of the interface connectors.  Refer to
+page 7 for switch setting details.
+RS232 Connector
+The SR530 has an RS232 interface.  The
+connector is configured as a DCE.  The baud rate,
+parity, stop bits, and echo mode are selected
+using SW2 located to the right of the interface
+connectors.  Refer to Page 7 for switch setting
+details.
+Signal Monitor Output
+This BNC provides the buffered output of the
+signal amplifiers and filters.  This is the signal just
+before the demodulator.  The output impedance is
+<1Ω.  When a full scale input is applied, the peak-
+to-peak amplitude at this output is 20 mV, 200 mV
+or 2 V for dynamic reserve settings of high, norm,
+and low, respectively.
+Preamp Connector
+This 9 pin "D" connector provides power and
+control signals to external peripherals such as pre-
+amplifiers.  The available power is described
+below.
+Pin
+Voltage Current Available
+1
++20
+100 mA
+2
++5
+10 mA
+6
+-20
+100 mA
+7
+Signal ground
+8
+Digital ground
+General Purpose A/D and D/A
+There are four analog input ports, labeled X1
+through X4.  These inputs may be digitized and
+read via the computer interfaces.  The range is -
+10.24 V to +10.24 V and the resolution is 2.5 mV.
+The input impedance is 1 MΩ.  A digitization can
+be performed in about 3 mS but the result may
+take longer to transmit over the interface being
+used.
+There are two analog output ports, labeled X5 and
+X6.  The voltages at these ports may be
+programmed via the computer interfaces.  The
+range is -10.24 V to +10.24 V and the resolution is
+2.5 mV.  The output impedance is <1Ω and the
+output current is limited to 20 mA.
+Ratio
+Output X5 is the ratio output when not
+programmed by the computer interface or set via
+the front panel.  X5 becomes the ratio output
+whenever the unit is turned on.
+The voltage at X5 is the ratio of the Channel 1
+Output to the analog voltage at port X1.  An output
+of 10 V corresponds to a ratio of 1.  The ratio is
+computed by digitizing the Channel 1 Output and
+the voltage at port X1 and then taking the ratio.
+The resolution is 2.5 mV.  For best accuracy, the
+sensitivity should be set to provide at least a 50%
+full scale signal and the analog denominator (X1)
+should be 5V or greater.  The ratio is updated
+approximately every 3 mS.  For the Ratio feature
+to work, the voltage at the denominator input must
+exceed 40 mV.
+When the DISPLAY is set to D/A, the ratio output
+is 10 times the magnitude, R, divided by X1.
+Internal Oscillator
+The INTERNAL OSCILLATOR is a voltage
+controlled oscillator with a sine wave output .  To
+use the oscillator as the reference source, connect
+
+
+===== PDF PAGE 23 =====
+19
+SR530 Guide to
+Programming
+The SR530 Lock-in Amplifier is remotely
+programmable via both RS232 and GPIB
+interfaces.  It may be used with laboratory
+computers or simply with a terminal.  All front
+panel features (except signal input selection and
+power) may be controlled and read via the
+computer interfaces.  The SR530 can also read
+the analog outputs of other laboratory instruments
+using its four general purpose analog input ports.
+There are also two programmable analog output
+ports available to provide general purpose control
+voltages.
+Communicating with the SR530
+Before using either the RS232 or GPIB interface,
+the appropriate configuration switches need to be
+set.  There are two banks of 8 switches, SW1 and
+SW2, located on the rear panel.  SW1 sets the
+GPIB address and SW2 sets the RS232
+parameters.  The configuration switches are read
+continuously and any changes will be effective
+immediately.  For details on switch settings, see
+page 7 at the front of this manual.
+Command Syntax
+Communications with the SR530 use ASCII
+characters.  Commands to the SR530 may be in
+either UPPER or lower case.
+A command to the SR530 consists of one or two
+command letters, arguments or parameters if
+necessary, and an ASCII carriage return (<cr>) or
+line-feed (<lf>) or both.  The different parts of the
+command do not need to be separated by spaces.
+If spaces are included, they will be ignored.  If
+more than one parameter is required by a
+command,  the parameters must be separated by
+a comma.  Examples of commands are:
+G 5 <cr>
+set the sensitivity to 200 nV
+T 1,4 <cr>
+set the pre filter to 30 mS
+F <cr>
+read the reference frequency
+P 45.10 <cr>
+set phase shift to 45.10¡
+X 5,-1.23E-1 <cr>
+set port X5 to -0.123 V
+Multiple commands may be sent on a single line.
+The commands must be separated by a semicolon
+(;) character.  The commands will not be executed
+until the terminating carriage return is sent.
+An example of a multiple command is:
+G 5; T 1,4; P 45.10 <cr>
+It is not necessary to wait between commands.
+The SR530 has a command input buffer of 256
+characters and processes the commands in the
+order received.  Likewise, the SR530 has an
+output buffer (for each interface) of 256
+characters.
+In general, if a command is sent without
+parameters, it is interpreted as a request to read
+the status of the associated function or setting.
+Values returned by the SR530 are sent as a string
+of ASCII characters terminated usually by carriage
+return, line-feed.  For example, after the above
+command is sent, the following read commands
+would generate the responses shown below.
+Command
+Response from the SR530
+G <cr>
+5<cr><lf>
+T 1 <cr>
+4<cr><lf>
+P <cr>
+45.10<cr><lf>
+The choice of terminating characters sent by the
+SR530 is determined by which interface is being
+used and whether the 'echo' feature is in use.  The
+terminating sequence for the GPIB interface is
+always <cr><lf> (with EOI).  The default sequence
+for RS232 is <cr> when the echo mode is off, and
+<cr><lf> when the echo mode is on.  The
+terminating sequence for the RS232 interface may
+be changed using the J command.
+Note that the terminating characters are sent with
+each value returned by the SR530.  Thus, the
+response to the command string G;T1;P<cr> while
+using the RS232 non-echo mode would be
+5<cr>4<cr>45.10<cr>.
+Front Panel Status LED's
+The ACT LED flashes whenever the SR530 is
+sending or receiving characters over the computer
+interfaces.
+The ERR LED flashes whenever an error has
+occurred, such as, an illegal command has been
+received, a parameter is out of range, or a
+communication buffer has exceeded 240
+characters.  This LED flashes for about three
+seconds on power-up if the battery voltage is
+insufficient to retain previous instrument settings.
+
+
+===== PDF PAGE 24 =====
+20
+The REM LED is on whenever the SR530 is
+programmed to be in the remote state.
+RS232 Echo and No Echo
+Operation
+In order to allow the SR530 to be operated from a
+terminal, an echo feature has been included which
+causes the unit to echo back commands received
+over the RS232 port.  This feature is enabled by
+setting switch 6 on SW2 to the DOWN position.  In
+this mode, the SR530 will send line-feeds in
+addition to carriage returns with each value
+returned and will also send the prompts 'OK>' and
+'?>' to indicate that the previous command line
+was either processed or contained  an error.
+Operating the SR530 from a terminal is an ideal
+way to learn the commands and responses before
+attempting to program a computer to control the
+SR530.  When the unit is controlled by a
+computer, the echo feature should be turned off to
+prevent the sending of spurious characters which
+the computer is not expecting.
+Try-Out with an ASCII Terminal
+Before attempting any detailed programming with
+the SR530, it is best to try out the commands
+using a terminal.  Connect a terminal with an
+RS232 port to the RS232 connector on the rear
+panel of the SR530.  A 'straight' RS232 cable is
+required since the SR530 is a DCE and the
+terminal is a DTE.  Set the baud rate, parity, and
+stop bits to match the terminal by setting SW2 per
+the switch setting table given on page 7.  The
+echo mode should be enabled (switch 6 DOWN).
+After setting SW2 and connecting the terminal,
+hold down the LOCAL key while turning the unit
+on.  This causes the SR530 to assume its default
+settings so that the following discussion will agree
+with the actual responses of the SR530.  The ACT
+and ERR LED's on the front panel will flash for a
+second and the sign-on message will appear on
+the terminal.  Following the message, the prompt
+'OK>' will be displayed.  This indicates that the
+SR530 is ready to accept commands.
+Type the letter 'P' followed by a carriage return
+(P<cr>).  The SR530 responds by sending to the
+terminal the characters 0.00 indicating that the
+phase is set to 0 degrees.  In general, a command
+with no arguments or parameters reads a setting
+of the unit.  To set the phase to 45 degrees, type
+the command, P45<cr>.  To see that the phase
+did change, use the SELECT key on the front
+panel to display the phase on the REFERENCE
+DIGITAL DISPLAY.  Typing the phase read
+command, P<cr>, will now return the string 45.00
+to the terminal.
+Now read the gain using the sensitivity read
+command, G<cr>.  The response should be 24
+meaning that the sensitivity is at the 24th setting or
+500 mV.  Change the sensitivity by typing
+G19<cr>.  The sensitivity should now be 10 mV.
+Check the front panel to make sure this is so.
+The Channel 1 Output of the lock-in is read by
+typing the command, Q1<cr>.  The response is a
+signed floating point number with up to 5
+significant digits plus a signed exponent.  Change
+the gain to 10 uV using the G10 command.  The
+response to the Q1 command will now be similar
+to the previous one except that the exponent is
+different.
+Attach a DC voltmeter to the X6 output on the rear
+panel.  The range should allow for 10V readings.
+The voltage at the X6 output can be set using the
+X6 command.  Type X6,5.0<cr> and the X6 output
+will change to 5.0V.  To read this back to the
+terminal, just type X6<cr>.  When setting the X6
+voltage, the voltage may be sent as an integer (5),
+real (5.000), or floating point (0.500E1) number.
+Now connect the X6 output to the X1 input (also
+on the rear panel).  X1 through X4 are analog
+input ports.  To read the voltage on X1, simply
+type X1<cr>.  The response 5.000 should appear
+on the terminal.  The analog ports X1 through X6
+can be used by your computer to read outputs of
+other instruments as well as to control other
+laboratory parameters.
+At this point, the user should experiment with a
+few of the commands.  A detailed command list
+follows.
+
+
+===== PDF PAGE 29 =====
+25
+characters again.
+Reset
+The Z command resets the unit to its default state.
+The default front panel settings are listed in the
+DEFAULTS section of the Guide to Operations.
+In addition, the interface status returns to LOCAL,
+the SRQ mask is cleared, the RS232 character
+WAIT interval is set to 6, and the terminating
+sequence is reset to the proper defaults.
+The command and output buffers are cleared by
+the Z command.  Therefore, it is bad practice to
+use the Z command before all previous commands
+have been processed and all responses have
+been received.
+Trouble-Shooting Interface
+Problems
+If you are having difficulty getting your computer to
+communicate with the SR530 look to the sections
+on the RS232 and GPIB interfaces for some tips
+specific to your particular interface.
+An ASCII terminal is a valuable aid for debugging
+interface problems.  You can use it to:
+1) 
+become familiar with the SR530's
+command structure,
+2) 
+see GPIB bus transactions by using the
+GPIB echo mode,
+3) 
+eavesdrop on transactions when using the
+RS232 interface,
+4) 
+substitute a human for the SR530 by using
+a null modem cable ( to make the DTE a
+DCE) and  attaching the terminal to the
+port to which  you would normally have
+connected the SR530.  This allows you to
+test your program's responses to inputs
+which you provide from the terminal.
+Common Hardware Problems include:
+1) 
+The RS232 or GPIB cables are not
+properly attached.
+2) 
+The configuration switches for the RS232
+characteristics or GPIB address are not
+set correctly (Make sure the RS232 echo
+is off when using the RS232 interface with
+a computer.  The GPIB with RS232 echo
+mode should be off when not debugging
+the GPIB interface.)
+3) 
+Your computer requires an RS232 control
+line to be asserted, but your cable does
+not pass it between the SR530 and the
+computer, or,  your computer is not
+asserting the DTR line on the RS232.
+Common Software Problems include:
+1) 
+You have sent the wrong command to ask
+for data from the SR530.  Your program
+will wait forever for a response which is
+not going to come.  This may not be your
+fault; we have seen Microsoft's Interpreted
+Basic on the IBM PC occasionally send a
+curly bracket (ASCII 253) when it was
+supposed to have sent a carriage return
+(ASCII 13).
+2) 
+Your computer's baud rate has been
+changed and no longer matches the
+SR530's baud rate.
+3) 
+The initial command sent to the SR530
+was invalid due to a garbage character left
+in the command queue from power-up, or,
+the first character in you computer's UART
+is garbage, also due to power-up.  It is
+good practice to send a few carriage
+returns to the SR530 when your program
+begins, and have your program clear-out
+its UART at the start of your program.
+4) 
+The SR530 is not sending the correct
+'end-of- record' marker for your computer.
+For example, it appears that Microsoft's
+Rev 3.2 FORTRAN on the IBM PC under
+DOS 2.1 requires two carriage returns for
+an end-of-record marker.  The J command
+can be used to set the SR530 end-of-
+record marker to 2 carriage returns.  [The
+end-of-record marker is that sequence
+which indicates that the response is
+complete.  From the keyboard, a single
+carriage return is the end-of-record
+marker.]
+5) 
+Answers are coming back from the SR530
+too fast, overwriting the end-of-record
+markers, and causing the computer to
+hang waiting for a complete response.  In
+this case, the W command can be used to
+slow down the response time of the
+SR530 preventing overwriting.
+
+
+===== PDF PAGE 30 =====
+26
+6) 
+Answers are coming back from the SR530
+too slowly due to the W6 default setting for
+the character interval time.  Use the W
+command to speed up the transmission
+from the SR530.  This can cause
+problems for the GPIB interface if the echo
+mode is on (switch 6 of SW1).
+The SR530 with the RS232
+Interface
+The RS232 is a popular serial interface standard
+for bit serial communication.  Despite the
+existence of the standard there are many
+permutations of control lines, baud rates, and data
+formats.  If you do not have a lot of experience
+interfacing RS232 equipment you should read
+Appendix B for a description of the RS232 and
+interfacing tips.
+Data Communications Equipment
+(DCE)
+The SR530 is configured as DCE so that it may be
+connected directly to a terminal.  If the SR530 is to
+be interfaced with another DCE device, a special
+cable (sometimes referred to as a 'modem' cable)
+is required.  To use the RS232 interface you must
+set the switches in SW2 to match your computer's
+baud rate, parity, and number of stop bits.  Refer
+to Page 7 for details.
+Wait Command
+The SR530 normally waits until the RS232 'Clear
+to Send' control line (CTS) is asserted before
+sending characters.  However, some computers
+do not set and reset the CTS line, possibly
+causing the SR530 to send data when the
+computer is not ready to read it.  The SR530 may
+be 'slowed down' using the W command.  Sending
+'Wn' causes the unit to wait nx4 mS before
+sending each character over the RS232 bus.  The
+command W0 sets the wait interval to zero and
+results in the fastest transmission.  The wait
+interval is set to 6 (24 mS)on power-up.
+Termination Sequences
+The default RS232 termination characters are
+sufficient to interface with most computers,
+however, it will occasionally be necessary to send
+special terminating sequences to fit the
+requirements of some computers.  This can be
+done with the J command.  The format for the
+command is:
+J {n1,n2,n3,n4}
+where n1, n2, n3, and n4 are decimal values
+between 0 and 255 corresponding to the ASCII
+codes of the desired termination characters.  For
+instance, if the desired termination sequence is an
+asterisk, (ASCII 42), two carriage returns, (ASCII
+13), and a line-feed, (ASCII 10), the appropriate
+command is:
+J 42,13,13,10
+If a G command is sent requiring an answer of 24
+(sensitivity = 500  mV), the SR530 would respond
+with the string
+24*<cr><cr><lf>
+Up to four terminating characters may be specified
+by the J command.  If no arguments are sent with
+the J command, the terminating sequence returns
+to the default (echo on: <cr><lf>; echo off: <cr>).
+The J command does not affect the terminating
+character (<cr>) required at the end of commands
+received by the SR530.  It also does not affect the
+terminating sequence sent with data over the
+GPIB interface.
+The SR530 with the GPIB
+Interface
+For a brief introduction to the GPIB standard,
+please read Appendix C at the back of this
+manual.  Before using the GPIB interface you
+must set the switches in SW1 per the instructions
+on page 7.
+GPIB Capabilities
+The GPIB capabilities of the SR530 consistent
+with IEEE standard 488 (1978) are shown in the
+table below.  Also shown are the responses of the
+SR530 to some standard commands.
+Code
+Function
+SH1
+Source handshake capability
+AH1
+Acceptor handshake capability
+T5
+Basic Talker, Serial Poll, Unaddressed to
+talk if addressed to listen
+L4
+Basic Listener, Unaddressed to listen if
+addressed to talk
+SR1
+Service request capability
+PP0
+No parallel poll capability
+
+
+===== PDF PAGE 31 =====
+27
+DC1
+Device Clear capability
+RL0
+REN,LLO, GTL not implemented.
+'I' command sets Remote-Local.
+SR530 Response to GPIB Commands
+Mnemonic
+Command
+Response
+DCL
+Device Clear
+Same as Z command
+SDC
+Selected
+Same as Z command
+Device Clear
+SPE
+Serial Poll
+Send Status Byte,
+Enable
+& clear status byte
+Because the SR530 can be controlled by an
+RS232 interface as well as the GPIB, the remote-
+local functions are not standard.  There is no local
+with lock out state.  When in the local state,
+remote commands are processed, even without
+the REN command being issued.  This is because
+the RS232 interface has no provision for bus
+commands and remote commands over the
+RS232 interface would never be enabled.
+Serial Polls and Service Requests
+The status byte sent by the SR530 when it is serial
+polled is the same status byte which is read using
+the Y command (except for bit 6, SRQ).  Ofcourse,
+when the SR530 is serial polled, it does not
+encode the status byte as a decimal number.  The
+SR530 can be programmed to generate a service
+request (SRQ) to the GPIB controller every time a
+given status condition occurs.  This is done using
+the V{n} command.  The mask byte, n (0-255), is
+the SRQ mask byte.  The mask byte is always
+logically ANDED with the status byte. If the result
+is non-zero, the SR530 generates an SRQ and
+leaves the status byte unchanged until the
+controller performs a serial poll to determine the
+cause of the service request.  When the unit has
+been serial polled, the status byte is reset to
+reflect all of the status conditions which have
+occurred since the SRQ was generated.
+For example, if we want to generate an SRQ
+whenever there is an overload or unlock condition,
+we need an SRQ mask byte equal to 00011000
+binary, or 24 decimal ("V24" command).  The byte
+00011000 binary corresponds to the status byte
+with the 'no reference' and 'unlock' status bits set.
+If an overload occurs, then an SRQ will be
+generated.  The serial poll will return a status byte
+showing SRQ and overload.  If an unlock condition
+occurs before the serial poll is concluded, another
+SRQ will be generated as soon as the serial poll is
+finished.  A second serial poll will reflect the unlock
+condition.
+Any SRQ generated by the 'no reference, 'unlock',
+'overload', and 'auto over-range' conditions will
+also reset the corresponding bit in the SRQ mask
+byte.  This is to prevent a constant error condition
+(such as no reference applied to the input) from
+continually interrupting the controller.  When such
+an SRQ occurs, the controller should change
+some parameter so as to solve the problem, and
+then re-enable the SRQ mask bit again using the
+V command.
+GPIB with RS232 Echo Mode
+It is sometimes useful when debugging a GPIB
+system to have some way of monitoring exactly
+what is going back and forth over the bus.  The
+SR530 has the capability to echo all characters
+sent and received over the GPIB to its RS232 port.
+This mode of operation is enabled by setting
+switch 6 of SW1 to the DOWN position.  The baud
+rate, stop bits, and parity of the RS232 port are
+still set by SW2.  Of course, the RS232 port
+operates at much lower speeds than the GPIB and
+will slow down the GPIB data rate in this mode.
+(Use the W0 command to allow the RS232
+interface to run at full speed, otherwise, the GPIB
+transactions may take so long that the controller
+can hang.)  During actual use, this mode should
+be disabled.
+The SR530 with BOTH Interfaces
+If both interfaces are connected, commands may
+be received from either interface.  Responses are
+always sent to the source of the request (except in
+GPIB echo mode).  It is unwise to send commands
+from the two interfaces at the same time since the
+characters from different sources can become
+interleaved on the command queue and result in
+'unrecognized command' errors.
+
+
+===== PDF PAGE 40 =====
+36
+U419.  Analog switch U418 selects the time constant
+and gain.  The full scale output of U418 is 5 volts.
+The quadrature demodulator and low pass amplifiers
+are identical to that described above.  The
+quadrature detector output is provided by U1119.
+Analog Output and Control
+The dc output of the demodulator/low pass
+amplifiers is passed to the reference input of
+multiplying DAC U502.  The DAC is programmed
+with the appropriate attenuation to calibrate the
+overall gain of the lock-in.  Every gain setting in each
+dynamic reserve is calibrated independently and the
+proper attenuations are stored in the unit's ROM.
+The quadrature output is calibrated by DAC U1201.
+Amplifiers U1204 and U1205 buffer the two
+demodulator outputs to drive the X and Y BNC's.
+A/D's
+Analog multiplexer U504 selects the signal to be
+digitized by the microprocessor.  This signal can be
+either the lock-in's in-phase or quadrature output or
+one of the four independent analog inputs buffered
+by U501.  These general purpose inputs are located
+on the rear panel of the instrument.  The selected
+signal is sampled and held on capacitor C502 and
+buffered by 4/4 U508.  The A/D conversion is done
+by successive approximation using comparator
+U514 to compare the sampled and held signal with
+known outputs of U505, a 12 bit DAC with a
+precision reference.  Note that the output of U506,
+an 8 bit DAC is summed with the output of U505.
+This 8 bit DAC corrects for offset errors which can
+accumulate as analog voltages pass through
+buffers, S/H amps, and comparators.  These offsets
+are measured after each unit is manufactured, and
+values to compensate for these offsets are placed in
+the unit's ROM.  The polarity of the offset-corrected
+12 bit DAC is set by 2/4 U511 and the SIGN bit
+yielding 13 bits of resolution from -10.24 to +10.24
+volts.
+D/A's
+In addition to providing reference voltages for A/D
+conversion, the DAC output voltage may be
+multiplexed by U507 to one of eight sample and hold
+amplifiers which provide analog output and control
+voltages.  The microprocessor refreshes each S/H
+amplifier every few milliseconds to prevent droop.
+Two of these outputs are available as general
+programmable outputs on the rear panel.  Two are
+used to program the band pass filter and the
+reference oscillator phase shift.  One output is
+subtracted from the lock-in output in U508 to
+provide a variable offset and another is the rms
+noise output.  The remaining two outputs
+generate the magnitude and phase output
+voltages.
+Expand
+3/4 U511 and 4/4 U1202 are the expand
+amplifiers.  They provide a selectable gain of 10
+to the channel 1 and 2 outputs just before the
+output buffers.
+Front Panel
+There are 71 led's on the front panel controlled
+by 9 serial-in, parallel-out shift registers.  8 of the
+shift registers are written to simultaneously and
+the 9th is written separately.  8 consecutive write
+operations are required to set the LED's in each
+case.  The liquid crystal displays are managed
+by the display controllers, U6101, U6102, and
+U6103.  Exclusive-or gates U6104, U6105 and
+U6106 drive the left over segments.  Latches
+U6107 and U6108 provide the logic bits for
+these extra segments as well as the keyboard
+row strobes.  U6109 reads the switch closures
+as the rows are scanned.
+Microprocessor Control
+The microprocessor, U701, is a Z80A CPU
+clocked at 4 MHz.  16K bytes of firmware are
+stored in the ROM, U702.  U703 is a 2K byte
+static RAM, backed-up by a lithium battery.  A
+power-down standby circuit, Q701, preserves
+the RAM contents when the power is turned off.
+The battery has a life of 5-10 years.  The CPU
+has power-up and power-down resets to prevent
+erroneous execution during turn-on or short
+sags in the line voltage.
+U704 is a 3-channel counter.  One channel
+generates the baud rate for the RS232 interface
+while the other two are used to measure the
+frequency or period of the reference oscillator.
+U709 provides a gate pulse to counter 0.
+Multiplexer U708 selects whether the gate is a
+single period of the reference (period
+measurement) or a gate of known duration
+(frequency measurement).  Counter 1 is a
+programmable divide by N counter whose output
+is either counted for one period of the reference,
+
+
+===== PDF PAGE 41 =====
+37
+or, generates the gate pulse during which reference
+pulses are counted.
+I/O addresses are decoded by U705, U706, and
+U707.  The microprocessor controls the lock-in
+functions through I/O ports U714-U721.  U713
+generates an interrupt to the CPU every 4 msec to
+keep the microprocessor executing in real time.
+RS232 Interface
+The RS232 interface uses an 8251A UART, U801,
+to send and receive bytes in a bit serial fashion.  Any
+standard baud rate from 300 to 19.2K baud may be
+selected with the configuration switches.  The X16
+transmit and receive clock comes from counter 2 of
+U704.  The RS232 interface is configured as DCE so
+that a terminal may be connected with a standard
+cable.  When a data byte is received by the UART,
+the RxRDY output interrupts the CPU to prevent the
+data from being overwritten.
+GPIB Interface
+The interface to the GPIB is provided by U802, an
+MC68488 General Purpose Interface Adapter
+(GPIA).  The GPIB data and control lines are
+buffered by drivers U808 and U811.  Because the
+GPIA uses a 1 MHz clock, wait states are provided
+by U805 to synchronize I/O transactions with the 4
+MHz CPU.  The GPIA interrupts the CPU whenever
+a GPIB transaction occurs which requires the CPU’s
+response.  (The GPIB address is set by switch bank
+SW1.)
+Power Supplies
+The line transformer provides two outputs, 40VAC
+and 15VAC, both center tapped.  The transformer
+has dual primaries which may be selected by the
+voltage selector card in the fuse holder.  The 15VAC
+is rectified by diode bridge BR2 and passed to 5V
+regulator U909.  The output of U909  powers the
+microprocessor and its related circuitry.  The 40VAC
+output is half-wave rectified by BR1 and regulated by
+U901 and U902 to provide +20V and -20V.  These
+two dc voltages are then regulated again by 15V
+regulators U903-U908.  Each 15V regulator powers
+a separate section of the lock-in to reduce coherent
+pick up between sections.  U911 and U912 provide
+plus and minus 7.5V and U910 generates +5V for
+the analog circuits.
+Internal Oscillator
+The internal oscillator is on a small circuit board
+attached to the rear panel of the instrument.
+Local regulators, Q1 and Q2, provide power to
+the board.  The VCO input is internally pulled up
+by R12.  This pulls the VCO input to 10V when
+the VCO input is left open.  2/4 U1 translates the
+VCO input voltage to provide a negative control
+voltage to U2, the function generator.  P3
+adjusts the VCO calibration.  U2 is a sine wave
+generator whose frequency range is selected by
+the VCO Range switch and capacitors, C4-C6.
+P2 adjusts the sine wave symmetry at low
+frequencies.  4/4 U1 buffers the output of U2.
+P1 adjusts the amplitude of the output sine
+wave.  The output amplitude on the SIne Out is
+selected by the amplitude switch.  The output
+impedance is 600 Ω.
+
+
+===== PDF PAGE 47 =====
+43
+Appendix B:
+Introduction to the RS232
+The 'RS232' is a standard for bit serial
+asynchronous data communication.  The
+standard defines the format for data
+transmission, the electrical specifications for the
+signal levels, and the mechanical dimensions of
+connectors.
+Despite the definition of a standard, there are so
+many permutations of control lines, data
+formats, and transmission speeds, that getting
+two RS232 devices to communicate usually
+requires some work.
+In this section, we will provide some basic
+information to aid you in connecting your RS232
+device to the SR530 Computer Interface.
+CASE 1 - The Simplest Configuration.
+In this case, one wire is used to send data from
+device A to device B and another wire is used to
+send data from device B to device A.  Notice
+that pin 2 is an output on device A and an input
+on device B.  (It is good practice to run the
+ground, pin 7, between the devices as well).
+The RS232 defines two types of devices; DTE
+(Data Terminal Equipment) and DCE (Data
+Communications Equipment.)  An RS232 port
+on a computer may be either a DTE or DCE but
+nearly every terminal with an RS232 port is a
+DTE.  RS232 ports on a computer which are
+intended to connect to a modem, such as the
+COM1: port on the IBM PC, are DTE.  The
+SR530 is configured as DCE, and so it may be
+directly connected to ASCII terminals and to the
+COM: ports on IBM PC's and compatibles.
+As an example, consider connecting an RS232
+ASCII computer terminal to the SR530 using a 2
+wire link.  The terminal is a DTE and the SR530
+is a DCE.  To operate correctly, the SR530 and
+the terminal must have the same settings for
+baud  rate, parity, and number of stop bits.  The
+control lines in the RS232 Standard, which are
+used to indicate that a device is ready to accept
+data, must also be connected correctly at the
+terminal end.  If the terminal responds to a control
+line, it will believe that the SR530 is not ready to
+accept data (because the line is not passed in this
+example) and will therefore not send any data.
+CASE 2 - RS232 with Control Lines.
+The data lines are the same as in Case 1.  In
+addition to the data lines, there are two control lines
+used:
+CTS - Pin 5
+"Clear to send" is a signal asserted by the DCE to
+tell the DTE that the DCE is ready to receive data.
+DTR - Pin 20
+"Data Terminal Ready" is a signal asserted by the
+DTE to tell the DCE that the DTE is ready to receive
+data.
+The SR530 responds to the control lines as follows:
+1) If the lines are not connected, the SR530
+assumes that you are ready to receive data.
+2) Data will not be transmitted from the SR530 if the
+DTR line (pin 20) is low.  This is useful in the case
+when your program is not yet ready to receive data.
+If data transmission is not suspended, then data
+may be overwritten in your computer's UART (as it is
+not being retrieved by the program and so will be
+lost.)  When this happens, the 'over-run' flag will be
+set in your computer's UART and it may be
+recognized by the operating system, generating an
+error message such as "I/O Device Error" (See the
+"W" command in the SR530 Command List for
+another way to slow data transmission.)
+Baud Rate
+The RS232 baud rate of the SR530 is switch
+selectable from 300 to 19.2K baud (see
+configuration switch setting in the front of this
+manual.)  19.2K baud means that data is transmitted
+at 19,200 bits/second.  With one start bit, 2 stop bits,
+8 data bits, and no parity bits, each ASCII character
+requires 573 µsec to be transmitted (11bits/19.2K
+
+
+===== PDF PAGE 48 =====
+ 
+ 
+44
+baud.)  The typical data string 5.1270<cr> has 7 
+characters, requiring 4 msec to be sent. 
+ 
+Stop Bits 
+ 
+Generally, selection of 2 stop bits will result in 
+fewer data transmission errors. 
+ 
+Parity 
+ 
+The Parity bit provides a check against faulty 
+data transfer.  It is not commonly used in local 
+data transmission environments.  If the parity 
+option is selected, the SR530 will transmit 8 data 
+bits and a parity bit, however, no parity check of 
+incoming data is done. 
+ 
+Voltage Levels 
+ 
+The RS232 uses bipolar voltage levels: 
+ 
+ 
+The control lines use positive logic.  For 
+example, the DCE tells the DTE that it is clear to 
+send (CTS) by placing > +3 VDC on pin 5 of the 
+interface.  Similarly, the DTE can tell the DCE 
+that it is not ready by placing -3 VDC on pin 20 
+(DTR) of the interface. 
+ 
+The data lines, pins 2 and 3, use negative logic.  
+A 'zero' bit is represented by a positive voltage 
+and a 'one' bit is represented by a negative 
+voltage.  A start bit is a positive voltage and a 
+stop bit is a negative voltage.  Data is 
+transmitted with the least significant bit first.  The 
+letter 'A', which has the ASCII code 41H (0100 
+0001), would appear as follows: 
+If a parity option was selected, the parity bit would 
+be sent after the 8th data bit, but before the first stop 
+bit. 
+ 
+Final Tip 
+ 
+When you are trying to get the RS232 to work with 
+your computer, it is helpful to be able to 'eavesdrop' 
+on the RS232 data lines going between the SR530 
+and the computer.  This can be done with an ASCII 
+RS232 terminal and the following connector: 
+ 
+To test the connector, place the hook clip on pin 2 of 
+the same connector (shorting pin 2 to pin 3.)  Now, 
+when you type at the terminal keyboard, data 
+transmitted from pin 2 is received at pin 3 and 
+displayed on the terminal screen.  To use as a 
+debugging tool, attach the hook clip to either pin 2 or 
+pin 3 of the RS232 cable on the SR530 to show 
+either data sent from the Computer or the SR530.  
+The baud rate, parity, and stop bits of the terminal 
+must match those of the SR530 and the computer.  
+If your terminal has a mode which will display control 
+characters (such as carriage returns and line feeds) 
+it is helpful to operate in that mode. 
+ 
+A variant of the 'eavesdropping' approach is 
+diagrammed below: 
+ 
+With this cable arrangement, the ASCII terminal can 
+listen to the data passing in both directions.  The 
+only drawback is that the terminal will display 
+garbled data if both devices transmit data at the 
+same time. 
+
+
+===== PDF PAGE 50 =====
+46
+Appendix D:
+Program Examples
+All of the program examples which follow do the
+same thing, only the computer, language, or
+interface is changed.  The programs read the
+Channel 1 and 2 Outputs and write the results to
+the computer screen.  In addition, the X6 analog
+output port is ramped from 0 to 10V.
+Program Example 1:
+IBM PC, Basic, via RS232
+In this example, the IBM PC's ASYNC port (known
+as COM1: or AUX: to DOS users) will be used to
+communicate with the SR530.  Only two wires
+between the IBM PC's ASYNC port and the
+SR530 are needed (pins #2 & #3 of the RS232),
+but pins 5,6,8 and 20 should be connected
+together on the connector at the IBM end.
+10 ′
+EXAMPLE PROGRAM TO READ THE SR510 OUTPUT AND RAMP THE X6 ANALOG OUTPUT
+20 ′
+USING IBM PC BASICA AND THE COM1: RS232 PORT.
+30 ′
+THE RAMP ON X6 CAN BE WATCHED BY SETTING THE SR530 DISPLAY TO A/D.
+40 ′
+50 ′
+60 ′
+ON THE REAR PANEL OF THE SR530, SET SWITCH #1 OF SW2 DOWN
+70 ′
+AND ALL OTHER SWITCHES IN SW2 UP. (9600 BAUD, NO PARITY)
+80 ′
+90 OPEN ″COM1:9600,N,8,2,CS,DS,CD″ AS #1
+100 ′ SET UP COM1: PORT TO 9600 BAUD, NO PARITY, 8 DATA BITS, 2 STOP BITS,
+110 ′
+IGNORE CTS (CLEAR TO SEND), DSR (DATA SET READY),
+120 ′
+AND CD (CARRIER DETECT).
+130 ′
+140 PRINT #1, ″ ″ ‘CLEAR UART BY SENDING SPACES
+150 PRINT #1, ″Z″ ′RESET SR530
+160 FOR I = 1 TO 200: NEXT I
+′WAIT FOR RESET TO FINISH
+170 ′
+180 X = 0
+′INIT X6 OUTPUT TO ZERO
+190 ′
+200 PRINT #1, ″Q1″
+′READ OUTPUT
+210 INPUT #1,V1
+′INTO V1
+220 PRINT #1, ″Q2″
+′READ OUTPUT
+230 INPUT #1,V2
+′INTO V2
+240 ′
+250 PRINT ″CH1 = ″;V1;″
+CH2 = ″;V2
+260 ′
+270 X =X + .0025
+′INCREMENT X6 OUTPUT BY 2.5 MV
+280 IF X > 10 THEN X = 0
+′RESET X6 RAMP
+290 PRINT #1, USING ″X6, ##.###″;X
+′SET X6 OUTPUT VOLTAGE
+300 ′
+310 GOTO 200
+′LOOP FOREVER
+
+
+===== PDF PAGE 51 =====
+47
+Program Example 2:
+IBM PC, Microsoft Fortran
+v3.3, via RS232
+Machine language routines to interface to the
+COM1:  RS232 port are provided in the file
+RS232.OBJ found on the SR575 disk.  These
+routines allow for simple interfacing to the SR530
+at 19.2 kbaud from FORTRAN programs.
+To use these routines, the file 'for232.inc' (also on
+the SR575 disk) must be 'included' in the
+FORTRAN source.
+ Only two wires between the IBM PC's ASYNC
+port and the SR530 are needed (pins #2 & #3 of
+the RS232), but pins 5,6,8 and 20 should be
+connected together on the connector at the IBM
+end.
+$storage:2
+$include: ′for232.inc′
+[
+for 232.inc must be included to call subroutines in RS232.OBJ
+[
+link with RS232.OBJ (on SR565 disk)
+[
+RS232.OBJ defines:
+[
+init
+[
+initializes COM1: to 19.2 kbaud
+[
+txstr (str) str is a string terminated with ′$′
+[
+transmits str to COM1:
+[
+rxstr (str) str must be declared with length of 15 or greater
+[
+fills str with string received from COM1:
+[
+if and error occurs, nocom is called.
+[
+Nocom should be a FORTRAN subroutine in your program.
+program ex2
+character *20 str1,str2, str3
+[
+Example program to read the SR530 outputs and ramp the
+[
+X6 analog output using Microsoft FORTRAN v3.3 and the
+[
+COM1: port. Set all switches in SW2 to UP on SR530
+[
+for 19.2 kbaud.
+[
+The ramp on X6 can be watched by setting the SR530
+[
+display to D/A/
+[
+initialize COM1: port to 19.2 kbaud
+call init
+[
+set character wait interval to zero
+call txstr(′w0$′)
+[
+reset X6 to zero
+x6=0.0
+[
+read channel 1 output into string variable str1
+20 
+call txstr(′q1$′)
+call rxstr(str1)
+[
+read channel 2 output into string variable str2
+call txstr(′q2$′)
+
+
+===== PDF PAGE 53 =====
+49
+Program Example 3:
+IBM PC, Microsoft C v3.0,
+via RS232
+Machine language routines to interface to the
+COM1: RS232 port are provided in the file
+RS232.OBJ found on the SR575 disk.  These
+routines allow for simple interfacing to the SR530
+at 19.2 kbaud from C programs.
+To use these routines, the large model must be
+used.  Compile with the /AL switch and link with
+RS232.OBJ.
+Only two wires between the IBM PC's ASYNC port
+and the SR530 are needed (pins #2 & #3 of the
+RS232), but pins 5,6,8 and 20 should be
+connected together on the connector at the IBM
+end.
+#include <stdio.h>
+/*
+Compile with >MSC program name/AL;
+link with RS232.OBJ (on SR565 disk)
+RS232.OBJ defines:
+init ()
+Initializes COM1: to 19.2 kbaud
+txstr (str);
+Char *str;
+str must terminate with ′$′ char
+Sends string str to COM1:
+rxstr (str);
+str must be declared with 15 characters
+  or more length.
+Fills str with string received from COM1:
+If an error occurs, your procedure nocom() is called.
+Nocom() must be a C procedure in your program.
+Example program to read the SR510 outputs and ramp the x6 analog
+Output using Microsoft C v3.0 (large model) and the COM1: port.
+Set all switches in SW2 to UP on SR530 for 19.2 kbaud.
+The ramp on x6 can be watched by setting the SR530 display to D/A.
+*/
+main ()
+{
+char str1[20], str2[20], STR3[20];
+float v1,V2,x;
+init ();
+/* init COM1: port to 19.2 kbaud */
+txstr (″w0$″);
+/* set character interval to 0 */
+x = 0;
+while (1)
+{
+txstr (″q1$″);
+/* read channel 1 output */
+rxstr (str1);
+/* into str1 */
+sscanf (str1, ″%f″, &v1);
+/* scan str1 for a float variable */
+
+
+===== PDF PAGE 55 =====
+51
+Program Example 4:
+IBM PC,Microsoft Basic,
+via GPIB
+This program requires the Capital Equipment
+Corporation GPIB card for the IBM PC or XT.  It
+has firmware in ROM to interface high level
+languages to the GPIB.
+Subroutine calls in Microsoft BASIC are done to
+memory locations specified by the name of the
+subroutine.  The address is relative to the segment
+address specified by the DEF SEG statement
+preceding CALL.
+In this program, the CEC card's ROM starts at
+OC0000H, the system controller's address is 21,
+and the SR530 has been assigned as GPIB
+address 23.
+To monitor the GPIB activity with an RS232
+terminal, SW1-6 should be down, and the ASCII
+terminal should be attached to the rear panel
+RS232 connector.
+10 ′
+EXAMPLE PROGRAM TO READ THE SR530 OUTPUT AND RAMP THE X6 ANALOG OUTPUT
+20 ′
+USING IBM PC BASICA AND THE CAPITAL EQUIPMENT CORP. GPIB INTERFACE CARD
+30 ′
+40 ′
+THE RAMP ON X6 CAN BE MATCHED BY SETTING THE SR530 DISPLAY TO D/A.
+50 ′
+60 ′
+ON THE SR530 REAR PANEL, SET SWITCHES #4 AND #6 ON SW1 TO DOWN (DEVICE
+70 ′
+ADDRESS = 23, RS232 ECHO ON) AND SWITCH # 1 ON SW2 TO DOWN (RS232 BAUD
+80 ′
+RATE = 9600). ALL OTHER SWITCHES SHOULD BE UP.
+90 ′
+NOTE THAT THE RS232 ECHO IS FOR DEBUGGING AND DEMOSTRATION PURPOSES,
+100 ′ UNDER NORMAL CONDITIONING, SWITCH # 6 OF SW1 SHOULD BE UP SINCE THE RS232
+110 ′ ECHO SLOWS DOWN THE GPIB INTERFACE.
+120 ′
+130 DEF SEG = &HC000
+′BASE ADDRESS OF CEC CARD
+140 INIT=0: TRANSMIT=3: RECV=6:
+′ADDRESSES OF CEC FIRM WARE ROUTINES
+150 ADDR%=21: SYS%=0
+′CONTROLLER ADDRESS
+160 INZ$ = ″IFC UNT UNL MTA LISTEN 23 DATA ′Z′ 13″
+170 ′
+180 Q1$ = ″IFC MTA LISTEN 23 DATA ′Q1′ 13″
+190 Q2$ = ″IFC MTA LISTEN 23 DATA ′Q2′ 13″
+200 X6$ = ″IFC MTA LISTEN 23 DATA ′X6, ″
+210 LISN$ = ″IFC UNT UNL MLA TALK 23″
+220 ′
+230 ′
+240 CALL INIT(ADDR%,SYS%)
+′INIT X6 OUTPUT TO ZERO
+250 CALL TRANSMIT(INZ$,STATUS%)
+′RESET SR530
+260 GOSUB 600
+′CHECK TRANSMIT STATUS
+270 ′
+280 X = 0
+′INIT X6 OUTPUT TO ZERO
+290 ′
+300 CALL TRANSMIT(Q1$,STATUS%)
+′READ CHANNEL 1 OUTPUT
+310 GOSUB 600
+320 GOSUB 510
+′GET RESULT
+330 V1 = VAL(ANS$)
+′INTO V1
+340 ′
+350 CALL TRANSMIT(Q2$,STATUS%)
+′READ CHANNEL 2 OUTPUT
+360 GOSUB 600
+370 GOSUB 510
+′GET RESULT
+380 V1 = VAL(ANS$)
+′INTO V2
+
+
+===== PDF PAGE 59 =====
+SR530 COMPONENT PARTS LIST
+55
+Oscillator Board Parts List
+REF.
+SRS part#
+VALUE
+DESCRIPTION
+C 1
+5-00023-529
+.1U
+Cap, Monolythic Ceramic, 50V, 20%, Z5U
+C 2
+5-00023-529
+.1U
+Cap, Monolythic Ceramic, 50V, 20%, Z5U
+C 3
+5-00102-517
+4.7U
+Capacitor, Tantalum, 35V, 20%, Rad
+C 4
+5-00054-512
+.047U
+Cap, Stacked Metal Film 50V 5% -40/+85c
+C 5
+5-00087-516
+390P
+Capacitor, Silver Mica, 500V, 5%, DM15
+C 6
+5-00102-517
+4.7U
+Capacitor, Tantalum, 35V, 20%, Rad
+C 7
+5-00014-501
+390P
+Capacitor, Ceramic Disc, 50V, 10%, SL
+C 8
+5-00034-526
+100U
+Capacitor, Electrolytic, 35V, 20%, Rad
+C 9
+5-00100-517
+2.2U
+Capacitor, Tantalum, 35V, 20%, Rad
+C 10
+5-00034-526
+100U
+Capacitor, Electrolytic, 35V, 20%, Rad
+C 11
+5-00100-517
+2.2U
+Capacitor, Tantalum, 35V, 20%, Rad
+P 1
+4-00016-445
+10K
+Pot, Multi-Turn, Side Adjust
+P 2
+4-00003-440
+100K
+Trim Pot, Single Turn, In-Line Leads
+P 3
+4-00016-445
+10K
+Pot, Multi-Turn, Side Adjust
+PC1
+7-00037-701
+SR501
+Printed Circuit Board
+R 1
+4-00079-401
+4.7K
+Resistor, Carbon Film, 1/4W, 5%
+R 2
+4-00083-401
+47K
+Resistor, Carbon Film, 1/4W, 5%
+R 3
+4-00202-407
+698
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 4
+4-00189-407
+41.2K
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 5
+4-00186-407
+4.22K
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 6
+4-00190-407
+42.2K
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 7
+4-00186-407
+4.22K
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 8
+4-00202-407
+698
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 9
+4-00078-401
+39K
+Resistor, Carbon Film, 1/4W, 5%
+R 10
+4-00186-407
+4.22K
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 11
+4-00022-401
+1.0M
+Resistor, Carbon Film, 1/4W, 5%
+R 12
+4-00042-401
+15K
+Resistor, Carbon Film, 1/4W, 5%
+R 13
+4-00070-401
+30K
+Resistor, Carbon Film, 1/4W, 5%
+R 14
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 15
+4-00022-401
+1.0M
+Resistor, Carbon Film, 1/4W, 5%
+R 16
+4-00079-401
+4.7K
+Resistor, Carbon Film, 1/4W, 5%
+R 17
+4-00104-401
+82K
+Resistor, Carbon Film, 1/4W, 5%
+R 18
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 19
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 20
+4-00188-407
+4.99K
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 21
+4-00188-407
+4.99K
+Resistor, Metal Film, 1/8W, 1%, 50PPM
+R 22
+4-00022-401
+1.0M
+Resistor, Carbon Film, 1/4W, 5%
+R 23
+4-00022-401
+1.0M
+Resistor, Carbon Film, 1/4W, 5%
+R 24
+4-00031-401
+100
+Resistor, Carbon Film, 1/4W, 5%
+R 25
+4-00031-401
+100
+Resistor, Carbon Film, 1/4W, 5%
+SW1
+2-00013-215
+DPDT
+Switch, Toggle Right Angle PCB Mount
+SW2
+2-00013-215
+DPDT
+Switch, Toggle Right Angle PCB Mount
+U 1
+3-00087-340
+LF347
+Integrated Circuit (Thru-hole Pkg)
+U 2
+3-00085-340
+ICL8038
+Integrated Circuit (Thru-hole Pkg)
+U 3
+3-00118-325
+78L15
+Transistor, TO-92 Package
+U 4
+3-00124-325
+79L15
+Transistor, TO-92 Package
+Z 0
+0-00100-040
+1/4X1/16
+Washer, Flat
+Z 0
+0-00122-053
+2-1/4" #24
+Wire #24 UL1007 Strip 1/4x1/4 Tin
+Z 0
+0-00136-053
+8-1/2" #24
+Wire #24 UL1007 Strip 1/4x1/4 Tin
+
+
+===== PDF PAGE 70 =====
+SR530 COMPONENT PARTS LIST
+66
+REF.
+SRS part#
+VALUE
+DESCRIPTION
+R 703
+4-00027-401
+1.5K
+Resistor, Carbon Film, 1/4W, 5%
+R 705
+4-00021-401
+1.0K
+Resistor, Carbon Film, 1/4W, 5%
+R 706
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 707
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 708
+4-00069-401
+300K
+Resistor, Carbon Film, 1/4W, 5%
+R 709
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 710
+4-00032-401
+100K
+Resistor, Carbon Film, 1/4W, 5%
+R 711
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 712
+4-00032-401
+100K
+Resistor, Carbon Film, 1/4W, 5%
+R 801
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 802
+4-00034-401
+10K
+Resistor, Carbon Film, 1/4W, 5%
+R 803
+4-00065-401
+3.3K
+Resistor, Carbon Film, 1/4W, 5%
+R 901
+4-00107-402
+10
+Resistor, Carbon Comp, 1/2W, 5%
+R 902
+4-00107-402
+10
+Resistor, Carbon Comp, 1/2W, 5%
+R 903
+4-00060-401
+240
+Resistor, Carbon Film, 1/4W, 5%
+R 904
+4-00024-401
+1.2K
+Resistor, Carbon Film, 1/4W, 5%
+R 905
+4-00024-401
+1.2K
+Resistor, Carbon Film, 1/4W, 5%
+R 906
+4-00060-401
+240
+Resistor, Carbon Film, 1/4W, 5%
+R 907
+4-00107-402
+10
+Resistor, Carbon Comp, 1/2W, 5%
+R 908
+4-00107-402
+10
+Resistor, Carbon Comp, 1/2W, 5%
+R 909
+4-00053-401
+200
+Resistor, Carbon Film, 1/4W, 5%
+R 910
+4-00063-401
+3.0K
+Resistor, Carbon Film, 1/4W, 5%
+R 911
+4-00063-401
+3.0K
+Resistor, Carbon Film, 1/4W, 5%
+R 912
+4-00053-401
+200
+Resistor, Carbon Film, 1/4W, 5%
+R 913
+4-00107-402
+10
+Resistor, Carbon Comp, 1/2W, 5%
+R 914
+4-00107-402
+10
+Resistor, Carbon Comp, 1/2W, 5%
+RN401
+4-00220-420
+10KX8
+Resistor Network, DIP, 1/4W,2%,8 Ind
+RN801
+4-00225-425
+100KX9
+Resistor Network SIP 1/4W 2% (Common)
+RN802
+4-00225-425
+100KX9
+Resistor Network SIP 1/4W 2% (Common)
+SO702
+1-00026-150
+28 PIN 600 MIL
+Socket, THRU-HOLE
+SW1
+2-00014-207
+SPSTX8
+Switch, DIP
+SW2
+2-00014-207
+SPSTX8
+Switch, DIP
+SW601
+2-00017-216
+4PDT
+Switch, Rocker, PCB Mount (LHS of 510)
+SW602
+2-00004-213
+DPDT
+Switch, Rocker, PCB Mount (RHS of 510)
+T 1
+6-00007-610
+SR510/530
+Transformer
+U 101
+8-00085-860
+SR513 ASSY
+SRS sub assemblies
+U 102
+8-00085-860
+SR513 ASSY
+SRS sub assemblies
+U 103
+3-00076-340
+DG211
+Integrated Circuit (Thru-hole Pkg)
+U 104
+3-00118-325
+78L15
+Transistor, TO-92 Package
+U 105
+3-00124-325
+79L15
+Transistor, TO-92 Package
+U 106
+3-00076-340
+DG211
+Integrated Circuit (Thru-hole Pkg)
+U 107
+3-00130-340
+5532A
+Integrated Circuit (Thru-hole Pkg)
+U 108
+3-00076-340
+DG211
+Integrated Circuit (Thru-hole Pkg)
+U 109
+3-00088-340
+LF353
+Integrated Circuit (Thru-hole Pkg)
+U 110
+3-00076-340
+DG211
+Integrated Circuit (Thru-hole Pkg)
+U 111
+3-00089-340
+LF357
+Integrated Circuit (Thru-hole Pkg)
+U 112
+3-00076-340
+DG211
+Integrated Circuit (Thru-hole Pkg)
+U 113
+3-00089-340
+LF357
+Integrated Circuit (Thru-hole Pkg)
+U 114
+3-00076-340
+DG211
+Integrated Circuit (Thru-hole Pkg)
+U 115
+3-00089-340
+LF357
+Integrated Circuit (Thru-hole Pkg)
+U 117
+3-00088-340
+LF353
+Integrated Circuit (Thru-hole Pkg)

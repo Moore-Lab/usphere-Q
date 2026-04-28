@@ -1,0 +1,666 @@
+
+
+===== PAGE 8 =====
+4
+Acquisition Time
+25 Sec at 1 Hz
+6 Sec at 10 Hz
+2 Sec at 10 kHz
+Slew Rate 
+1 decade per 10 S at 1 kHz
+Phase Control
+90° shifts
+Fine shifts in 0.025° steps
+Phase Noise
+0.01° rms at 1 kHz, 100 msec, 12 dB TC
+Phase Drift
+0.1°/°C
+Phase Error
+Less than 1° above 10Hz
+Orthogonality
+90° ± 1°
+Demodulator
+Stability
+5 ppm/°C on LOW dynamic reserve
+50 ppm/°C on NORM dynamic reserve
+500 ppm/°C on HIGH dynamic reserve
+Time Constants
+Pre:
+1msec to 100 sec (6 dB/Octave)
+Post:
+1sec, 0.1 sec, none (6 dB/Octave) or none
+Offset
+Up to 1X full scale (10X on expand)
+Both channels may be offset
+Harmonic Rej
+-55 dB (bandpass filter in)
+Outputs & Interfaces
+Channel 1 Outputs   
+X (RcosØ), X Offset, R (magnitude), R Offset, X Noise, X5 (external D/A)
+Channel 2 Outputs
+Y (RsinØ), Y Offset, Ø (phase shift of signal), Y Noise, X6 (external D/A)
+Output Meters
+2% Precision mirrored analog meter
+Output LCD's
+Four digit auto-ranging LCD display shows same values as the analog meters
+Output BNC's
+±10 V output corresponds to full scale input, <1Ω output impedance
+X Output
+X (RcosØ), ±10 V full scale, < 1Ω output impedance
+Y Output
+Y (RsinØ), ±10 V full scale, < 1Ω output impedance
+Reference LCD
+Four digit LCD display for reference phase shift or frequency
+RS232 
+Interface controls all functions.  Baud rates from 300 to 19.2 K
+GPIB
+Interface controls all functions. ( IEEE-488 Std )
+A/D
+4 BNC inputs with 13 bit resolution (±10.24 V)
+D/A
+2 BNC outputs with 13 bit resolution (±10.24 V)
+Ratio
+Ratio output equals 10X Channel 1 output divided by the Denominator input.
+Internal Oscillator
+Range:
+1 Hz to 100 kHz, 1% accuracy
+Stability:
+150 ppm/°C
+Distortion:
+2% THD
+Amplitude: 1% accuracy, 500 ppm/°C stability
+
+
+===== PAGE 9 =====
+5
+Front Panel Summary
+Signal Inputs
+Single Ended (A), True Differential (A-B), or Current (I)
+Signal Filters
+Bandpass:
+Q-of-5 Auto-tracking filter (In or Out)
+Line Notch:
+Q-of-10 Notch Filter at line frequency (In or Out)
+2XLine Notch:
+Q-of-10 Notch Filter at twice line frequency (In or Out)
+Sensitivity
+Full scale sensitivity from 100 nV to 500 mV RMS for voltage inputs
+or from 100 fA to 500 nA RMS for current inputs.
+Dynamic Reserve
+Select
+Dynamic Reserve
+Stability 
+Sensitivity Ranges
+LOW
+20 dB
+ 
+5 ppm
+  
+1 µV to 500 mV
+NORM
+40 dB
+50 ppm
+100 nV to 50 mV
+HIGH
+60 dB
+500 ppm
+100 nV  to 5 mV
+Status Indicators
+OVLD
+Signal Overload
+UNLK
+PLL is not locked to the reference input
+ERR
+Illegal or Unrecognized command
+ACT
+RS232 or GPIB interface Activity
+REM
+Remote mode: front panel has been locked-out
+Display Select
+Channel 1
+Channel 2
+X (RcosØ)
+Y (RsinØ)
+X Offset
+Y Offset
+R (Magnitude)
+Ø (Phase)
+R Offset
+Ø (no offset)
+X Noise
+Y Noise
+X5 (D/A)
+X6 (D/A)
+Analog Meters
+Displays Channel 1 and 2 Outputs as a fraction of full scale
+Output LCD's
+Displays the Channel 1 and 2 Outputs in absolute units
+Output BNC's
+Channel 1 and 2 Outputs follow Analog Meters, ± 10 V for ± full scale
+Expand
+Multiplies the Channel 1 or 2 Analog Meter and Output voltage by a factor X1 or X10.
+REL
+Set the Channel 1 or 2 Offset to null the output: subsequent readings are relative
+readings.  REL with phase display performs auto-phasing.  REL with X5, X6 display
+zeroes the D/A outputs.
+Offset
+Enables or Disables Offset, and allows any offset (up to full scale) to be entered.  X, Y,
+and R may be offset and X5, X6 may be adjusted.  Phase is offset using the reference
+phase shift.
+X BNC
+X (RcosØ) output, ± 10V full scale
+Y BNC
+Y (RsinØ) output, ± 10V full scale
+Reference Input
+1 MΩ Input, 0.5 Hz to 100 KHz, 100 mV minimum
+Reference Trigger
+Trigger on rising edge, zero crossing, or falling edge
+f/2f Mode
+PLL can lock to either X1 or X2 of the reference input frequency
+
+
+===== PAGE 10 =====
+6
+Phase Controls
+Adjust phase in smoothly accelerating 0.025° steps, or by
+90° steps. Press both 90° buttons to zero the phase.
+Reference LCD
+Display reference phase setting or reference frequency
+Time Constants
+Pre-filter has time constants from 1 mS to 100 S  (6 dB/Octave)
+Post-filter has time constants of 0, 0.1 or 1.0 S (6 dB/Octave)
+ENBW
+Equivalent Noise Bandwidth. Specifies the bandwidth when making
+Noise measurements. (1Hz or 10 Hz ENBW)
+Power Switch
+Instrument settings from the last use are recalled on power-up
+
+
+===== PAGE 43 =====
+ 
+ 
+39
+The CMRR is adjusted by the single turn 
+potentiometer located at A1 under the single 
+hole at the front of the signal shield.  (The shield 
+is the aluminum box on the left side of the main 
+board).  Using a small screwdriver, carefully 
+adjust the potentiometer to minimize the 100 Hz 
+output on the scope.  Set the DISPLAY to R,Ø 
+and the sensitivity to 5µV and minimize the R 
+output on the Channel 1 meter. 
+ 
+Notch Filters 
+ 
+Set the reference frequency to 60.0 Hz (50.0 
+Hz).  It is convenient to use the SYNC output of 
+the signal generator as the reference input if it is 
+available.  Connect the sine output of the signal 
+generator to the A input and set the input 
+selector to A.  With the SENSITIVITY at 100mV, 
+adjust the amplitude of the input signal to 100 
+mV (full scale). 
+ 
+Set the LINE NOTCH to IN, the SENSITIVITY to 
+10mV, and the DYN RES to LOW.  Connect the 
+scope to the SIGNAL MONITOR output on the 
+rear panel.  Set the scope to AC coupled, 
+0.2V/div, 10mS/div.  Trigger the scope externally 
+using the reference input signal. 
+ 
+The LINE NOTCH frequency and depth are 
+adjusted by the pair of 20 turn potentiometers 
+located under the middle two holes in the signal 
+shield (row 4 on the circuit board).  Using a 
+small screwdriver, carefully adjust one pot until 
+the line output on the scope is minimized.  Then 
+adjust the other pot until the output is minimized.  
+Iterate between the two pots until there is no 
+further improvement.  Set the SENSITIVITY to 
+5mV, 2mV, and 1mV, repeating the adjustments 
+at each sensitivity. 
+ 
+Repeat this procedure using a reference 
+frequency of 120.0 Hz (100.0 Hz) and the 
+LINEX2 NOTCH filter.  The LINEX2 NOTCH is 
+adjusted by the pair of 20 turn potentiometers 
+located under the back two holes in the signal 
+shield (row 5 on the circuit board). 
+Replace the top panel. 
+Replacing the Front-End Transistors 
+ 
+Both the voltage and current front end transistors 
+(Q101 and Q102) are 2N6485 (IMF6485) dual 
+JFETS.  These transistors are selected at the factory 
+to meet the noise specifications. 
+ 
+This section outlines their replacement procedure in 
+the event that they become damaged during use. 
+ 
+1) Remove the AC power cord from the unit. 
+ 
+2) Remove top and bottom panels. 
+ 
+3) Release the signal shields by removing the four 
+screws which hold it onto the circuit board.  Be 
+careful not to lose the nuts.  Carefully slide the 
+shields back and then lift them out. 
+ 
+4) The input transistors are located on the main 
+board, just behind the input selector switch.  
+Q101 is the voltage (A, A-B) front end, and 
+Q102 is the current (I) front end.  Desolder and 
+replace the appropriate transistor. 
+ 
+5) Replace the signal shields.  Be careful to check 
+that the shields do not touch any circuit board 
+traces around their edges. 
+ 
+6) Replace the top and bottom panels. 
+ 
+7) If Q101, the voltage front end has just been 
+replaced, the Common Mode Rejection needs to 
+be readjusted using the procedure described in 
+the Amplifier Adjustments section. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+
+
+===== PAGE 44 =====
+40
+Appendix A:
+Noise Sources and Cures
+Noise, random and uncorrelated fluctuations of
+electronic signals, finds its way into experiments
+in a variety of ways.  Good laboratory practice
+can reduce noise sources to a manageable
+level, and the lock-in technique can be used to
+recover signals which may still be buried in
+noise.
+Intrinsic Noise Sources
+Johnson Noise.  Arising from fluctuations of
+electron density in a resistor at finite
+temperature, these fluctuations give rise to a
+mean square noise voltage,
+_
+V2 = ∫4kT Re[Z(f)] df = 4kTR ∆f
+where k=Boltzman's constant, 1.38x10-23J/°K; T
+is the absolute temperature in Kelvin; the real
+part of the impedance, Re[z(f)] is the resistance
+R; and we are looking at the noise source with a
+detector, or ac voltmeter, with a bandwidth of ∆f
+in Hz.  For a 1MΩ resistor,
+ _
+(V2)1/2 = 0.13 µV/√Hz
+To obtain the rms noise voltage that you would
+see across this 1M½ resistor, we multiply
+0.13µV/√Hz by the square root of the detector
+bandwidth.  If, for example, we were looking at
+all frequencies between dc and 1 MHz, we
+would expect to see an rms Johnson noise of
+  _
+(V2)1/2 = 0.13 µV/√Hz*(106 Hz)1/2 = 130 µV
+'1/f Noise'.  Arising from resistance fluctuations
+in a current carrying resistor, the mean squared
+noise voltage due to '1/f' noise is given by
+_
+V2  = A R2 I2 ∆f/f
+where A is a dimensionless constant, 10-11 for
+carbon, R is the resistance, I the current, ∆f the
+bandwidth of our detector, and f is the frequency
+to which the detector is tuned.  For a carbon
+resistor carrying 10 mA with R = 1k, ∆f = f = 1Hz,
+we have
+Vnoise = 3 µVrms
+And Others.  Other noise sources include flicker
+noise found in vacuum tubes, and generation and
+recombination noise found in semiconductors.
+All of these noise sources are incoherent.  Thus, the
+total noise is the square root of the sum of the
+squares of all the incoherent noise sources.
+Non-Essential Noise Sources
+In addition to the "intrinsic" noise sources listed
+above there are a variety of "non-essential" noise
+sources, i.e. those noise sources which can be
+minimized with good laboratory practice.  It is
+worthwhile to look at what might be a typical noise
+spectrum encountered in the laboratory
+environment:
+Noise Spectrum
+Some of the non-essential noise sources appear in
+this spectrum as spikes on the intrinsic background.
+There are several ways which these noise sources
+work their way into an experiment.
+
+
+===== PAGE 45 =====
+41
+Capacitive Coupling.  A voltage on a nearby
+piece of apparatus (or operator) can couple to a
+detector via a stray capacitance.  Although
+Cstray may be very small, the coupled in noise
+may still be larger than a weak experimental
+signal.
+Capacitive Noise Coupling
+To estimate the noise current through Cstray into
+the detector we have
+i
+=
+Cstray dV  =  jwCstrayVnoise
+       dt
+where a reasonable approximation to Cstray can
+be made by treating it as parallel plate capacitor.
+Here, w is the radian frequency of the noise
+source (perhaps 2 * π * 60Hz ), Vnoise is the
+noise voltage source amplitude (perhaps 120
+VAC).  For an area of A = (.01 m)2 and a
+distance of d = 0.1m, the 'capacitor' will have a
+value of 0.009 pF and the resulting noise current
+will be 400pA.  This meager current is about
+4000 times larger than the most sensitive
+current scale that is available on the SR510
+lock-in.
+Cures for capacitive coupling of noise signals
+include:
+1) removing or turning off the interfering noise
+source,
+2) measuring voltages with low impedance
+sources and measuring currents with high
+impedance sources to reduce the effect of istray,
+3) installing capacitive shielding by placing both
+the experiment and the detector in a metal box.
+Inductive Coupling.  Here noise couples to the
+experiment via a magnetic field:
+Inductive Noise Coupling
+A changing current in a nearby circuit gives rise to a
+changing magnetic field which induces an emf in the
+loop connecting the detector to the experiment.
+(emf = dØB/dt.)  This is like a transformer, with the
+experiment-detector loop as the secondary winding.)
+Cures for inductively coupled noise include:
+1) removing or turning off the interfering noise
+source (difficult to do if the noise is a broadcast
+station),
+2) reduce the area of the pick-up loop by using
+twisted pairs or coaxial cables, or even twisting the 2
+coaxial cables used in differential hook-ups,
+3) using magnetic shielding to prevent the magnetic
+field from inducing an emf (at high frequencies a
+simple metal enclosure is adequate),
+4) measuring currents, not voltages, from high
+impedance experiments.
+
+
+===== PAGE 26 =====
+22
+23 200mV
+24 500mV
+Note that sensitivity settings below 100 nV are
+allowed only when a pre-amplifier is connected.
+H
+The H command reads the pre-amplifier status.
+If a pre-amplifier is connected, a "1" is returned,
+otherwise, a "0" is returned.  The H command is a
+read only command.
+I {n}
+If n is included, the I command sets the remote-
+local status.  If n is absent, the remote-local status
+is returned.
+n
+Status
+0
+Local: all front panel keys are operative
+1 
+Remote: front panel keys are not
+operative.  The LOCAL key returns the
+status to local.
+2 
+Lock-out: front panel keys are not
+operative.  No key returns the status to
+local.  Another I command is needed to
+return to local.
+When using the GPIB interface, the REN, LLO,
+and GTL commands are not implemented.  The I
+command is used by both interfaces to set the
+remote-local status.
+J {n1,n2,n3,n4}
+The J command sets the RS232 end-of-record
+characters sent by the SR530 to those specified
+by the decimal ASCII codes n1-n4.  If no argument
+is included, the end-of-record sequence returns to
+the default (a carriage return), otherwise, up to
+four characters may be specified.  The end-of-
+record required by the SR530 when receiving
+commands is not affected.
+K n
+The K command simulates a front panel key
+press.  The effect is exactly the same as pressing
+the selected key once.  The parameter n is
+required.
+n
+Key
+1
+Post Time Constant Up
+2
+Post Time Constant Down
+3
+Pre Time Constant Up
+4
+Pre Time Constant Down
+5
+Select Display (f/phase)
+6
+90° Up
+7
+90° Down
+8
+Zero Phase (Simultaneous 90° Up and
+Down)
+9
+Reference Trigger Mode
+10 Reference Mode (f/2f)
+11 Degrees Up
+12 Degrees Down
+13 Channel 2 Rel
+14 Channel 2 Offset (On/Off)
+15 Channel 2 Offset Up
+16 Channel 2 Offset Down
+17 Channel 2 Expand
+18 Output Display Up
+19 Output Display Down
+20 Channel 1 Expand
+21 Channel 1 Rel
+22 Channel 1 Offset (On/Off)
+23 Channel 1 Offset Up
+24 Channel 1 Offset Down
+25 Dyn Res Up
+26 Dyn Res Down
+27 Sensitivity Up
+28 Sensitivity Down
+29 Local
+30 Line X 2 Notch Filter
+31 Line Notch Filter
+32 Bandpass Filter
+L m {,n}
+The L command sets and reads the status of the
+line notch filters.  If m is "1", then the 1X line
+notch is selected, if m is "2", the 2X line notch is
+selected.  The parameter m is required.  If n is "1",
+the L command sets the selected filter in.  If n is
+"0", the selected filter is taken out.  If n is absent,
+the status of the selected filter is returned.
+M {n}
+If n is "1", the M command sets the reference
+mode to 2f.  If n is "0", the reference mode is set
+to f.  If n is absent, the reference mode is returned.
+N {m}
+If m is "1", the N command sets the ENBW to 10
+Hz.  If m is "0", the ENBW is set to 1 Hz.  If m is
+absent, the ENBW setting is returned.
+OX {n} {,v}
+OY {n} {,v}
+OR {n} {,v}
+The "OX", "OY", and "OR" commands set the
+offsets for the X, Y, and R outputs respectively.  If
+n is "1", the offset is turned on.  If n is "0", the
+offset is turned off.  If n and v are absent, the
+offset status (on or off) is returned.  (The value of
+the offset is read using the S and Q commands.)
+
+
+===== PAGE 27 =====
+23
+If n is included, then v may be sent also.  v is the
+offset value up to plus or minus full scale in units
+of volts.  For example, to offset half of full scale on
+the 100 µV sensitivity, v should be "50.0E-6" or an
+equivalent value.  However, if the sensitivity is
+then changed to 200 µV, the offset is now half of
+the new full scale or 100 µV.  When the sensitivity
+is changed, the offset is preserved as a constant
+fraction of full scale rather than as a voltage
+referred to the input.  The expand function will, on
+the other hand, preserve the value of the offset as
+an input referred voltage.  Once a value of v is
+sent, the offsets may be turned off and on without
+losing the offset values by using the O commands
+without the v parameter.  Note that the X and Y
+offsets will affect the R output but the R offset
+does not affect the X or Y output.
+P {v}
+If v is absent, the P command returns the
+reference phase shift setting from -180 to +180
+degrees.  When v is included, the phase is set to
+the value of v up to ±999 degrees.
+Q1
+Q2
+QX
+QY
+The Q commands return the output values in
+units of volts or degrees.  For an input signal of 50
+µV on a full scale sensitivity of 100 µV, a Q
+command will return the string "50.00E-6".  "Q1"
+and "Q2" read the parameters being shown on the
+Channel 1 and Channel 2 output displays as
+selected with the S command.  "QX" and "QY"
+read the X (RCOS Ø) and Y (RSIN Ø) BNC
+outputs.
+R {n}
+If n is included, the R command sets the
+reference input trigger mode.  If n is absent, the
+trigger mode is returned.
+n
+Mode
+0
+ositive
+1 
+Symmetric
+2 
+Negative
+S {n}
+If n is included, the S command selects the
+parameters shown on the Channel 1 and 2 analog
+meters, output digital displays, and output BNC's.
+If n is absent, the displayed parameter is returned.
+n
+Channel 1
+Channel 2
+0
+X
+Y
+1
+X Offset
+Y Offset
+2
+R
+Ø
+3
+R Offset
+Ø
+4
+X Noise
+Y Noise
+5
+X5 (D/A)
+X6 (D/A)
+T m {,n}
+The T command sets and reads the status of the
+time constants.  If m is "1", the pre time constant
+is selected, if m is "2", the post time constant is
+selected.  The parameter m is required.  If n is
+included, the T command sets the selected time
+constant.  If n is absent, the setting of the selected
+time constant is returned.
+n
+Pre Time Constant (m=1)
+1
+1 
+mS
+2
+3 
+mS
+3
+10 
+mS
+4
+30 
+mS
+5
+100 
+mS
+6
+300 
+mS
+7
+1 
+S
+8
+3 
+S
+9
+10 
+S
+10 30 
+S
+11 100 
+S
+n
+Post Time Constant (m=2)
+0
+none
+1
+ 0.1
+S
+2
+1
+S
+U m {,n}
+The U command sets and reads the unit's
+calibration bytes.   m is the address offset of the
+byte, 0-511.  If n is absent, the value of the
+addressed calibration byte is returned.  If n is
+included, the addressed calibration byte is set to
+the value of n, 0-255.  The new value will be in
+effect until the power is turned off or a reset
+command is issued.  Use of this command is not
+recommended.
+V {n}
+If n is included, the V command sets the GPIB
+SRQ (service request) mask to the value n (0-
+255).  If n is absent, the value of the SRQ mask is
+returned.
+W {n}
+The W command sets and reads the RS232
+character wait interval.  If n is included, the SR530
+will wait nx4 mS between characters sent over the
+RS232 interface.  This allows slow computer
+interfaces to keep up.  n can range from 0 to 255.
+If n is absent, the wait value is returned.  The wait
+interval is set to 6 on power-up.

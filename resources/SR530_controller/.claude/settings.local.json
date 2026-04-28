@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import serial; import serial.tools.list_ports; ports = list\\(serial.tools.list_ports.comports\\(\\)\\); [print\\(f'{p.device}: {p.description}'\\) for p in ports]\")",
+      "Read(//c/Users/yalem/AppData/Local/Programs/Python//**)",
+      "Bash(ls /c/Python*)",
+      "Bash(where python3 *)",
+      "Bash(where py *)",
+      "Bash(py -3 --version)",
+      "Bash(py -3 -c \"import serial.tools.list_ports; ports = list\\(serial.tools.list_ports.comports\\(\\)\\); [print\\(f'{p.device}: {p.description}'\\) for p in ports]\")",
+      "Bash(py -3 -c \"import PyQt5; print\\('PyQt5 OK'\\)\")",
+      "Bash(py -3 -c \"import pyqtgraph; print\\('pyqtgraph OK'\\)\")",
+      "Bash(py -3 sr530_cli_test.py --port COM5)"
+    ]
+  }
+}

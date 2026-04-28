@@ -13,6 +13,12 @@ Designed for use in the Yale Moore Lab optically levitated microsphere experimen
 
 ---
 
+## Documentation
+
+- **[docs/USER_GUIDE.md](docs/USER_GUIDE.md)** — practical guide for first-time SR530 users: physical connections, parameter selection, phase setting, calibration workflow, and common mistakes
+
+---
+
 ## Quick start
 
 ```bash

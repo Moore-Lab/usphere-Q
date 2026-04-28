@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import fitz; print\\('fitz ok'\\)\")",
+      "Bash(python -c \"import pdfplumber; print\\('pdfplumber ok'\\)\")",
+      "Bash(python -c \"import pypdf; print\\('pypdf ok'\\)\")",
+      "Bash(python -c \"import PyPDF2; print\\('PyPDF2 ok'\\)\")",
+      "Bash(python3 -c \"import fitz; print\\('fitz ok'\\)\")",
+      "Bash(python3 -c \"import pdfplumber; print\\('pdfplumber ok'\\)\")",
+      "Bash(python3 -c \"import pypdf; print\\('pypdf ok'\\)\")",
+      "Bash(where py *)",
+      "Bash(py --version)"
+    ]
+  }
+}
