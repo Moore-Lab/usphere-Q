@@ -32,6 +32,7 @@ Module-specific commands go through handle_command().
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 from typing import Callable
@@ -82,6 +83,7 @@ class ModuleServer:
         self._running = False
         self._rep_thread: threading.Thread | None = None
         self._pub_thread: threading.Thread | None = None
+        self._event_queue: queue.SimpleQueue = queue.SimpleQueue()
 
     # ------------------------------------------------------------------
     # Override in subclass
@@ -94,6 +96,19 @@ class ModuleServer:
     def get_state(self) -> dict:
         """Return the current state dict. Called by the PUB loop."""
         return {}
+
+    def publish_event(self, event: str, data: dict | None = None) -> None:
+        """
+        Queue a one-shot event to be published on the PUB socket.
+
+        Event messages carry an ``"event"`` key so subscribers can
+        distinguish them from regular periodic state updates::
+
+            {"module": "ctrl", "ts": <float>, "event": "sphere_caught", "data": {...}}
+
+        Thread-safe — may be called from any thread.
+        """
+        self._event_queue.put({"event": event, "ts": time.time(), "data": data or {}})
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -155,16 +170,29 @@ class ModuleServer:
         sock.bind(f"tcp://*:{self.pub_port}")
         try:
             while self._running:
+                # Drain queued one-shot events before the periodic state update.
+                # Event messages include an "event" key so subscribers can
+                # distinguish them from regular state updates.
+                while True:
+                    try:
+                        ev = self._event_queue.get_nowait()
+                        sock.send(json.dumps({
+                            "module": self.module_name,
+                            "ts":     ev["ts"],
+                            "event":  ev["event"],
+                            "data":   ev["data"],
+                        }).encode())
+                    except queue.Empty:
+                        break
                 try:
                     state = self.get_state()
                 except Exception:
                     state = {}
-                payload = json.dumps({
+                sock.send(json.dumps({
                     "module": self.module_name,
                     "ts":     time.time(),
                     "data":   state,
-                })
-                sock.send(payload.encode())
+                }).encode())
                 time.sleep(self.publish_interval_s)
         finally:
             sock.close()
