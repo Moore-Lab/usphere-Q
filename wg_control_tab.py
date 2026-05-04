@@ -27,6 +27,7 @@ Public attributes on WaveformControlTab (for control-loop wiring):
 from __future__ import annotations
 
 import math
+import threading as _threading
 
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -123,6 +124,34 @@ def _query_ch_status(afg, ch: int) -> str:
     if off is not None and abs(off) > 0.001:
         parts.append(f"offset {off:+.3g} V")
     return "  ".join(parts)
+
+
+# One lock per AFG connection object — prevents concurrent serial writes when
+# multiple electrode tabs share the same physical WG (e.g. WG1-CH1 and WG1-CH2).
+_afg_serial_locks: "dict[int, _threading.Lock]" = {}
+
+
+def _poll_hw_async(afg, ch: int, on_result) -> None:
+    """
+    Query AFG channel status in a daemon thread; call on_result(text) on the
+    Qt main thread when done.  Serialises concurrent callers on the same AFG
+    connection so serial commands never interleave.
+    """
+    key = id(afg)
+    if key not in _afg_serial_locks:
+        _afg_serial_locks[key] = _threading.Lock()
+    lock = _afg_serial_locks[key]
+
+    def _run():
+        with lock:
+            try:
+                txt = _query_ch_status(afg, ch)
+            except Exception:
+                txt = None
+        if txt is not None:
+            QTimer.singleShot(0, lambda: on_result(txt))
+
+    _threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +705,7 @@ class ChannelControlWidget(QWidget):
 
         outer.addStretch()
 
-        # Poll hardware state every 8 s (slow enough to avoid serial conflicts)
+        self._hw_poll_running = False
         self._hw_poll_timer = QTimer(self)
         self._hw_poll_timer.setInterval(8000)
         self._hw_poll_timer.timeout.connect(self._update_hw_lbl)
@@ -807,16 +836,21 @@ class ChannelControlWidget(QWidget):
         self._status.setStyleSheet("color: red;")
 
     def _update_hw_lbl(self):
-        """Query hardware state and update the gray readout label (8 s timer + after actions)."""
+        """Trigger an async hardware status poll; update label on main thread when done."""
         if self._comb_worker is not None:
             return
-        try:
-            afg, ch = self._map.get_afg_ch(self._axis)
-            if afg is None or not afg.is_connected:
-                return
-            self._hw_lbl.setText(_query_ch_status(afg, ch))
-        except Exception:
-            pass  # serial conflict or timeout — leave label unchanged
+        if self._hw_poll_running:
+            return
+        afg, ch = self._map.get_afg_ch(self._axis)
+        if afg is None or not afg.is_connected:
+            return
+        self._hw_poll_running = True
+
+        def _done(txt):
+            self._hw_lbl.setText(txt)
+            self._hw_poll_running = False
+
+        _poll_hw_async(afg, ch, _done)
 
     # -- Button slots --------------------------------------------------------
 
@@ -2251,23 +2285,27 @@ class SweepTab(QWidget):
             self._wf_status.setStyleSheet("color:red;")
 
     def _update_wf_hw_lbl(self, afg, ch: int) -> None:
-        try:
-            txt = _query_ch_status(afg, ch)
-            self._wf_hw_lbl.setText(txt)
-        except Exception:
-            pass
+        _poll_hw_async(afg, ch, self._wf_hw_lbl.setText)
 
     def _poll_wf_hw_status(self) -> None:
         if self._worker is not None:
+            return
+        if getattr(self, '_wf_poll_running', False):
             return
         axis = self._selected_axis()
         try:
             afg, ch = self._map.get_afg_ch(axis)
             if afg is None or not afg.is_connected:
                 return
-            self._update_wf_hw_lbl(afg, ch)
         except Exception:
-            pass
+            return
+        self._wf_poll_running = True
+
+        def _done(txt):
+            self._wf_hw_lbl.setText(txt)
+            self._wf_poll_running = False
+
+        _poll_hw_async(afg, ch, _done)
 
     # ------------------------------------------------------------------
     # Sweep control
