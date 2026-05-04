@@ -652,6 +652,37 @@ class ChannelControlWidget(QWidget):
             cr1.addWidget(self._comb_freqs)
             cl.addLayout(cr1)
 
+            # arange-style helper row
+            cr_range = QHBoxLayout()
+            cr_range.addWidget(QLabel("Range:"))
+            self._comb_start = QDoubleSpinBox()
+            self._comb_start.setRange(0.001, 25e6)
+            self._comb_start.setDecimals(3)
+            self._comb_start.setValue(100.0)
+            self._comb_start.setMinimumWidth(90)
+            self._comb_start.setPrefix("start ")
+            cr_range.addWidget(self._comb_start)
+            self._comb_stop = QDoubleSpinBox()
+            self._comb_stop.setRange(0.001, 25e6)
+            self._comb_stop.setDecimals(3)
+            self._comb_stop.setValue(1000.0)
+            self._comb_stop.setMinimumWidth(90)
+            self._comb_stop.setPrefix("stop ")
+            cr_range.addWidget(self._comb_stop)
+            self._comb_step = QDoubleSpinBox()
+            self._comb_step.setRange(0.001, 25e6)
+            self._comb_step.setDecimals(3)
+            self._comb_step.setValue(100.0)
+            self._comb_step.setMinimumWidth(90)
+            self._comb_step.setPrefix("step ")
+            cr_range.addWidget(self._comb_step)
+            range_btn = QPushButton("→ List")
+            range_btn.setMaximumWidth(60)
+            range_btn.clicked.connect(self._comb_range_to_list)
+            cr_range.addWidget(range_btn)
+            cr_range.addStretch()
+            cl.addLayout(cr_range)
+
             cr2 = QHBoxLayout()
             cr2.addWidget(QLabel("Amplitude:"))
             self._comb_amp = QDoubleSpinBox()
@@ -913,6 +944,24 @@ class ChannelControlWidget(QWidget):
             self._set_status_err(f"Error: {e}")
 
     # -- Frequency comb ------------------------------------------------------
+
+    def _comb_range_to_list(self):
+        import numpy as np
+        start = self._comb_start.value()
+        stop  = self._comb_stop.value()
+        step  = self._comb_step.value()
+        if step <= 0 or start >= stop:
+            self._comb_status.setText("Invalid range (need start < stop, step > 0)")
+            self._comb_status.setStyleSheet("color: red;")
+            return
+        freqs = np.arange(start, stop, step)
+        if len(freqs) == 0:
+            self._comb_status.setText("Range produced no frequencies")
+            self._comb_status.setStyleSheet("color: red;")
+            return
+        self._comb_freqs.setText(", ".join(f"{f:.6g}" for f in freqs))
+        self._comb_status.setText(f"{len(freqs)} frequencies loaded")
+        self._comb_status.setStyleSheet("color: gray;")
 
     def _apply_comb(self):
         if not _ARB_AVAILABLE:
