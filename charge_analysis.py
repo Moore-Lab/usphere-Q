@@ -623,6 +623,20 @@ class AnalysisTab(QWidget):
         outer.setSpacing(8)
         outer.setContentsMargins(6, 6, 6, 6)
 
+        # --- Monitor axis ---
+        axis_row = QHBoxLayout()
+        axis_row.addWidget(QLabel("Monitor axis:"))
+        self._axis_combo = QComboBox()
+        self._axis_combo.addItems(["X", "Y", "Z"])
+        self._axis_combo.setMaximumWidth(80)
+        self._axis_combo.setToolTip(
+            "Which electrode axis is being driven for this charge measurement.\n"
+            "Informational — the WG/CH assignment is set in the Electrodes tab."
+        )
+        axis_row.addWidget(self._axis_combo)
+        axis_row.addStretch()
+        outer.addLayout(axis_row)
+
         # --- Source selector ---
         src_row = QHBoxLayout()
         src_row.addWidget(QLabel("Source type:"))
@@ -855,6 +869,7 @@ class AnalysisTab(QWidget):
 
     def get_config(self) -> dict:
         return {
+            "monitor_axis": self._axis_combo.currentIndex(),
             "source_type": self._source_combo.currentIndex(),
             # File-based
             "watch_dir": self._dir_edit.text(),
@@ -874,6 +889,8 @@ class AnalysisTab(QWidget):
         }
 
     def restore_config(self, cfg: dict):
+        if "monitor_axis" in cfg:
+            self._axis_combo.setCurrentIndex(int(cfg["monitor_axis"]))
         if "source_type" in cfg:
             self._source_combo.setCurrentIndex(int(cfg["source_type"]))
         if "watch_dir" in cfg:

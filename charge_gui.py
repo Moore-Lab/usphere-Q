@@ -346,7 +346,7 @@ class ConnectionsTab(QWidget):
         outer.addSpacing(12)
 
         launch_row = QHBoxLayout()
-        launch_btn = QPushButton("Launch Charge Control ▶")
+        launch_btn = QPushButton("Launch Electrode Control ▶")
         launch_btn.setMinimumWidth(200)
         launch_btn.setStyleSheet(
             "font-size: 14px; font-weight: bold;"
@@ -399,6 +399,8 @@ class ChargeWidget(QWidget):
         self._wg_tab = WaveformControlTab(
             lambda wg_n: self._connections_tab.get_afg(wg_n)
         )
+        if "ElectrodeMap" in saved:
+            self._wg_tab.electrode_map.restore_config(saved["ElectrodeMap"])
 
         # --- Analysis tab ---
         self._analysis_tab = AnalysisTab()
@@ -438,7 +440,7 @@ class ChargeWidget(QWidget):
         # --- Build tab widget ---
         self._tabs = QTabWidget()
         self._tabs.addTab(self._connections_tab, "Connections")
-        self._tabs.addTab(self._wg_tab,          "Waveform Control")
+        self._tabs.addTab(self._wg_tab,          "Electrodes")
         self._tabs.addTab(self._sr530_tab,       "Lock-In (SR530)")
         self._tabs.addTab(self._analysis_tab,    "Analysis")
         self._tabs.addTab(self._control_tab,     "Control")
@@ -472,10 +474,11 @@ class ChargeWidget(QWidget):
         if self._photon_exp.is_running:
             self._photon_exp.abort()
         configs = self._connections_tab.get_all_configs()
-        configs["Analysis"]    = self._analysis_tab.get_config()
-        configs["Control"]     = self._control_tab.get_config()
-        configs["Calibration"] = self._calibration_tab.get_config()
-        configs["Experiment"]  = self._experiment_tab.get_config()
+        configs["Analysis"]      = self._analysis_tab.get_config()
+        configs["Control"]       = self._control_tab.get_config()
+        configs["Calibration"]   = self._calibration_tab.get_config()
+        configs["Experiment"]    = self._experiment_tab.get_config()
+        configs["ElectrodeMap"]  = self._wg_tab.electrode_map.get_config()
         _append_log(configs)
         event.accept()
 
@@ -487,7 +490,7 @@ class ChargeWidget(QWidget):
 class ChargeWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("usphere Charge Control")
+        self.setWindowTitle("usphere Paul Trap Control")
         self.resize(860, 720)
         self._widget = ChargeWidget()
         self.setCentralWidget(self._widget)
