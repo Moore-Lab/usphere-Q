@@ -69,6 +69,19 @@ try:
 except Exception:
     _ZMQ_AVAILABLE = False
 
+try:
+    import sys as _sys
+    import os as _os
+    _AFG_CTRL_DIR = _os.path.join(_os.path.dirname(__file__),
+                                   "resources", "GWINSTEKAFG2225_controller")
+    if _AFG_CTRL_DIR not in _sys.path:
+        _sys.path.insert(0, _AFG_CTRL_DIR)
+    from afg2225_arbitrarywf import WaveformGenerator as _WaveformGenerator
+    from afg2225_arbitrarywf import compute_optimal_points_for_comb as _comb_pts
+    _ARB_AVAILABLE = True
+except Exception:
+    _ARB_AVAILABLE = False
+
 _WG_OPTIONS = ["WG1", "WG2", "WG3"]
 _CH_OPTIONS = ["CH1", "CH2"]
 # Used by PulseGroup / DCGroup selector rows
@@ -81,6 +94,35 @@ _WARN  = "color: #F44336; font-weight: bold; font-size: 11px;"
 
 _PW_UNITS = ["ns", "µs", "ms", "s"]
 _PW_MULTS = {"ns": 1e-9, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
+
+_WF_DISPLAY = {"SIN": "Sine", "SQU": "Square", "RAMP": "Ramp",
+               "NOIS": "Noise", "ARB": "ARB", "PULS": "Pulse"}
+
+
+def _fmt_freq(hz: float) -> str:
+    if hz >= 1e6:
+        return f"{hz/1e6:.4g} MHz"
+    if hz >= 1e3:
+        return f"{hz/1e3:.4g} kHz"
+    return f"{hz:.4g} Hz"
+
+
+def _query_ch_status(afg, ch: int) -> str:
+    """Read current channel state from hardware. May raise on serial error."""
+    on   = afg.is_output_on(ch)
+    raw  = afg.get_waveform_type(ch) or ""
+    wf   = _WF_DISPLAY.get(raw.upper().strip(), raw.strip() or "?")
+    freq = afg.get_frequency(ch)
+    amp  = afg.get_amplitude(ch)
+    off  = afg.get_offset(ch)
+    parts = ["ON" if on else "OFF", wf]
+    if freq is not None:
+        parts.append(_fmt_freq(freq))
+    if amp is not None:
+        parts.append(f"{amp:.3g} Vpp")
+    if off is not None and abs(off) > 0.001:
+        parts.append(f"offset {off:+.3g} V")
+    return "  ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +344,84 @@ class ElectrodeMapWidget(QGroupBox):
 
 
 # ---------------------------------------------------------------------------
+# Frequency comb background worker
+# ---------------------------------------------------------------------------
+
+class _CombWorker(QThread):
+    """Upload a random-phase frequency comb (ARB) to the AFG in a background thread."""
+
+    log      = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)   # success, message
+
+    def __init__(self, afg, ch: int, frequencies: list, amplitude: float,
+                 offset: float, n_mc: int, parent=None):
+        super().__init__(parent)
+        self._afg       = afg
+        self._ch        = ch
+        self._freqs     = frequencies
+        self._amplitude = amplitude
+        self._offset    = offset
+        self._n_mc      = n_mc
+
+    def run(self):
+        import numpy as np
+        try:
+            freqs = self._freqs
+            n_pts, info = _comb_pts(freqs)
+            if info.get("warning"):
+                self.log.emit(f"Warning: {info['warning']}")
+            fundamental = info["fundamental"]
+            self.log.emit(
+                f"Comb: {len(freqs)} tone(s), {n_pts} pts, "
+                f"fundamental {fundamental:.4g} Hz"
+            )
+
+            n = len(freqs)
+            if self._n_mc > 0 and n > 1:
+                self.log.emit(f"MC phase optimization ({self._n_mc} iters)…")
+                best_phases = list(np.random.uniform(0, 360, n))
+                best_wf = _WaveformGenerator.frequency_comb(
+                    freqs, phases=best_phases, num_points=n_pts)
+                best_rms = float(np.sqrt(np.mean(best_wf.data ** 2)))
+
+                for _ in range(self._n_mc):
+                    new_phases = best_phases[:]
+                    idx = int(np.random.randint(n))
+                    new_phases[idx] = float(np.random.uniform(0, 360))
+                    wf = _WaveformGenerator.frequency_comb(
+                        freqs, phases=new_phases, num_points=n_pts)
+                    rms = float(np.sqrt(np.mean(wf.data ** 2)))
+                    if rms > best_rms:
+                        best_rms = rms
+                        best_phases = new_phases
+                        best_wf = wf
+
+                crest = 1.0 / best_rms if best_rms > 0 else float("inf")
+                self.log.emit(
+                    f"MC done — RMS={best_rms:.4f} crest={crest:.3f}"
+                )
+                wf = best_wf
+            else:
+                wf = _WaveformGenerator.frequency_comb(freqs, num_points=n_pts)
+
+            self.log.emit(f"Uploading {n_pts} points to CH{self._ch}…")
+            ok = self._afg.waveform.upload_arbitrary_waveform(self._ch, wf.data)
+            if not ok:
+                self.finished.emit(False, "Upload failed — check serial connection")
+                return
+
+            ok2 = self._afg.waveform.apply_arbitrary(
+                self._ch, fundamental, self._amplitude, self._offset)
+            msg = (
+                f"Comb applied — {len(freqs)} tones, "
+                f"{fundamental:.4g} Hz fundamental, {self._amplitude:.3g} Vpp"
+            )
+            self.finished.emit(ok2, msg if ok2 else "apply_arbitrary failed")
+        except Exception as exc:
+            self.finished.emit(False, str(exc))
+
+
+# ---------------------------------------------------------------------------
 # Per-axis full waveform control
 # ---------------------------------------------------------------------------
 
@@ -485,6 +605,54 @@ class ChannelControlWidget(QWidget):
         self._status.setStyleSheet("color: gray;")
         outer.addWidget(self._status)
 
+        self._hw_lbl = QLabel("")
+        self._hw_lbl.setStyleSheet(_HINT)
+        self._hw_lbl.setWordWrap(True)
+        outer.addWidget(self._hw_lbl)
+
+        # === Frequency Comb (ARB) ===
+        self._comb_worker: "_CombWorker | None" = None
+        if _ARB_AVAILABLE:
+            comb_box = QGroupBox("Frequency Comb (ARB)")
+            cl = QVBoxLayout(comb_box)
+
+            cr1 = QHBoxLayout()
+            cr1.addWidget(QLabel("Frequencies (Hz):"))
+            self._comb_freqs = QLineEdit()
+            self._comb_freqs.setPlaceholderText("e.g.  100, 200, 500")
+            cr1.addWidget(self._comb_freqs)
+            cl.addLayout(cr1)
+
+            cr2 = QHBoxLayout()
+            cr2.addWidget(QLabel("Amplitude:"))
+            self._comb_amp = QDoubleSpinBox()
+            self._comb_amp.setRange(0.001, 20.0)
+            self._comb_amp.setDecimals(3)
+            self._comb_amp.setValue(1.0)
+            self._comb_amp.setSuffix(" Vpp")
+            self._comb_amp.setMinimumWidth(100)
+            cr2.addWidget(self._comb_amp)
+            cr2.addSpacing(12)
+            cr2.addWidget(QLabel("MC iter:"))
+            self._comb_mc = QSpinBox()
+            self._comb_mc.setRange(0, 20000)
+            self._comb_mc.setValue(500)
+            self._comb_mc.setMinimumWidth(75)
+            cr2.addWidget(self._comb_mc)
+            cr2.addStretch()
+            cl.addLayout(cr2)
+
+            cr3 = QHBoxLayout()
+            self._comb_btn = QPushButton("Apply Comb")
+            self._comb_btn.clicked.connect(self._apply_comb)
+            cr3.addWidget(self._comb_btn)
+            self._comb_status = QLabel("—")
+            self._comb_status.setStyleSheet("color: gray;")
+            cr3.addWidget(self._comb_status, 1)
+            cl.addLayout(cr3)
+
+            outer.addWidget(comb_box)
+
         # === Waveform preview ===
         if _PLOT_AVAILABLE:
             self._plot_widget = pg.PlotWidget()
@@ -507,6 +675,12 @@ class ChannelControlWidget(QWidget):
             self._plot_timer = None
 
         outer.addStretch()
+
+        # Poll hardware state every 8 s (slow enough to avoid serial conflicts)
+        self._hw_poll_timer = QTimer(self)
+        self._hw_poll_timer.setInterval(8000)
+        self._hw_poll_timer.timeout.connect(self._update_hw_lbl)
+        self._hw_poll_timer.start()
 
         # Connect waveform radio buttons now that all param widgets exist
         for rb in self._wf_btns.values():
@@ -632,6 +806,18 @@ class ChannelControlWidget(QWidget):
         self._status.setText(msg)
         self._status.setStyleSheet("color: red;")
 
+    def _update_hw_lbl(self):
+        """Query hardware state and update the gray readout label (8 s timer + after actions)."""
+        if self._comb_worker is not None:
+            return
+        try:
+            afg, ch = self._map.get_afg_ch(self._axis)
+            if afg is None or not afg.is_connected:
+                return
+            self._hw_lbl.setText(_query_ch_status(afg, ch))
+        except Exception:
+            pass  # serial conflict or timeout — leave label unchanged
+
     # -- Button slots --------------------------------------------------------
 
     def _apply(self):
@@ -665,6 +851,7 @@ class ChannelControlWidget(QWidget):
             self._set_status_ok(
                 f"Applied — {wf}, {freq:.4g} Hz, {amp:.3g} Vpp"
             )
+            self._update_hw_lbl()
         except Exception as e:
             self._set_status_err(f"Error: {e}")
 
@@ -675,6 +862,7 @@ class ChannelControlWidget(QWidget):
         try:
             afg.output_on(ch)
             self._set_status_ok("Output ON")
+            self._update_hw_lbl()
         except Exception as e:
             self._set_status_err(f"Error: {e}")
 
@@ -686,8 +874,63 @@ class ChannelControlWidget(QWidget):
             afg.output_off(ch)
             self._status.setText("Output OFF")
             self._status.setStyleSheet("color: gray;")
+            self._update_hw_lbl()
         except Exception as e:
             self._set_status_err(f"Error: {e}")
+
+    # -- Frequency comb ------------------------------------------------------
+
+    def _apply_comb(self):
+        if not _ARB_AVAILABLE:
+            return
+        if self._comb_worker is not None:
+            return
+        afg, ch = self._afg_ch()
+        if afg is None:
+            return
+
+        raw = self._comb_freqs.text().strip()
+        if not raw:
+            self._comb_status.setText("Enter frequencies first")
+            self._comb_status.setStyleSheet("color: red;")
+            return
+        try:
+            freqs = [float(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            self._comb_status.setText("Invalid frequency list")
+            self._comb_status.setStyleSheet("color: red;")
+            return
+        if not freqs:
+            self._comb_status.setText("No valid frequencies")
+            self._comb_status.setStyleSheet("color: red;")
+            return
+
+        self._comb_btn.setEnabled(False)
+        self._comb_status.setText("Working…")
+        self._comb_status.setStyleSheet("color: gray;")
+
+        self._comb_worker = _CombWorker(
+            afg, ch, freqs,
+            amplitude=self._comb_amp.value(),
+            offset=0.0,
+            n_mc=self._comb_mc.value(),
+            parent=self,
+        )
+        self._comb_worker.log.connect(
+            lambda msg: self._comb_status.setText(msg))
+        self._comb_worker.finished.connect(self._on_comb_done)
+        self._comb_worker.start()
+
+    def _on_comb_done(self, ok: bool, msg: str):
+        self._comb_btn.setEnabled(True)
+        self._comb_worker = None
+        if ok:
+            self._comb_status.setText(msg)
+            self._comb_status.setStyleSheet("color: green;")
+            self._update_hw_lbl()
+        else:
+            self._comb_status.setText(f"Error: {msg}")
+            self._comb_status.setStyleSheet("color: red;")
 
     # -- Waveform preview ----------------------------------------------------
 
@@ -1598,6 +1841,9 @@ class SweepTab(QWidget):
         wr3.addWidget(self._wf_status)
         wr3.addStretch()
         wl.addLayout(wr3)
+        self._wf_hw_lbl = QLabel("")
+        self._wf_hw_lbl.setStyleSheet("color:gray;font-style:italic;")
+        wl.addWidget(self._wf_hw_lbl)
         root.addWidget(wf_box)
 
         # ── Recording Settings ───────────────────────────────────────────
@@ -1805,6 +2051,12 @@ class SweepTab(QWidget):
         )
         root.addWidget(self._log_box)
 
+        # Poll waveform setup HW state every 8 s (skip if sweep running)
+        self._wf_poll_timer = QTimer(self)
+        self._wf_poll_timer.setInterval(8000)
+        self._wf_poll_timer.timeout.connect(self._poll_wf_hw_status)
+        self._wf_poll_timer.start()
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1967,6 +2219,7 @@ class SweepTab(QWidget):
                 f"Applied — {wf}, {freq:.4g} Hz, {amp:.3g} Vpp"
             )
             self._wf_status.setStyleSheet("color:green;")
+            self._update_wf_hw_lbl(afg, ch)
         except Exception as exc:
             self._wf_status.setText(f"Error: {exc}")
             self._wf_status.setStyleSheet("color:red;")
@@ -1979,6 +2232,7 @@ class SweepTab(QWidget):
             afg.output_on(ch)
             self._wf_status.setText("Output ON")
             self._wf_status.setStyleSheet("color:green;")
+            self._update_wf_hw_lbl(afg, ch)
         except Exception as exc:
             self._wf_status.setText(f"Error: {exc}")
             self._wf_status.setStyleSheet("color:red;")
@@ -1991,9 +2245,29 @@ class SweepTab(QWidget):
             afg.output_off(ch)
             self._wf_status.setText("Output OFF")
             self._wf_status.setStyleSheet("color:gray;")
+            self._update_wf_hw_lbl(afg, ch)
         except Exception as exc:
             self._wf_status.setText(f"Error: {exc}")
             self._wf_status.setStyleSheet("color:red;")
+
+    def _update_wf_hw_lbl(self, afg, ch: int) -> None:
+        try:
+            txt = _query_ch_status(afg, ch)
+            self._wf_hw_lbl.setText(txt)
+        except Exception:
+            pass
+
+    def _poll_wf_hw_status(self) -> None:
+        if self._worker is not None:
+            return
+        axis = self._selected_axis()
+        try:
+            afg, ch = self._map.get_afg_ch(axis)
+            if afg is None or not afg.is_connected:
+                return
+            self._update_wf_hw_lbl(afg, ch)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Sweep control
