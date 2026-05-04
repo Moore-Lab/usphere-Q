@@ -1260,6 +1260,7 @@ class _SweepWorker(QThread):
                  prefix: str, output_dir: str,
                  sample_rate: float, n_bits: int,
                  daq_host: str, daq_rep_port: int,
+                 fixed_freq: float = 0.0, fixed_amp: float = 0.0,
                  parent=None):
         super().__init__(parent)
         self._afg            = afg
@@ -1274,6 +1275,8 @@ class _SweepWorker(QThread):
         self._n_bits         = n_bits
         self._daq_host       = daq_host
         self._daq_rep_port   = daq_rep_port
+        self._fixed_freq     = fixed_freq
+        self._fixed_amp      = fixed_amp
         self._cancel         = False
 
     def cancel(self):
@@ -1306,23 +1309,23 @@ class _SweepWorker(QThread):
 
                 # --- Set AFG parameter ---
                 if self._mode == "amplitude":
-                    self.log.emit(f"--- Step {i+1}/{n}: {val:.4g} Vpp ---")
+                    self.log.emit(f"--- Step {i+1}/{n}: amp={val:.4g} Vpp  freq={self._fixed_freq:.4g} Hz ---")
                     try:
                         self._afg.set_amplitude(self._channel, val)
                     except Exception as exc:
                         self.log.emit(f"  ERROR setting amplitude: {exc}")
                         self.finished.emit(False)
                         return
-                    basename = f"{self._prefix}_amp_{val:.4g}"
+                    basename = f"{self._prefix}_amp{val:.4g}V_f{self._fixed_freq:.4g}Hz"
                 else:
-                    self.log.emit(f"--- Step {i+1}/{n}: {val:.4g} Hz ---")
+                    self.log.emit(f"--- Step {i+1}/{n}: freq={val:.4g} Hz  amp={self._fixed_amp:.4g} Vpp ---")
                     try:
                         self._afg.set_frequency(self._channel, val)
                     except Exception as exc:
                         self.log.emit(f"  ERROR setting frequency: {exc}")
                         self.finished.emit(False)
                         return
-                    basename = f"{self._prefix}_freq_{val:.4g}"
+                    basename = f"{self._prefix}_f{val:.4g}Hz_amp{self._fixed_amp:.4g}V"
 
                 # --- Settle ---
                 if self._settle_s > 0:
@@ -1368,6 +1371,8 @@ class _SweepWorker(QThread):
                 # --- Wait for recording to finish ---
                 timeout = max(180.0, dur_s * self._files_per_step * 2.5)
                 t0 = time.time()
+                # Brief initial wait so the recorder thread is definitely alive
+                time.sleep(0.5)
                 while True:
                     if self._cancel:
                         try:
@@ -1385,10 +1390,26 @@ class _SweepWorker(QThread):
                         return
                     try:
                         st = daq.send("get_status")
-                        if not st.get("data", {}).get("recording", True):
+                        st_data = st.get("data", {})
+                        if not st_data.get("recording", True):
+                            # Recording stopped — check whether files were written
+                            files_written = st_data.get("file_index", 0)
+                            elapsed = time.time() - t0
+                            if files_written == 0:
+                                self.log.emit(
+                                    f"  WARNING: recording stopped after {elapsed:.1f}s "
+                                    f"but 0 files written.\n"
+                                    f"  Check DAQ server logs for hardware errors "
+                                    f"(wrong device name, NI-DAQmx not connected, etc.)"
+                                )
+                            else:
+                                self.log.emit(
+                                    f"  {files_written}/{self._files_per_step} file(s) "
+                                    f"written in {elapsed:.1f}s"
+                                )
                             break
-                    except Exception:
-                        pass
+                    except Exception as poll_exc:
+                        self.log.emit(f"  poll error: {poll_exc}")
                     time.sleep(0.3)
 
                 if self._cancel:
@@ -1963,6 +1984,8 @@ class SweepTab(QWidget):
             n_bits=self._nbits_spin.value(),
             daq_host=self._host_edit.text().strip() or "localhost",
             daq_rep_port=self._port_spin.value(),
+            fixed_freq=self._wf_freq.value(),
+            fixed_amp=self._wf_amp.value(),
         )
         self._worker.log.connect(self._log)
         self._worker.progress.connect(
