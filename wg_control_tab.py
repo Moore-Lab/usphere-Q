@@ -1448,8 +1448,11 @@ class SweepTab(QWidget):
 
     def __init__(self, electrode_map: "ElectrodeMapWidget", parent=None):
         super().__init__(parent)
-        self._map    = electrode_map
+        self._map          = electrode_map
         self._worker: _SweepWorker | None = None
+        self._sweep_list:   list[dict] = []
+        self._pending_list: list[dict] = []
+        self._running_list: bool       = False
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -1692,8 +1695,55 @@ class SweepTab(QWidget):
 
         self._on_mode_changed()
 
+        # ── Sweep Chain / Recipe ─────────────────────────────────────────
+        chain_box = QGroupBox("Sweep Chain / Recipe")
+        chl = QVBoxLayout(chain_box)
+
+        chain_btn_row = QHBoxLayout()
+        self._add_btn = QPushButton("Add to List")
+        self._add_btn.setToolTip("Append current sweep configuration to the list")
+        self._add_btn.clicked.connect(self._add_to_list)
+        chain_btn_row.addWidget(self._add_btn)
+
+        self._remove_last_btn = QPushButton("Clear Last")
+        self._remove_last_btn.setEnabled(False)
+        self._remove_last_btn.clicked.connect(self._remove_last)
+        chain_btn_row.addWidget(self._remove_last_btn)
+
+        self._clear_list_btn = QPushButton("Clear List")
+        self._clear_list_btn.setEnabled(False)
+        self._clear_list_btn.clicked.connect(self._clear_list)
+        chain_btn_row.addWidget(self._clear_list_btn)
+
+        chain_btn_row.addSpacing(16)
+
+        self._save_recipe_btn = QPushButton("Save Recipe…")
+        self._save_recipe_btn.clicked.connect(self._save_recipe)
+        chain_btn_row.addWidget(self._save_recipe_btn)
+
+        self._load_recipe_btn = QPushButton("Load Recipe…")
+        self._load_recipe_btn.clicked.connect(self._load_recipe)
+        chain_btn_row.addWidget(self._load_recipe_btn)
+
+        chain_btn_row.addStretch()
+        chl.addLayout(chain_btn_row)
+
+        self._list_display = QTextEdit()
+        self._list_display.setReadOnly(True)
+        self._list_display.setFixedHeight(100)
+        self._list_display.setStyleSheet(
+            "font-family:Consolas,monospace;font-size:10px;"
+            "background:#f8f8f8;color:#333;border:1px solid #ccc;"
+        )
+        self._list_display.setPlaceholderText(
+            "(empty — configure a sweep above then click Add to List)"
+        )
+        chl.addWidget(self._list_display)
+        root.addWidget(chain_box)
+
         # ── Controls ────────────────────────────────────────────────────
         ctrl_row = QHBoxLayout()
+
         self._start_btn = QPushButton("▶  Start Sweep")
         self._start_btn.setMinimumWidth(130)
         self._start_btn.setStyleSheet(
@@ -1704,6 +1754,19 @@ class SweepTab(QWidget):
         )
         self._start_btn.clicked.connect(self._start_sweep)
         ctrl_row.addWidget(self._start_btn)
+
+        self._run_list_btn = QPushButton("▶  Run List")
+        self._run_list_btn.setEnabled(False)
+        self._run_list_btn.setMinimumWidth(110)
+        self._run_list_btn.setStyleSheet(
+            "QPushButton{background:#15803d;color:white;font-weight:bold;"
+            "padding:5px 14px;border-radius:4px;}"
+            "QPushButton:hover{background:#16a34a;}"
+            "QPushButton:disabled{background:#94a3b8;}"
+        )
+        self._run_list_btn.clicked.connect(self._run_list)
+        ctrl_row.addWidget(self._run_list_btn)
+
         self._cancel_btn = QPushButton("■  Cancel")
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.setStyleSheet(
@@ -1714,6 +1777,7 @@ class SweepTab(QWidget):
         )
         self._cancel_btn.clicked.connect(self._cancel_sweep)
         ctrl_row.addWidget(self._cancel_btn)
+
         self._progress_lbl = QLabel("")
         self._progress_lbl.setStyleSheet("color:gray;font-size:10px;")
         ctrl_row.addWidget(self._progress_lbl)
@@ -1924,68 +1988,271 @@ class SweepTab(QWidget):
     # Sweep control
     # ------------------------------------------------------------------
 
-    def _build_values(self) -> list:
-        start = self._start_spin.value()
-        stop  = self._stop_spin.value()
-        step  = self._step_spin.value()
-        vals, v = [], start
-        while v <= stop + 1e-9:
-            vals.append(round(v, 8))
-            v += step
-        return vals
+    # ------------------------------------------------------------------
+    # Sweep config capture & list management
+    # ------------------------------------------------------------------
+
+    def _capture_sweep_config(self) -> dict:
+        """Snapshot the current UI state into a portable dict."""
+        return {
+            "axis":           self._selected_axis(),
+            "wf_type":        self._wf_combo.currentText(),
+            "freq_hz":        self._wf_freq.value(),
+            "amp_vpp":        self._wf_amp.value(),
+            "offset_v":       self._wf_offset.value(),
+            "phase_deg":      self._wf_phase.value(),
+            "mode":           "amplitude" if self._amp_rb.isChecked() else "frequency",
+            "start":          self._start_spin.value(),
+            "stop":           self._stop_spin.value(),
+            "step":           self._step_spin.value(),
+            "files_per_step": self._files_spin.value(),
+            "settle_s":       self._settle_spin.value(),
+            "sample_rate":    self._rate_spin.value(),
+            "n_bits":         self._nbits_spin.value(),
+            "output_dir":     self._dir_edit.text().strip(),
+            "prefix":         self._prefix_edit.text().strip() or "ptrap",
+            "daq_host":       self._host_edit.text().strip() or "localhost",
+            "daq_port":       self._port_spin.value(),
+        }
+
+    def _format_sweep_entry(self, i: int, cfg: dict) -> str:
+        axis  = cfg["axis"].upper()
+        wf    = cfg["wf_type"]
+        freq  = cfg["freq_hz"]
+        amp   = cfg["amp_vpp"]
+        mode  = cfg["mode"]
+        start = cfg["start"]
+        stop  = cfg["stop"]
+        step  = cfg["step"]
+        unit  = "Vpp" if mode == "amplitude" else "Hz"
+        n_pts = max(1, round((stop - start) / step) + 1) if step > 0 else 1
+        sr    = cfg["sample_rate"]
+        nb    = cfg["n_bits"]
+        dur   = (2 ** nb) / sr if sr else 0.0
+        fps   = cfg["files_per_step"]
+        return (
+            f"[{i+1}] {axis} | {wf} {freq:.4g}Hz {amp:.4g}Vpp | "
+            f"{mode}: {start:.4g}→{stop:.4g} {unit} step {step:.4g} ({n_pts} pts) | "
+            f"{fps}×{dur:.1f}s settle {cfg['settle_s']:.1f}s | → {cfg['prefix']}"
+        )
+
+    def _refresh_list_display(self):
+        has = bool(self._sweep_list)
+        if has:
+            self._list_display.setPlainText(
+                "\n".join(
+                    self._format_sweep_entry(i, cfg)
+                    for i, cfg in enumerate(self._sweep_list)
+                )
+            )
+        else:
+            self._list_display.clear()
+        self._run_list_btn.setEnabled(has and self._worker is None)
+        self._remove_last_btn.setEnabled(has)
+        self._clear_list_btn.setEnabled(has)
+
+    def _add_to_list(self):
+        cfg = self._capture_sweep_config()
+        if not cfg["output_dir"]:
+            self._log("Cannot add to list: output directory is empty.")
+            return
+        self._sweep_list.append(cfg)
+        self._refresh_list_display()
+        self._log(f"Added: {self._format_sweep_entry(len(self._sweep_list)-1, cfg)}")
+
+    def _remove_last(self):
+        if self._sweep_list:
+            self._sweep_list.pop()
+            self._refresh_list_display()
+            self._log(f"Removed last entry ({len(self._sweep_list)} remaining).")
+
+    def _clear_list(self):
+        self._sweep_list.clear()
+        self._refresh_list_display()
+        self._log("Sweep list cleared.")
+
+    def _save_recipe(self):
+        import json as _json
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save sweep recipe", "",
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(self._sweep_list, f, indent=2)
+            self._log(f"Recipe saved ({len(self._sweep_list)} sweep(s)): {path}")
+        except Exception as exc:
+            self._log(f"ERROR saving recipe: {exc}")
+
+    def _load_recipe(self):
+        import json as _json
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load sweep recipe", "",
+            "JSON files (*.json);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if not isinstance(data, list):
+                self._log("ERROR: recipe file must be a JSON list.")
+                return
+            self._sweep_list = data
+            self._refresh_list_display()
+            self._log(f"Recipe loaded ({len(self._sweep_list)} sweep(s)): {path}")
+        except Exception as exc:
+            self._log(f"ERROR loading recipe: {exc}")
+
+    # ------------------------------------------------------------------
+    # Sweep execution (single and list)
+    # ------------------------------------------------------------------
 
     def _start_sweep(self):
-        axis = self._selected_axis()
+        """Start a single sweep from the current UI state (no wf auto-apply)."""
+        cfg = self._capture_sweep_config()
+        self._launch_worker(cfg, apply_wf=False)
+
+    def _run_list(self):
+        """Start running the full sweep list from the beginning."""
+        if not self._sweep_list:
+            self._log("Sweep list is empty — add sweeps first.")
+            return
+        self._pending_list = list(self._sweep_list)
+        self._running_list = True
+        total = len(self._pending_list)
+        self._log(
+            f"\n{'='*60}\n"
+            f"Running recipe: {total} sweep(s)\n"
+            f"{'='*60}"
+        )
+        self._start_btn.setEnabled(False)
+        self._run_list_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
+        self._run_next_in_list()
+
+    def _run_next_in_list(self):
+        if not self._pending_list:
+            self._on_list_done(True)
+            return
+        cfg   = self._pending_list.pop(0)
+        done  = len(self._sweep_list) - len(self._pending_list)
+        total = len(self._sweep_list)
+        self._progress_lbl.setText(f"Recipe {done}/{total}")
+        self._log(f"\n--- Recipe step {done}/{total} ---")
+        self._launch_worker(cfg, apply_wf=True)
+
+    def _on_list_done(self, ok: bool):
+        self._running_list = False
+        self._pending_list = []
+        self._start_btn.setEnabled(True)
+        self._run_list_btn.setEnabled(bool(self._sweep_list))
+        self._cancel_btn.setEnabled(False)
+        self._progress_lbl.setText("")
+        self._log(
+            "\n=== Recipe complete ===" if ok
+            else "\n=== Recipe cancelled/stopped ==="
+        )
+
+    def _launch_worker(self, cfg: dict, apply_wf: bool):
+        """Validate, optionally apply waveform, then start _SweepWorker."""
+        axis = cfg["axis"]
         afg, ch = self._map.get_afg_ch(axis)
 
         if afg is None or not afg.is_connected:
             self._log(
                 f"ERROR: {axis.upper()} electrode AFG not connected.\n"
-                "Connect it in the Electrode Map tab, then return here."
+                "Connect it in the Electrode Map tab."
             )
+            if self._running_list:
+                self._on_list_done(False)
             return
 
-        out_dir = self._dir_edit.text().strip()
+        out_dir = cfg.get("output_dir", "")
         if not out_dir:
             self._log(
                 "ERROR: Output directory is empty.\n"
-                "Browse to a folder or click 'Fetch Config' to load the DAQ default."
+                "Browse to a folder or click 'Fetch Config'."
             )
+            if self._running_list:
+                self._on_list_done(False)
             return
 
-        vals = self._build_values()
+        # Apply waveform before sweeping (recipe mode always; single mode skips)
+        wf    = cfg["wf_type"]
+        freq  = cfg["freq_hz"]
+        amp   = cfg["amp_vpp"]
+        offset = cfg["offset_v"]
+        phase  = cfg["phase_deg"]
+        if apply_wf:
+            try:
+                if wf == "Sine":
+                    afg.setup_sine(ch, frequency=freq, amplitude=amp, offset=offset)
+                    afg.set_phase(ch, phase)
+                elif wf == "Square":
+                    afg.setup_square(ch, frequency=freq, amplitude=amp, offset=offset)
+                    afg.set_phase(ch, phase)
+                elif wf == "Ramp":
+                    afg.setup_ramp(ch, frequency=freq, amplitude=amp, offset=offset)
+                    afg.set_phase(ch, phase)
+                elif wf == "Noise":
+                    afg.setup_noise(ch, amplitude=amp, offset=offset)
+                elif wf == "ARB (loaded)":
+                    afg.set_amplitude(ch, amp)
+                    afg.set_offset(ch, offset)
+                afg.output_on(ch)
+                self._log(
+                    f"  Waveform: {wf} {freq:.4g}Hz {amp:.4g}Vpp → output ON"
+                )
+            except Exception as exc:
+                self._log(f"  WARNING: waveform apply failed: {exc}")
+
+        # Build sweep value list
+        start = cfg["start"]
+        stop  = cfg["stop"]
+        step  = cfg["step"]
+        vals, v = [], start
+        while v <= stop + 1e-9:
+            vals.append(round(v, 8))
+            v += step
         if not vals:
             self._log("ERROR: No sweep steps in range.")
+            if self._running_list:
+                self._on_list_done(False)
             return
 
-        mode   = "amplitude" if self._amp_rb.isChecked() else "frequency"
-        prefix = self._prefix_edit.text().strip() or "ptrap"
+        mode   = cfg["mode"]
+        prefix = cfg.get("prefix", "ptrap")
+        sr     = cfg["sample_rate"]
+        nb     = cfg["n_bits"]
+        fps    = cfg["files_per_step"]
+        settle = cfg["settle_s"]
 
         self._log(
             f"Sweep: {axis.upper()} electrode  ({self._map.assignment_str(axis)})\n"
             f"  Mode: {mode}  |  "
             f"{len(vals)} steps: {vals[0]:.4g} → {vals[-1]:.4g} "
             f"({'Vpp' if mode == 'amplitude' else 'Hz'})\n"
-            f"  {self._files_spin.value()} file(s)/step  "
-            f"| settle {self._settle_spin.value():.1f} s\n"
+            f"  {fps} file(s)/step  | settle {settle:.1f} s\n"
             f"  Output: {out_dir}  |  prefix: {prefix}\n"
-            f"  {2**self._nbits_spin.value():,} samples @ "
-            f"{self._rate_spin.value():.0f} Hz = "
-            f"{2**self._nbits_spin.value() / self._rate_spin.value():.2f} s/file"
+            f"  {2**nb:,} samples @ {sr:.0f} Hz = {2**nb / sr:.2f} s/file"
         )
 
         self._worker = _SweepWorker(
             afg=afg, channel=ch,
             mode=mode, values=vals,
-            settle_s=self._settle_spin.value(),
-            files_per_step=self._files_spin.value(),
+            settle_s=settle,
+            files_per_step=fps,
             prefix=prefix, output_dir=out_dir,
-            sample_rate=self._rate_spin.value(),
-            n_bits=self._nbits_spin.value(),
-            daq_host=self._host_edit.text().strip() or "localhost",
-            daq_rep_port=self._port_spin.value(),
-            fixed_freq=self._wf_freq.value(),
-            fixed_amp=self._wf_amp.value(),
+            sample_rate=sr,
+            n_bits=nb,
+            daq_host=cfg.get("daq_host", "localhost"),
+            daq_rep_port=cfg.get("daq_port", 5552),
+            fixed_freq=freq, fixed_amp=amp,
         )
         self._worker.log.connect(self._log)
         self._worker.progress.connect(
@@ -1995,18 +2262,28 @@ class SweepTab(QWidget):
         self._worker.start()
 
         self._start_btn.setEnabled(False)
+        self._run_list_btn.setEnabled(False)
         self._cancel_btn.setEnabled(True)
 
     def _cancel_sweep(self):
+        self._pending_list.clear()   # prevent next step in list from starting
         if self._worker:
             self._worker.cancel()
 
     def _on_finished(self, ok: bool):
-        self._start_btn.setEnabled(True)
-        self._cancel_btn.setEnabled(False)
-        self._progress_lbl.setText("")
-        self._log("Sweep complete." if ok else "Sweep stopped.")
         self._worker = None
+        self._progress_lbl.setText("")
+
+        if self._running_list:
+            if ok and self._pending_list:
+                self._run_next_in_list()
+            else:
+                self._on_list_done(ok)
+        else:
+            self._start_btn.setEnabled(True)
+            self._run_list_btn.setEnabled(bool(self._sweep_list))
+            self._cancel_btn.setEnabled(False)
+            self._log("Sweep complete." if ok else "Sweep stopped.")
 
 
 # ---------------------------------------------------------------------------
