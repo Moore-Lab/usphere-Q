@@ -10,6 +10,7 @@ Sub-tabs:
     Z Electrode    — full waveform control for Z axis
     Filament       — pulse to SSR (0 V low, V_high high)
     Flash Lamp     — trigger pulse + DC control
+    Sweep          — automated amplitude/frequency sweep with DAQ recording
 
 Public attributes on WaveformControlTab (for control-loop wiring):
     electrode_map  : ElectrodeMapWidget
@@ -20,25 +21,30 @@ Public attributes on WaveformControlTab (for control-loop wiring):
     flash_trigger  : PulseGroup
     flash_control  : DCGroup
     flashlamp      : FlashLampAdapter
+    sweep          : SweepTab
 """
 
 from __future__ import annotations
 
 import math
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSpinBox,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -51,6 +57,17 @@ try:
     _PLOT_AVAILABLE = True
 except ImportError:
     _PLOT_AVAILABLE = False
+
+try:
+    import sys as _sys
+    import os as _os
+    _ZMQ_BASE = _os.path.join(_os.path.dirname(__file__))
+    if _ZMQ_BASE not in _sys.path:
+        _sys.path.insert(0, _ZMQ_BASE)
+    from zmq_base import ModuleClient as _ModuleClient
+    _ZMQ_AVAILABLE = True
+except Exception:
+    _ZMQ_AVAILABLE = False
 
 _WG_OPTIONS = ["WG1", "WG2", "WG3"]
 _CH_OPTIONS = ["CH1", "CH2"]
@@ -1223,6 +1240,507 @@ class FlashLampAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Sweep automation — worker thread
+# ---------------------------------------------------------------------------
+
+class _SweepWorker(QThread):
+    """
+    Runs an amplitude or frequency sweep in a background thread.
+
+    Uses the AFG that is already connected via the electrode map —
+    no second serial connection needed.  Controls the DAQ via ZMQ.
+    """
+
+    log      = pyqtSignal(str)
+    progress = pyqtSignal(int, int)   # (step, total)
+    finished = pyqtSignal(bool)       # success flag
+
+    def __init__(self, afg, channel: int, mode: str,
+                 values: list, settle_s: float, files_per_step: int,
+                 prefix: str, output_dir: str,
+                 daq_host: str, daq_rep_port: int,
+                 parent=None):
+        super().__init__(parent)
+        self._afg            = afg
+        self._channel        = channel
+        self._mode           = mode           # "amplitude" or "frequency"
+        self._values         = values
+        self._settle_s       = settle_s
+        self._files_per_step = files_per_step
+        self._prefix         = prefix
+        self._output_dir     = output_dir
+        self._daq_host       = daq_host
+        self._daq_rep_port   = daq_rep_port
+        self._cancel         = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        if not _ZMQ_AVAILABLE:
+            self.log.emit("ERROR: zmq not available — cannot control DAQ.")
+            self.finished.emit(False)
+            return
+
+        daq = _ModuleClient(
+            "daq",
+            rep_port=self._daq_rep_port,
+            pub_port=self._daq_rep_port + 1,
+            host=self._daq_host,
+            timeout_ms=8000,
+        )
+
+        try:
+            n = len(self._values)
+            for i, val in enumerate(self._values):
+                if self._cancel:
+                    self.log.emit("Sweep cancelled.")
+                    break
+
+                self.progress.emit(i + 1, n)
+
+                # --- Set AFG parameter ---
+                if self._mode == "amplitude":
+                    self.log.emit(f"--- Step {i+1}/{n}: {val:.4g} Vpp ---")
+                    try:
+                        self._afg.set_amplitude(self._channel, val)
+                    except Exception as exc:
+                        self.log.emit(f"  ERROR setting amplitude: {exc}")
+                        self.finished.emit(False)
+                        return
+                    basename = f"{self._prefix}_amp_{val:.4g}"
+                else:
+                    self.log.emit(f"--- Step {i+1}/{n}: {val:.4g} Hz ---")
+                    try:
+                        self._afg.set_frequency(self._channel, val)
+                    except Exception as exc:
+                        self.log.emit(f"  ERROR setting frequency: {exc}")
+                        self.finished.emit(False)
+                        return
+                    basename = f"{self._prefix}_freq_{val:.4g}"
+
+                # --- Settle ---
+                if self._settle_s > 0:
+                    self.log.emit(f"  Settling {self._settle_s:.1f} s …")
+                    import time
+                    t0 = time.time()
+                    while time.time() - t0 < self._settle_s:
+                        if self._cancel:
+                            break
+                        time.sleep(0.05)
+
+                if self._cancel:
+                    break
+
+                # --- Trigger DAQ recording ---
+                self.log.emit(
+                    f"  Recording {self._files_per_step} file(s) → "
+                    f"{basename}"
+                )
+                try:
+                    kwargs = dict(
+                        n_files=self._files_per_step,
+                        basename=basename,
+                    )
+                    if self._output_dir:
+                        kwargs["output_dir"] = self._output_dir
+                    resp = daq.send("start_recording", **kwargs)
+                except Exception as exc:
+                    self.log.emit(f"  ERROR starting DAQ: {exc}")
+                    self.finished.emit(False)
+                    return
+
+                if resp.get("status") != "ok":
+                    self.log.emit(
+                        f"  DAQ refused: {resp.get('message', resp)}"
+                    )
+                    self.finished.emit(False)
+                    return
+
+                # --- Wait for recording to finish (180 s timeout) ---
+                import time
+                t0 = time.time()
+                while True:
+                    if self._cancel:
+                        try:
+                            daq.send("stop_recording")
+                        except Exception:
+                            pass
+                        break
+                    if time.time() - t0 > 180:
+                        self.log.emit("  ERROR: DAQ timeout — stopping.")
+                        try:
+                            daq.send("stop_recording")
+                        except Exception:
+                            pass
+                        self.finished.emit(False)
+                        return
+                    try:
+                        st = daq.send("get_status")
+                        if not st.get("data", {}).get("recording", True):
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
+
+                if self._cancel:
+                    break
+                self.log.emit("  Done.")
+
+            self.finished.emit(not self._cancel)
+
+        except Exception as exc:
+            self.log.emit(f"Sweep error: {exc}")
+            self.finished.emit(False)
+        finally:
+            daq.close()
+
+
+# ---------------------------------------------------------------------------
+# Sweep tab
+# ---------------------------------------------------------------------------
+
+class SweepTab(QWidget):
+    """
+    Automated amplitude / frequency sweep coupled to the DAQ server.
+
+    Reads the electrode map's already-connected AFG — no second serial
+    connection needed.  Controls the DAQ via ZMQ (usphere-DAQ must be
+    running).
+
+    Parameters
+    ----------
+    electrode_map : ElectrodeMapWidget
+        Shared map widget; provides get_afg_ch(axis) at sweep time.
+    """
+
+    def __init__(self, electrode_map: "ElectrodeMapWidget", parent=None):
+        super().__init__(parent)
+        self._map    = electrode_map
+        self._worker: _SweepWorker | None = None
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setSpacing(6)
+        root.setContentsMargins(8, 8, 8, 8)
+
+        if not _ZMQ_AVAILABLE:
+            lbl = QLabel(
+                "ZMQ not available — install with:  pip install pyzmq\n"
+                "The sweep tab requires a running usphere-DAQ server."
+            )
+            lbl.setStyleSheet("color: #b45309; font-size: 12px;")
+            lbl.setWordWrap(True)
+            root.addWidget(lbl)
+            root.addStretch()
+            return
+
+        # --- DAQ Server ---
+        daq_box = QGroupBox("DAQ Server (ZMQ)")
+        dl = QVBoxLayout(daq_box)
+        dr = QHBoxLayout()
+        dr.addWidget(QLabel("Host:"))
+        self._host_edit = QLineEdit("localhost")
+        self._host_edit.setMaximumWidth(140)
+        dr.addWidget(self._host_edit)
+        dr.addWidget(QLabel("Port:"))
+        self._port_spin = QSpinBox()
+        self._port_spin.setRange(1024, 65535)
+        self._port_spin.setValue(5552)
+        self._port_spin.setMaximumWidth(80)
+        dr.addWidget(self._port_spin)
+        self._ping_btn = QPushButton("Ping DAQ")
+        self._ping_btn.setMaximumWidth(90)
+        self._ping_btn.clicked.connect(self._ping_daq)
+        dr.addWidget(self._ping_btn)
+        self._daq_status = QLabel("—")
+        self._daq_status.setStyleSheet("color: gray;")
+        dr.addWidget(self._daq_status)
+        dr.addStretch()
+        dl.addLayout(dr)
+        root.addWidget(daq_box)
+
+        # --- Recording settings ---
+        rec_box = QGroupBox("Recording Settings")
+        rl = QVBoxLayout(rec_box)
+
+        rr1 = QHBoxLayout()
+        rr1.addWidget(QLabel("Output dir:"))
+        self._dir_edit = QLineEdit()
+        self._dir_edit.setPlaceholderText("(use DAQ default)")
+        rr1.addWidget(self._dir_edit)
+        self._dir_btn = QPushButton("Browse…")
+        self._dir_btn.setMaximumWidth(80)
+        self._dir_btn.clicked.connect(self._browse_dir)
+        rr1.addWidget(self._dir_btn)
+        rl.addLayout(rr1)
+
+        rr2 = QHBoxLayout()
+        rr2.addWidget(QLabel("Basename prefix:"))
+        self._prefix_edit = QLineEdit("ptrap")
+        self._prefix_edit.setMaximumWidth(140)
+        self._prefix_edit.setToolTip(
+            "Files are saved as {prefix}_amp_{val}_NNN.h5 or {prefix}_freq_{val}_NNN.h5"
+        )
+        rr2.addWidget(self._prefix_edit)
+        rr2.addWidget(QLabel("Files/step:"))
+        self._files_spin = QSpinBox()
+        self._files_spin.setRange(1, 200)
+        self._files_spin.setValue(1)
+        self._files_spin.setMaximumWidth(70)
+        rr2.addWidget(self._files_spin)
+        rr2.addWidget(QLabel("Settle (s):"))
+        self._settle_spin = QDoubleSpinBox()
+        self._settle_spin.setRange(0.0, 300.0)
+        self._settle_spin.setDecimals(1)
+        self._settle_spin.setValue(2.0)
+        self._settle_spin.setMaximumWidth(80)
+        rr2.addWidget(self._settle_spin)
+        rr2.addStretch()
+        rl.addLayout(rr2)
+        root.addWidget(rec_box)
+
+        # --- Sweep parameters ---
+        sw_box = QGroupBox("Sweep")
+        sl = QVBoxLayout(sw_box)
+
+        # Axis + mode
+        sm1 = QHBoxLayout()
+        sm1.addWidget(QLabel("Axis:"))
+        self._axis_bg = QButtonGroup(self)
+        for ax in ("X", "Y", "Z"):
+            rb = QRadioButton(ax)
+            self._axis_bg.addButton(rb)
+            sm1.addWidget(rb)
+            if ax == "X":
+                rb.setChecked(True)
+                self._axis_rb_x = rb
+        sm1.addSpacing(20)
+        sm1.addWidget(QLabel("Sweep:"))
+        self._mode_bg = QButtonGroup(self)
+        self._amp_rb  = QRadioButton("Amplitude (Vpp)")
+        self._freq_rb = QRadioButton("Frequency (Hz)")
+        self._amp_rb.setChecked(True)
+        self._mode_bg.addButton(self._amp_rb)
+        self._mode_bg.addButton(self._freq_rb)
+        self._amp_rb.toggled.connect(self._on_mode_changed)
+        sm1.addWidget(self._amp_rb)
+        sm1.addWidget(self._freq_rb)
+        sm1.addStretch()
+        sl.addLayout(sm1)
+
+        # Range
+        sm2 = QHBoxLayout()
+        sm2.addWidget(QLabel("Start:"))
+        self._start_spin = QDoubleSpinBox()
+        self._start_spin.setDecimals(4)
+        self._start_spin.setMinimumWidth(110)
+        sm2.addWidget(self._start_spin)
+        sm2.addWidget(QLabel("Stop:"))
+        self._stop_spin = QDoubleSpinBox()
+        self._stop_spin.setDecimals(4)
+        self._stop_spin.setMinimumWidth(110)
+        sm2.addWidget(self._stop_spin)
+        sm2.addWidget(QLabel("Step:"))
+        self._step_spin = QDoubleSpinBox()
+        self._step_spin.setDecimals(4)
+        self._step_spin.setMinimumWidth(100)
+        sm2.addWidget(self._step_spin)
+        self._range_unit_lbl = QLabel("Vpp")
+        sm2.addWidget(self._range_unit_lbl)
+        sm2.addStretch()
+        sl.addLayout(sm2)
+        root.addWidget(sw_box)
+
+        # Initialise ranges for amplitude mode
+        self._on_mode_changed()
+
+        # --- Controls ---
+        ctrl_row = QHBoxLayout()
+        self._start_btn = QPushButton("▶  Start Sweep")
+        self._start_btn.setMinimumWidth(130)
+        self._start_btn.setStyleSheet(
+            "QPushButton { background-color: #1d4ed8; color: white; "
+            "font-weight: bold; padding: 5px 18px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #2563eb; }"
+            "QPushButton:disabled { background-color: #94a3b8; }"
+        )
+        self._start_btn.clicked.connect(self._start_sweep)
+        ctrl_row.addWidget(self._start_btn)
+        self._cancel_btn = QPushButton("■  Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setStyleSheet(
+            "QPushButton { background-color: #dc2626; color: white; "
+            "padding: 5px 12px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #ef4444; }"
+            "QPushButton:disabled { background-color: #94a3b8; }"
+        )
+        self._cancel_btn.clicked.connect(self._cancel_sweep)
+        ctrl_row.addWidget(self._cancel_btn)
+        self._progress_lbl = QLabel("")
+        self._progress_lbl.setStyleSheet("color: gray; font-size: 10px;")
+        ctrl_row.addWidget(self._progress_lbl)
+        ctrl_row.addStretch()
+        root.addLayout(ctrl_row)
+
+        # --- Log ---
+        self._log_box = QTextEdit()
+        self._log_box.setReadOnly(True)
+        self._log_box.setMinimumHeight(150)
+        self._log_box.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px; "
+            "background: #1e1e1e; color: #d4d4d4;"
+        )
+        root.addWidget(self._log_box)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _log(self, msg: str):
+        self._log_box.append(msg)
+        self._log_box.verticalScrollBar().setValue(
+            self._log_box.verticalScrollBar().maximum()
+        )
+
+    def _on_mode_changed(self):
+        is_amp = self._amp_rb.isChecked()
+        if is_amp:
+            self._start_spin.setRange(0.001, 20.0)
+            self._stop_spin.setRange(0.001, 20.0)
+            self._step_spin.setRange(0.001, 10.0)
+            self._start_spin.setValue(0.1)
+            self._stop_spin.setValue(2.0)
+            self._step_spin.setValue(0.1)
+            self._range_unit_lbl.setText("Vpp")
+        else:
+            self._start_spin.setRange(0.001, 25e6)
+            self._stop_spin.setRange(0.001, 25e6)
+            self._step_spin.setRange(0.001, 1e6)
+            self._start_spin.setValue(100.0)
+            self._stop_spin.setValue(1000.0)
+            self._step_spin.setValue(100.0)
+            self._range_unit_lbl.setText("Hz")
+
+    def _browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Select output directory",
+                                             self._dir_edit.text() or "")
+        if d:
+            self._dir_edit.setText(d)
+
+    def _ping_daq(self):
+        try:
+            client = _ModuleClient(
+                "daq",
+                rep_port=self._port_spin.value(),
+                pub_port=self._port_spin.value() + 1,
+                host=self._host_edit.text().strip() or "localhost",
+                timeout_ms=3000,
+            )
+            ok = client.ping()
+            client.close()
+        except Exception as exc:
+            self._daq_status.setText(f"Error: {exc}")
+            self._daq_status.setStyleSheet("color: red;")
+            return
+        if ok:
+            self._daq_status.setText("Connected")
+            self._daq_status.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self._daq_status.setText("No response")
+            self._daq_status.setStyleSheet("color: red;")
+
+    def _selected_axis(self) -> str:
+        for btn in self._axis_bg.buttons():
+            if btn.isChecked():
+                return btn.text().lower()
+        return "x"
+
+    # ------------------------------------------------------------------
+    # Sweep control
+    # ------------------------------------------------------------------
+
+    def _build_values(self) -> list:
+        start = self._start_spin.value()
+        stop  = self._stop_spin.value()
+        step  = self._step_spin.value()
+        vals  = []
+        v = start
+        while v <= stop + 1e-9:
+            vals.append(round(v, 8))
+            v += step
+        return vals
+
+    def _start_sweep(self):
+        axis = self._selected_axis()
+        afg, ch = self._map.get_afg_ch(axis)
+
+        if afg is None or not afg.is_connected:
+            self._log(
+                f"ERROR: {axis.upper()} electrode AFG is not connected — "
+                "connect it in the Electrode Map tab first."
+            )
+            return
+
+        vals = self._build_values()
+        if not vals:
+            self._log("ERROR: No sweep steps in range.")
+            return
+
+        mode    = "amplitude" if self._amp_rb.isChecked() else "frequency"
+        prefix  = self._prefix_edit.text().strip() or "ptrap"
+        out_dir = self._dir_edit.text().strip()
+
+        self._log(
+            f"Starting {mode} sweep on {axis.upper()} electrode "
+            f"({self._map.assignment_str(axis)}):\n"
+            f"  {len(vals)} steps:  {vals[0]:.4g} → {vals[-1]:.4g}  "
+            f"({'Vpp' if mode == 'amplitude' else 'Hz'})\n"
+            f"  {self._files_spin.value()} file(s)/step, "
+            f"{self._settle_spin.value():.1f} s settle\n"
+            f"  Output: {out_dir or '(DAQ default)'}  prefix: {prefix}"
+        )
+
+        self._worker = _SweepWorker(
+            afg=afg,
+            channel=ch,
+            mode=mode,
+            values=vals,
+            settle_s=self._settle_spin.value(),
+            files_per_step=self._files_spin.value(),
+            prefix=prefix,
+            output_dir=out_dir,
+            daq_host=self._host_edit.text().strip() or "localhost",
+            daq_rep_port=self._port_spin.value(),
+        )
+        self._worker.log.connect(self._log)
+        self._worker.progress.connect(
+            lambda s, t: self._progress_lbl.setText(f"Step {s}/{t}")
+        )
+        self._worker.finished.connect(self._on_finished)
+        self._worker.start()
+
+        self._start_btn.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
+
+    def _cancel_sweep(self):
+        if self._worker:
+            self._worker.cancel()
+
+    def _on_finished(self, ok: bool):
+        self._start_btn.setEnabled(True)
+        self._cancel_btn.setEnabled(False)
+        self._progress_lbl.setText("")
+        self._log("Sweep complete." if ok else "Sweep stopped.")
+        self._worker = None
+
+
+# ---------------------------------------------------------------------------
 # Combined waveform control tab
 # ---------------------------------------------------------------------------
 
@@ -1245,6 +1763,7 @@ class WaveformControlTab(QWidget):
         Z Electrode    — same
         Filament       — pulse to SSR
         Flash Lamp     — trigger pulse + DC control
+        Sweep          — automated amplitude/frequency sweep with DAQ recording
 
     Parameters
     ----------
@@ -1307,5 +1826,9 @@ class WaveformControlTab(QWidget):
         tabs.addTab(_make_scroll(flash_w), "Flash Lamp")
 
         self.flashlamp = FlashLampAdapter(self.flash_trigger, self.flash_control)
+
+        # --- Sweep ---
+        self.sweep = SweepTab(self.electrode_map)
+        tabs.addTab(_make_scroll(self.sweep), "Sweep")
 
         outer.addWidget(tabs)
