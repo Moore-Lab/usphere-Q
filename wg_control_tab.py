@@ -1299,6 +1299,12 @@ class _SweepWorker(QThread):
         )
 
         try:
+            try:
+                self._afg.output_on(self._channel)
+                self.log.emit("Output ON")
+            except Exception as exc:
+                self.log.emit(f"WARNING: could not turn output on: {exc}")
+
             n = len(self._values)
             for i, val in enumerate(self._values):
                 if self._cancel:
@@ -1427,6 +1433,11 @@ class _SweepWorker(QThread):
             self.log.emit(f"Sweep error: {exc}")
             self.finished.emit(False)
         finally:
+            try:
+                self._afg.output_off(self._channel)
+                self.log.emit("Output OFF")
+            except Exception as exc:
+                self.log.emit(f"WARNING: could not turn output off: {exc}")
             daq.close()
 
 
