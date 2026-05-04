@@ -762,6 +762,14 @@ class ChannelControlWidget(QWidget):
 # ---------------------------------------------------------------------------
 
 class PulseGroup(QGroupBox):
+    """
+    Pulse waveform control (Filament / Flash Trigger).
+
+    Output levels:
+        low  = dc_offset
+        high = dc_offset + v_high
+    With dc_offset = 0 (default) the low level is always 0 V.
+    """
 
     def __init__(self, title: str, get_afg,
                  wg_default: str, ch_default: str,
@@ -773,8 +781,12 @@ class PulseGroup(QGroupBox):
         self._build()
 
     def _build(self):
-        g = QGridLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setSpacing(4)
+
+        g = QGridLayout()
         g.setColumnStretch(7, 1)
+        outer.addLayout(g)
         row = 0
 
         self._wg, self._ch, self._imp = _add_selector_row(
@@ -782,7 +794,8 @@ class PulseGroup(QGroupBox):
         )
         row += 1
 
-        g.addWidget(QLabel("High level (V):"), row, 0, Qt.AlignRight)
+        # Pulse swing
+        g.addWidget(QLabel("Pulse high (V):"), row, 0, Qt.AlignRight)
         self._amp = QDoubleSpinBox()
         self._amp.setRange(0.001, 20.0)
         self._amp.setDecimals(3)
@@ -792,6 +805,20 @@ class PulseGroup(QGroupBox):
         g.addWidget(self._amp, row, 1, 1, 3)
         row += 1
 
+        # DC offset (baseline)
+        g.addWidget(QLabel("DC offset:"), row, 0, Qt.AlignRight)
+        self._dc = QDoubleSpinBox()
+        self._dc.setRange(-10.0, 10.0)
+        self._dc.setDecimals(3)
+        self._dc.setValue(0.0)
+        self._dc.setSuffix(" V")
+        self._dc.setMinimumWidth(130)
+        g.addWidget(self._dc, row, 1, 1, 3)
+        self._levels_lbl = _hint_label()
+        g.addWidget(self._levels_lbl, row, 4, 1, 4)
+        row += 1
+
+        # Frequency
         g.addWidget(QLabel("Frequency:"), row, 0, Qt.AlignRight)
         self._freq = QDoubleSpinBox()
         self._freq.setRange(0.001, 25e6)
@@ -804,6 +831,7 @@ class PulseGroup(QGroupBox):
         g.addWidget(self._freq_hint, row, 4, 1, 4)
         row += 1
 
+        # Pulse width
         g.addWidget(QLabel("Pulse width:"), row, 0, Qt.AlignRight)
         self._width_ms = QDoubleSpinBox()
         self._width_ms.setRange(0.001, 1e6)
@@ -828,9 +856,63 @@ class PulseGroup(QGroupBox):
         self._status.setStyleSheet("color: gray;")
         g.addWidget(self._status, row, 0, 1, 8)
 
-        self._freq.valueChanged.connect(self._update_hints)
-        self._width_ms.valueChanged.connect(self._update_hints)
+        # Waveform preview
+        if _PLOT_AVAILABLE:
+            self._plot_widget = pg.PlotWidget()
+            self._plot_widget.setMinimumHeight(160)
+            self._plot_widget.setMaximumHeight(200)
+            self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
+            self._plot_widget.setLabel("left", "V")
+            self._plot_widget.setLabel("bottom", "time")
+            self._plot_widget.getAxis("left").setWidth(45)
+            self._plot_curve = self._plot_widget.plot(
+                [], [], pen=pg.mkPen(color="#1565C0", width=2)
+            )
+            outer.addWidget(self._plot_widget)
+            self._plot_timer = QTimer()
+            self._plot_timer.setSingleShot(True)
+            self._plot_timer.setInterval(80)
+            self._plot_timer.timeout.connect(self._update_plot)
+        else:
+            self._plot_widget = None
+            self._plot_timer = None
+
+        for sb in (self._amp, self._dc, self._freq, self._width_ms):
+            sb.valueChanged.connect(self._update_hints)
+            sb.valueChanged.connect(self._schedule_plot_update)
+
         self._update_hints()
+
+    def _schedule_plot_update(self):
+        if self._plot_timer is not None:
+            self._plot_timer.start()
+
+    def _update_plot(self):
+        if not _PLOT_AVAILABLE or self._plot_widget is None:
+            return
+        freq_hz = self._freq.value()
+        width_s = self._width_ms.value() * 1e-3
+        v_high  = self._amp.value()
+        dc      = self._dc.value()
+        if freq_hz <= 0:
+            return
+        period = 1.0 / freq_hz
+        N = 600
+        t = np.linspace(0, 2.5 * period, N)
+        t_mod = t % period
+        y = np.where(t_mod < width_s, dc + v_high, dc)
+
+        if period < 1e-3:
+            t_disp, unit = t * 1e6, "µs"
+        elif period < 1:
+            t_disp, unit = t * 1e3, "ms"
+        else:
+            t_disp, unit = t, "s"
+
+        self._plot_curve.setData(t_disp, y)
+        self._plot_widget.setLabel("bottom", f"time ({unit})")
+        pad = v_high * 0.2 + 0.05
+        self._plot_widget.setYRange(dc - pad, dc + v_high + pad)
 
     def _update_hints(self):
         freq  = self._freq.value()
@@ -844,6 +926,10 @@ class PulseGroup(QGroupBox):
             self._freq_hint.setText(f"  max: {max_freq_hz:.3f} Hz")
         else:
             self._freq_hint.setText(f"  max: {max_freq_hz:.3e} Hz")
+
+        dc = self._dc.value()
+        v_high = self._amp.value()
+        self._levels_lbl.setText(f"  low: {dc:+.3f} V   high: {dc + v_high:+.3f} V")
 
         if width >= period:
             self._warn.setText(
@@ -876,6 +962,10 @@ class PulseGroup(QGroupBox):
         self._status.setText(msg)
         self._status.setStyleSheet("color: red;")
 
+    def _get_offset(self) -> float:
+        """AFG offset = midpoint of pulse swing + DC baseline."""
+        return self._amp.value() / 2.0 + self._dc.value()
+
     def _apply(self):
         afg, ch = self._afg_ch()
         if afg is None:
@@ -883,7 +973,7 @@ class PulseGroup(QGroupBox):
         freq_hz = self._freq.value()
         width_s = self._width_ms.value() * 1e-3
         v_high  = self._amp.value()
-        offset  = v_high / 2.0
+        dc      = self._dc.value()
 
         if width_s >= 1.0 / freq_hz:
             self._status_err("Pulse width ≥ period — not applied")
@@ -891,11 +981,11 @@ class PulseGroup(QGroupBox):
         try:
             self._set_impedance(afg, ch)
             afg.setup_pulse(ch, frequency=freq_hz,
-                            amplitude=v_high, offset=offset,
+                            amplitude=v_high, offset=self._get_offset(),
                             width=width_s)
             self._status_ok(
                 f"Applied — {freq_hz:.3f} Hz, {width_s*1e3:.3f} ms, "
-                f"0 V – {v_high:.3f} V"
+                f"{dc:+.3f} V – {dc + v_high:+.3f} V"
             )
         except Exception as e:
             self._status_err(f"Error: {e}")
@@ -930,7 +1020,7 @@ class PulseGroup(QGroupBox):
         width_s = self._width_ms.value() * 1e-3
         v_high  = self._amp.value()
         afg.setup_pulse(ch, frequency=freq_hz,
-                        amplitude=v_high, offset=v_high / 2.0,
+                        amplitude=v_high, offset=self._get_offset(),
                         width=width_s)
         return afg.output_on(ch)
 
@@ -964,8 +1054,12 @@ class DCGroup(QGroupBox):
         self._build()
 
     def _build(self):
-        g = QGridLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setSpacing(4)
+
+        g = QGridLayout()
         g.setColumnStretch(7, 1)
+        outer.addLayout(g)
         row = 0
 
         self._wg, self._ch, self._imp = _add_selector_row(
@@ -989,6 +1083,43 @@ class DCGroup(QGroupBox):
         self._status = QLabel("—")
         self._status.setStyleSheet("color: gray;")
         g.addWidget(self._status, row, 0, 1, 8)
+
+        # Waveform preview (flat DC line)
+        if _PLOT_AVAILABLE:
+            self._plot_widget = pg.PlotWidget()
+            self._plot_widget.setMinimumHeight(120)
+            self._plot_widget.setMaximumHeight(160)
+            self._plot_widget.showGrid(x=False, y=True, alpha=0.25)
+            self._plot_widget.setLabel("left", "V")
+            self._plot_widget.hideAxis("bottom")
+            self._plot_widget.getAxis("left").setWidth(45)
+            self._plot_curve = self._plot_widget.plot(
+                [], [], pen=pg.mkPen(color="#1565C0", width=2)
+            )
+            outer.addWidget(self._plot_widget)
+            self._plot_timer = QTimer(self)
+            self._plot_timer.setSingleShot(True)
+            self._plot_timer.setInterval(80)
+            self._plot_timer.timeout.connect(self._update_plot)
+        else:
+            self._plot_widget = None
+            self._plot_timer = None
+
+        self._voltage.valueChanged.connect(self._schedule_plot_update)
+        self._schedule_plot_update()
+
+    def _schedule_plot_update(self):
+        if self._plot_timer is not None:
+            self._plot_timer.start()
+
+    def _update_plot(self):
+        if not _PLOT_AVAILABLE or self._plot_widget is None:
+            return
+        v = self._voltage.value()
+        self._plot_curve.setData([0.0, 1.0], [v, v])
+        pad = max(abs(v) * 0.3, 0.5)
+        self._plot_widget.setYRange(v - pad, v + pad, padding=0)
+        self._plot_widget.setXRange(0, 1, padding=0.05)
 
     def _afg_ch(self):
         wg_n = self._wg.currentIndex() + 1
