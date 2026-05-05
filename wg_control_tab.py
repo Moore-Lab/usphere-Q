@@ -1927,6 +1927,77 @@ class SweepTab(QWidget):
         self._wf_hw_lbl = QLabel("")
         self._wf_hw_lbl.setStyleSheet("color:gray;font-style:italic;")
         wl.addWidget(self._wf_hw_lbl)
+
+        # Frequency comb sub-section (requires afg2225_arbitrarywf)
+        self._wf_comb_worker: "_CombWorker | None" = None
+        if _ARB_AVAILABLE:
+            comb_box = QGroupBox("Frequency Comb (ARB)")
+            ccl = QVBoxLayout(comb_box)
+
+            cc1 = QHBoxLayout()
+            cc1.addWidget(QLabel("Frequencies (Hz):"))
+            self._wf_comb_freqs = QLineEdit()
+            self._wf_comb_freqs.setPlaceholderText("e.g.  100, 200, 500")
+            cc1.addWidget(self._wf_comb_freqs)
+            ccl.addLayout(cc1)
+
+            cc_range = QHBoxLayout()
+            cc_range.addWidget(QLabel("Range:"))
+            self._wf_comb_start = QDoubleSpinBox()
+            self._wf_comb_start.setRange(0.001, 25e6)
+            self._wf_comb_start.setDecimals(3)
+            self._wf_comb_start.setValue(100.0)
+            self._wf_comb_start.setMinimumWidth(90)
+            self._wf_comb_start.setPrefix("start ")
+            cc_range.addWidget(self._wf_comb_start)
+            self._wf_comb_stop = QDoubleSpinBox()
+            self._wf_comb_stop.setRange(0.001, 25e6)
+            self._wf_comb_stop.setDecimals(3)
+            self._wf_comb_stop.setValue(1000.0)
+            self._wf_comb_stop.setMinimumWidth(90)
+            self._wf_comb_stop.setPrefix("stop ")
+            cc_range.addWidget(self._wf_comb_stop)
+            self._wf_comb_step = QDoubleSpinBox()
+            self._wf_comb_step.setRange(0.001, 25e6)
+            self._wf_comb_step.setDecimals(3)
+            self._wf_comb_step.setValue(100.0)
+            self._wf_comb_step.setMinimumWidth(90)
+            self._wf_comb_step.setPrefix("step ")
+            cc_range.addWidget(self._wf_comb_step)
+            wf_range_btn = QPushButton("→ List")
+            wf_range_btn.setMaximumWidth(60)
+            wf_range_btn.clicked.connect(self._wf_comb_range_to_list)
+            cc_range.addWidget(wf_range_btn)
+            cc_range.addStretch()
+            ccl.addLayout(cc_range)
+
+            cc2 = QHBoxLayout()
+            cc2.addWidget(QLabel("Amplitude:"))
+            self._wf_comb_amp = QDoubleSpinBox()
+            self._wf_comb_amp.setRange(0.001, 20.0)
+            self._wf_comb_amp.setDecimals(3)
+            self._wf_comb_amp.setValue(1.0)
+            self._wf_comb_amp.setSuffix(" Vpp")
+            self._wf_comb_amp.setMinimumWidth(100)
+            cc2.addWidget(self._wf_comb_amp)
+            cc2.addSpacing(12)
+            cc2.addWidget(QLabel("MC iter:"))
+            self._wf_comb_mc = QSpinBox()
+            self._wf_comb_mc.setRange(0, 20000)
+            self._wf_comb_mc.setValue(500)
+            self._wf_comb_mc.setMinimumWidth(75)
+            cc2.addWidget(self._wf_comb_mc)
+            cc2.addSpacing(12)
+            self._wf_comb_btn = QPushButton("Apply Comb")
+            self._wf_comb_btn.clicked.connect(self._apply_wf_comb)
+            cc2.addWidget(self._wf_comb_btn)
+            self._wf_comb_status = QLabel("—")
+            self._wf_comb_status.setStyleSheet("color:gray;")
+            cc2.addWidget(self._wf_comb_status, 1)
+            ccl.addLayout(cc2)
+
+            wl.addWidget(comb_box)
+
         root.addWidget(wf_box)
 
         # ── Recording Settings ───────────────────────────────────────────
@@ -2332,6 +2403,80 @@ class SweepTab(QWidget):
         except Exception as exc:
             self._wf_status.setText(f"Error: {exc}")
             self._wf_status.setStyleSheet("color:red;")
+
+    # ------------------------------------------------------------------
+    # Waveform comb helpers
+    # ------------------------------------------------------------------
+
+    def _wf_comb_range_to_list(self):
+        import numpy as np
+        start = self._wf_comb_start.value()
+        stop  = self._wf_comb_stop.value()
+        step  = self._wf_comb_step.value()
+        if step <= 0 or start >= stop:
+            self._wf_comb_status.setText("Invalid range (need start < stop, step > 0)")
+            self._wf_comb_status.setStyleSheet("color:red;")
+            return
+        freqs = np.arange(start, stop, step)
+        if len(freqs) == 0:
+            self._wf_comb_status.setText("Range produced no frequencies")
+            self._wf_comb_status.setStyleSheet("color:red;")
+            return
+        self._wf_comb_freqs.setText(", ".join(f"{f:.6g}" for f in freqs))
+        self._wf_comb_status.setText(f"{len(freqs)} frequencies loaded")
+        self._wf_comb_status.setStyleSheet("color:gray;")
+
+    def _apply_wf_comb(self):
+        if not _ARB_AVAILABLE or self._wf_comb_worker is not None:
+            return
+        afg, ch = self._get_afg_or_err()
+        if afg is None:
+            return
+        raw = self._wf_comb_freqs.text().strip()
+        if not raw:
+            self._wf_comb_status.setText("Enter frequencies first")
+            self._wf_comb_status.setStyleSheet("color:red;")
+            return
+        try:
+            freqs = [float(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            self._wf_comb_status.setText("Invalid frequency list")
+            self._wf_comb_status.setStyleSheet("color:red;")
+            return
+        if not freqs:
+            self._wf_comb_status.setText("No valid frequencies")
+            self._wf_comb_status.setStyleSheet("color:red;")
+            return
+
+        self._wf_comb_btn.setEnabled(False)
+        self._wf_comb_status.setText("Working…")
+        self._wf_comb_status.setStyleSheet("color:gray;")
+
+        self._wf_comb_worker = _CombWorker(
+            afg, ch, freqs,
+            amplitude=self._wf_comb_amp.value(),
+            offset=0.0,
+            n_mc=self._wf_comb_mc.value(),
+            parent=self,
+        )
+        self._wf_comb_worker.log.connect(self._wf_comb_status.setText)
+        self._wf_comb_worker.finished.connect(self._on_wf_comb_done)
+        self._wf_comb_worker.start()
+
+    def _on_wf_comb_done(self, ok: bool, msg: str):
+        self._wf_comb_btn.setEnabled(True)
+        self._wf_comb_worker = None
+        if ok:
+            self._wf_comb_status.setText(msg)
+            self._wf_comb_status.setStyleSheet("color:green;")
+            afg, ch = self._get_afg_or_err()
+            if afg is not None:
+                self._update_wf_hw_lbl(afg, ch)
+        else:
+            self._wf_comb_status.setText(f"Error: {msg}")
+            self._wf_comb_status.setStyleSheet("color:red;")
+
+    # ------------------------------------------------------------------
 
     def _update_wf_hw_lbl(self, afg, ch: int) -> None:
         _poll_hw_async(afg, ch, self._wf_hw_lbl.setText)
