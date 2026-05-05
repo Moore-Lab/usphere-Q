@@ -1780,8 +1780,8 @@ class SweepTab(QWidget):
     Controls the running usphere-DAQ server via ZMQ.
     """
 
-    _WAVEFORMS     = ["Sine", "Square", "Ramp", "Noise", "ARB (loaded)"]
-    _NO_FREQ_TYPES = {"Noise", "ARB (loaded)"}   # disable freq sweep for these
+    _WAVEFORMS     = ["Sine", "Square", "Ramp", "Noise", "DC Bias", "ARB (loaded)"]
+    _NO_FREQ_TYPES = {"Noise", "DC Bias", "ARB (loaded)"}   # disable freq sweep for these
 
     def __init__(self, electrode_map: "ElectrodeMapWidget", parent=None):
         super().__init__(parent)
@@ -2366,12 +2366,15 @@ class SweepTab(QWidget):
                 afg.set_phase(ch, phase)
             elif wf == "Noise":
                 afg.setup_noise(ch, amplitude=amp, offset=offset)
+            elif wf == "DC Bias":
+                afg.setup_sine(ch, frequency=1e-6, amplitude=amp, offset=offset)
             elif wf == "ARB (loaded)":
                 afg.set_amplitude(ch, amp)
                 afg.set_offset(ch, offset)
-            self._wf_status.setText(
-                f"Applied — {wf}, {freq:.4g} Hz, {amp:.3g} Vpp"
-            )
+            status_txt = (f"DC Bias — {amp:.3g} Vpp, offset {offset:+.3g} V"
+                          if wf == "DC Bias"
+                          else f"Applied — {wf}, {freq:.4g} Hz, {amp:.3g} Vpp")
+            self._wf_status.setText(status_txt)
             self._wf_status.setStyleSheet("color:green;")
             self._update_wf_hw_lbl(afg, ch)
         except Exception as exc:
@@ -2718,13 +2721,15 @@ class SweepTab(QWidget):
                     afg.set_phase(ch, phase)
                 elif wf == "Noise":
                     afg.setup_noise(ch, amplitude=amp, offset=offset)
+                elif wf == "DC Bias":
+                    afg.setup_sine(ch, frequency=1e-6, amplitude=amp, offset=offset)
                 elif wf == "ARB (loaded)":
                     afg.set_amplitude(ch, amp)
                     afg.set_offset(ch, offset)
                 afg.output_on(ch)
-                self._log(
-                    f"  Waveform: {wf} {freq:.4g}Hz {amp:.4g}Vpp → output ON"
-                )
+                label = (f"DC Bias {amp:.4g}Vpp offset {offset:+.3g}V"
+                         if wf == "DC Bias" else f"{wf} {freq:.4g}Hz {amp:.4g}Vpp")
+                self._log(f"  Waveform: {label} → output ON")
             except Exception as exc:
                 self._log(f"  WARNING: waveform apply failed: {exc}")
 
