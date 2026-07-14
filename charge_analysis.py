@@ -394,6 +394,10 @@ class LockInSource(ChargeStateSource):
     def is_running(self) -> bool:
         return self._running
 
+    def set_volts_per_electron(self, vpe: float) -> None:
+        """Update the calibration factor on a running source."""
+        self._volts_per_electron = vpe
+
     # -- internal --
 
     def _handle_voltage(self, volts: float):
@@ -537,6 +541,10 @@ class SR530SerialSource(ChargeStateSource):
     @property
     def is_running(self) -> bool:
         return self._running
+
+    def set_volts_per_electron(self, vpe: float) -> None:
+        """Update the calibration factor on a running source."""
+        self._volts_per_electron = vpe
 
     # -- internal --
 
@@ -917,6 +925,27 @@ class AnalysisTab(QWidget):
             self._sr_poll_edit.setText(str(cfg["sr_poll_hz"]))
         if "sr_volts_per_electron" in cfg:
             self._sr_vpe_edit.setText(str(cfg["sr_volts_per_electron"]))
+
+    # ------------------------------------------------------------------
+    # External calibration hand-off
+    # ------------------------------------------------------------------
+
+    def set_volts_per_electron(self, vpe: float, source_kind: str) -> None:
+        """
+        Push a freshly measured volts-per-electron into the config field
+        (and into the live source, if one of the matching kind is running).
+
+        source_kind: 'sr530' (direct RS232) or 'esp32' (ADS1115 reader).
+        Called by the Calibration tab after an auto-calibration completes.
+        """
+        if source_kind == "sr530":
+            self._sr_vpe_edit.setText(f"{vpe:.6g}")
+            if isinstance(self._source, SR530SerialSource):
+                self._source.set_volts_per_electron(vpe)
+        elif source_kind == "esp32":
+            self._li_vpe_edit.setText(f"{vpe:.6g}")
+            if isinstance(self._source, LockInSource):
+                self._source.set_volts_per_electron(vpe)
 
     # ------------------------------------------------------------------
     # Browse dialogs

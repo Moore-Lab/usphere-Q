@@ -421,6 +421,12 @@ class ChargeWidget(QWidget):
         self._analysis_tab.charge_updated.connect(self._charge_ctrl.on_charge_update)
         self._analysis_tab.charge_updated.connect(self._photon_exp.on_charge_update)
 
+        # --- Wire analysis → auto lock-in calibration (and result back) ---
+        self._analysis_tab.charge_updated.connect(
+            self._calibration_tab.on_charge_update)
+        self._calibration_tab.lockin_cal_saved.connect(
+            self._analysis_tab.set_volts_per_electron)
+
         # --- Actuator sync (wires WG tab groups to ChargeController) ---
         self._actuator_timer = QTimer(self)
         self._actuator_timer.timeout.connect(self._sync_actuators)

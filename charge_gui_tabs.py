@@ -13,6 +13,7 @@ These are thin GUI wrappers.
 
 from __future__ import annotations
 
+import math
 import time
 from functools import partial
 
@@ -580,13 +581,35 @@ class CalibrationTab(QWidget):
     """
     GUI for running and managing calibrations.
 
-    Two workflows:
-        File-based — select a directory of known-charge H5 files, run checkQ calibration
-        Lock-in    — enter measured voltage at known charge, compute volts-per-electron
+    Workflows:
+        File-based    — select a directory of known-charge H5 files, run checkQ
+                        calibration
+        Lock-in auto  — enter |charge| and polarity, press Start: samples the
+                        running lock-in source until the standard error of the
+                        mean X voltage reaches the target (or the sample cap),
+                        then computes and saves volts-per-electron
+        Lock-in manual — enter a measured voltage at a known charge directly
+
+    For the auto workflow, connect the AnalysisTab stream to
+    ``on_charge_update`` and ``lockin_cal_saved`` back to
+    ``AnalysisTab.set_volts_per_electron`` (done in charge_gui.py).
     """
+
+    # Emitted after a successful auto-calibration: (volts_per_electron, kind)
+    # where kind is 'sr530' or 'esp32'.
+    lockin_cal_saved = pyqtSignal(float, str)
+
+    # SEM criterion may only trigger after this many samples.
+    _AUTO_MIN_SAMPLES = 100
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._auto_active = False
+        self._auto_n = 0
+        self._auto_mean = 0.0
+        self._auto_m2 = 0.0
+        self._auto_kind = ""
+        self._auto_snap: dict = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -670,8 +693,65 @@ class CalibrationTab(QWidget):
         fg.setColumnStretch(1, 1)
         outer.addWidget(file_grp)
 
-        # --- Lock-in calibration ---
-        li_grp = QGroupBox("Lock-in calibration (volts-per-electron)")
+        # --- Lock-in calibration (auto) ---
+        auto_grp = QGroupBox("Lock-in calibration — auto (sample the live source)")
+        ag = QGridLayout(auto_grp)
+
+        ag.addWidget(QLabel("Known charge |e|:"), 0, 0)
+        self._auto_charge_spin = QSpinBox()
+        self._auto_charge_spin.setRange(1, 1000)
+        self._auto_charge_spin.setValue(1)
+        self._auto_charge_spin.setMaximumWidth(80)
+        self._auto_charge_spin.setToolTip(
+            "Magnitude of the known charge on the sphere, in electrons."
+        )
+        ag.addWidget(self._auto_charge_spin, 0, 1)
+
+        ag.addWidget(QLabel("Polarity:"), 0, 2)
+        self._auto_polarity_combo = QComboBox()
+        self._auto_polarity_combo.addItems(["positive", "negative"])
+        self._auto_polarity_combo.setMaximumWidth(100)
+        ag.addWidget(self._auto_polarity_combo, 0, 3)
+
+        ag.addWidget(QLabel("Target SEM (%):"), 1, 0)
+        self._auto_target_spin = QDoubleSpinBox()
+        self._auto_target_spin.setRange(0.01, 50.0)
+        self._auto_target_spin.setDecimals(2)
+        self._auto_target_spin.setValue(1.0)
+        self._auto_target_spin.setMaximumWidth(80)
+        self._auto_target_spin.setToolTip(
+            "Stop when the standard error of the mean X voltage falls below\n"
+            "this fraction of the mean (needs at least "
+            f"{self._AUTO_MIN_SAMPLES} samples)."
+        )
+        ag.addWidget(self._auto_target_spin, 1, 1)
+
+        ag.addWidget(QLabel("Max samples:"), 1, 2)
+        self._auto_max_spin = QSpinBox()
+        self._auto_max_spin.setRange(self._AUTO_MIN_SAMPLES, 1_000_000)
+        self._auto_max_spin.setValue(10_000)
+        self._auto_max_spin.setMaximumWidth(100)
+        self._auto_max_spin.setToolTip(
+            "Hard cap: finish with whatever precision has been reached\n"
+            "after this many samples."
+        )
+        ag.addWidget(self._auto_max_spin, 1, 3)
+
+        self._auto_btn = QPushButton("Start auto-calibration")
+        self._auto_btn.setMinimumWidth(180)
+        self._auto_btn.clicked.connect(self._on_auto_cal_clicked)
+        ag.addWidget(self._auto_btn, 2, 0, 1, 2)
+
+        self._auto_status = QLabel(
+            "Requires a running lock-in source in the Analysis tab."
+        )
+        self._auto_status.setWordWrap(True)
+        ag.addWidget(self._auto_status, 3, 0, 1, 4)
+        ag.setColumnStretch(4, 1)
+        outer.addWidget(auto_grp)
+
+        # --- Lock-in calibration (manual) ---
+        li_grp = QGroupBox("Lock-in calibration — manual (known voltage)")
         lg = QGridLayout(li_grp)
 
         lg.addWidget(QLabel("Measured voltage (V):"), 0, 0)
@@ -798,6 +878,143 @@ class CalibrationTab(QWidget):
         self._cal_thread.done.connect(_on_done)
         self._cal_thread.start()
 
+    # ------------------------------------------------------------------
+    # Auto lock-in calibration
+    # ------------------------------------------------------------------
+
+    def on_charge_update(self, result: dict):
+        """
+        Receives every measurement from the Analysis tab stream.
+
+        While an auto-calibration is active, accumulates the raw lock-in X
+        voltage (Welford mean/variance) and finishes when the SEM criterion
+        or the sample cap is reached.  Ignores results with no raw_voltage
+        (i.e. the file-based source).
+        """
+        if not self._auto_active or "raw_voltage" not in result:
+            return
+
+        v = float(result["raw_voltage"])
+        self._auto_n += 1
+        delta = v - self._auto_mean
+        self._auto_mean += delta / self._auto_n
+        self._auto_m2 += delta * (v - self._auto_mean)
+        self._auto_kind = (
+            "sr530" if "sr530_sensitivity" in result else "esp32"
+        )
+        if isinstance(result.get("raw"), dict):
+            self._auto_snap = result["raw"]
+
+        n = self._auto_n
+        sem_frac = self._auto_sem_frac()
+        if n % 10 == 0 or n <= 10:
+            sem_pct = sem_frac * 100.0
+            self._auto_status.setText(
+                f"Sampling… n={n}   mean={self._auto_mean:.4e} V   "
+                f"SEM={'—' if math.isinf(sem_pct) else f'{sem_pct:.2f}%'}"
+            )
+
+        target = self._auto_target_spin.value() / 100.0
+        if ((n >= self._AUTO_MIN_SAMPLES and sem_frac <= target)
+                or n >= self._auto_max_spin.value()):
+            self._finish_auto_cal()
+
+    def _auto_sem_frac(self) -> float:
+        """Standard error of the mean as a fraction of |mean|."""
+        n = self._auto_n
+        if n < 2 or self._auto_mean == 0.0:
+            return float("inf")
+        sem = math.sqrt(self._auto_m2 / (n - 1) / n)
+        return sem / abs(self._auto_mean)
+
+    def _on_auto_cal_clicked(self):
+        if self._auto_active:
+            self._set_auto_active(False)
+            self._auto_status.setText(
+                f"Cancelled after {self._auto_n} samples — nothing saved."
+            )
+            self._auto_status.setStyleSheet("color: gray;")
+            return
+
+        try:
+            float(self._diam_edit.text())
+            float(self._freq_edit.text())
+        except ValueError:
+            self._auto_status.setText("Invalid sphere diameter / drive frequency")
+            self._auto_status.setStyleSheet("color: red;")
+            return
+
+        self._auto_n = 0
+        self._auto_mean = 0.0
+        self._auto_m2 = 0.0
+        self._auto_kind = ""
+        self._auto_snap = {}
+        self._set_auto_active(True)
+        self._auto_status.setText(
+            "Sampling… waiting for lock-in data (if this stays at 0, start a "
+            "lock-in source in the Analysis tab)."
+        )
+        self._auto_status.setStyleSheet("color: #2196F3;")
+
+    def _set_auto_active(self, active: bool):
+        self._auto_active = active
+        self._auto_btn.setText(
+            "Stop (cancel)" if active else "Start auto-calibration"
+        )
+        for w in (self._auto_charge_spin, self._auto_polarity_combo,
+                  self._auto_target_spin, self._auto_max_spin):
+            w.setEnabled(not active)
+
+    def _finish_auto_cal(self):
+        self._set_auto_active(False)
+        n = self._auto_n
+        mean_v = self._auto_mean
+        sem_pct = self._auto_sem_frac() * 100.0
+
+        sign = 1 if self._auto_polarity_combo.currentText() == "positive" else -1
+        charge = sign * self._auto_charge_spin.value()
+
+        if mean_v == 0.0:
+            self._auto_status.setText("Mean voltage is exactly 0 — nothing saved.")
+            self._auto_status.setStyleSheet("color: red;")
+            return
+
+        # A sign mismatch would produce a negative V/e, which the sources
+        # treat as "uncalibrated" — refuse and point at the likely cause.
+        if (mean_v > 0) != (charge > 0):
+            self._auto_status.setText(
+                f"Mean X = {mean_v:.4e} V has the opposite sign to the "
+                f"selected polarity ({charge:+d}e) — check the SR530 phase "
+                f"or the polarity choice. Nothing saved."
+            )
+            self._auto_status.setStyleSheet("color: red;")
+            return
+
+        try:
+            from charge_calibration import calibrate_lockin_from_voltage
+            cal = calibrate_lockin_from_voltage(
+                measured_voltage=mean_v,
+                known_charge=charge,
+                sphere_diameter_um=float(self._diam_edit.text()),
+                drive_frequency_hz=float(self._freq_edit.text()),
+                calibration_file=self._cal_file_edit.text().strip(),
+                sr530_sensitivity_idx=int(
+                    self._auto_snap.get("sensitivity_idx", -1)),
+                sr530_phase=float(self._auto_snap.get("phase", 0.0)),
+            )
+            vpe = cal["volts_per_electron"]
+            self._auto_status.setText(
+                f"Saved: {vpe:.6e} V/e from n={n} samples "
+                f"(mean={mean_v:.4e} V, SEM={sem_pct:.2f}%, "
+                f"charge={charge:+d}e) — Analysis tab updated."
+            )
+            self._auto_status.setStyleSheet("color: green;")
+            self._refresh_cal_list()
+            self.lockin_cal_saved.emit(vpe, self._auto_kind or "sr530")
+        except Exception as e:
+            self._auto_status.setText(f"{type(e).__name__}: {e}")
+            self._auto_status.setStyleSheet("color: red;")
+
     def _on_run_lockin_cal(self):
         try:
             voltage = float(self._li_voltage.text())
@@ -877,6 +1094,10 @@ class CalibrationTab(QWidget):
             "n_charges": self._n_charges_spin.value(),
             "position_channel": self._pos_ch.value(),
             "drive_channel": self._drive_ch.value(),
+            "auto_charge_e": self._auto_charge_spin.value(),
+            "auto_polarity": self._auto_polarity_combo.currentText(),
+            "auto_target_pct": self._auto_target_spin.value(),
+            "auto_max_samples": self._auto_max_spin.value(),
         }
 
     def restore_config(self, cfg: dict):
@@ -898,6 +1119,16 @@ class CalibrationTab(QWidget):
             self._pos_ch.setValue(int(cfg["position_channel"]))
         if "drive_channel" in cfg:
             self._drive_ch.setValue(int(cfg["drive_channel"]))
+        if "auto_charge_e" in cfg:
+            self._auto_charge_spin.setValue(int(cfg["auto_charge_e"]))
+        if "auto_polarity" in cfg:
+            idx = self._auto_polarity_combo.findText(str(cfg["auto_polarity"]))
+            if idx >= 0:
+                self._auto_polarity_combo.setCurrentIndex(idx)
+        if "auto_target_pct" in cfg:
+            self._auto_target_spin.setValue(float(cfg["auto_target_pct"]))
+        if "auto_max_samples" in cfg:
+            self._auto_max_spin.setValue(int(cfg["auto_max_samples"]))
 
 
 # ======================================================================
