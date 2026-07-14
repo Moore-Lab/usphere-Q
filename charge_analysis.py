@@ -487,7 +487,7 @@ class SR530SerialSource(ChargeStateSource):
     """
     Reads the SR530 X output directly over RS232 — no ESP32 needed.
 
-    Polls the SR530 at ~30 Hz (limited by 9600 baud command/response).
+    Polls the SR530 at ~30 Hz (RS232 at 19200 baud with fast readback).
     Converts X voltage → charge using a ``volts_per_electron`` calibration.
     Polarity is determined by the sign of the X output (assumes reference
     phase has been correctly set on the SR530).
@@ -542,7 +542,7 @@ class SR530SerialSource(ChargeStateSource):
 
     def _handle_snapshot(self, snap: dict):
         self._sample_count += 1
-        x_v = snap["x_v"]          # X output in real volts
+        x_v = snap["x"]            # X output in real volts (QX)
         polarity = 1.0 if x_v >= 0 else -1.0
         calibrated = self._volts_per_electron > 0 and self._volts_per_electron != 1.0
 
@@ -565,8 +565,8 @@ class SR530SerialSource(ChargeStateSource):
             "calibrated":       calibrated,
             # raw SR530 voltages
             "raw_voltage":      x_v,
-            "raw_y_voltage":    snap["y_v"],
-            "raw_r_voltage":    snap["r_v"],
+            "raw_y_voltage":    snap["y"],
+            "raw_r_voltage":    snap["r"],
             # SR530 status
             "sr530_theta":      snap["theta"],
             "sr530_frequency":  snap["frequency"],
@@ -764,7 +764,7 @@ class AnalysisTab(QWidget):
         self._sr_poll_edit = QLineEdit("30")
         self._sr_poll_edit.setToolTip(
             "How many times per second to query the SR530.\n"
-            "Max ~50 Hz at 9600 baud.  30 Hz is a safe default."
+            "Max ~50 Hz over RS232 (19200 baud).  30 Hz is a safe default."
         )
         self._sr_poll_edit.setMaximumWidth(80)
         sg.addWidget(self._sr_poll_edit, row, 1)

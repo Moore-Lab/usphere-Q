@@ -4,6 +4,6 @@
 [submodule "resources/GWINSTEKAFG2225_controller"]
 	path = resources/GWINSTEKAFG2225_controller
 	url = https://github.com/Moore-Lab/GWINSTEKAFG2225_controller
-[submodule "SR530_controller"]
+[submodule "resources/SR530_controller"]
 	path = resources/SR530_controller
 	url = https://github.com/Moore-Lab/SR530_controller

@@ -60,7 +60,6 @@ try:
     from sr530_gui import (
         ConnectionTab  as SR530ConnectionTab,
         ParametersTab  as SR530ParametersTab,
-        AdvancedTab    as SR530AdvancedTab,
         MonitorTab     as SR530MonitorTab,
     )
     _SR530_GUI_AVAILABLE = True
@@ -123,7 +122,7 @@ class _Worker(QThread):
 
 class SR530Tab(QWidget):
     """
-    Embeds the SR530 GUI (Connection / Parameters / Advanced / Monitor sub-tabs)
+    Embeds the SR530 GUI (Connection / Parameters / Monitor sub-tabs)
     as a single top-level tab in the main charge window.
 
     Falls back to a plain "not available" message if the SR530 submodule is
@@ -151,7 +150,6 @@ class SR530Tab(QWidget):
 
         self._conn_tab     = SR530ConnectionTab()
         self._params_tab   = SR530ParametersTab()
-        self._advanced_tab = SR530AdvancedTab()
         self._monitor_tab  = SR530MonitorTab()
 
         self._conn_tab.connected.connect(self._on_connected)
@@ -159,31 +157,25 @@ class SR530Tab(QWidget):
 
         self._tabs.addTab(self._conn_tab,     "Connection")
         self._tabs.addTab(self._params_tab,   "Parameters")
-        self._tabs.addTab(self._advanced_tab, "Advanced")
         self._tabs.addTab(self._monitor_tab,  "Monitor")
 
         self._tabs.setTabEnabled(1, False)
         self._tabs.setTabEnabled(2, False)
-        self._tabs.setTabEnabled(3, False)
 
         outer.addWidget(self._tabs)
 
     def _on_connected(self, ctrl) -> None:
         self._params_tab.set_controller(ctrl)
-        self._advanced_tab.set_controller(ctrl)
         self._monitor_tab.set_controller(ctrl)
         self._tabs.setTabEnabled(1, True)
         self._tabs.setTabEnabled(2, True)
-        self._tabs.setTabEnabled(3, True)
 
     def _on_disconnected(self) -> None:
         self._monitor_tab.stop()
         self._params_tab.set_controller(None)
-        self._advanced_tab.set_controller(None)
         self._monitor_tab.set_controller(None)
         self._tabs.setTabEnabled(1, False)
         self._tabs.setTabEnabled(2, False)
-        self._tabs.setTabEnabled(3, False)
 
     def stop(self) -> None:
         if self._tabs and self._monitor_tab:

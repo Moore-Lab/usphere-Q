@@ -2,6 +2,16 @@
 
 A practical guide to using the SR530 lock-in amplifier with this GUI, written for someone who understands the mathematics of lock-in detection but is operating the physical instrument for the first time.
 
+> **NOTE (2026-07-14):** This guide was written against an older revision of the
+> driver, when `resources/SR530_controller` was a vendored copy. The driver is
+> now a proper git submodule and was rewritten against the real instrument
+> protocol — serial defaults changed (19200 baud, no parity, 2 stop bits, `W 0`
+> fast readback, default port COM11), `snapshot()` now returns `x/y/r` in
+> volts with fractions under `x_frac/y_frac/r_frac`, and the Advanced GUI tab
+> was retired. Wiring, phase-setting, and calibration procedures below remain
+> valid; for serial settings and the CLI, see
+> `resources/SR530_controller/README.md`.
+
 ---
 
 ## Contents
