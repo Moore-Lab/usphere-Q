@@ -131,16 +131,21 @@ def _query_ch_status(afg, ch: int) -> str:
 _afg_serial_locks: "dict[int, _threading.Lock]" = {}
 
 
+def _afg_lock(afg) -> "_threading.Lock":
+    """Return the per-connection serial lock for an AFG object."""
+    key = id(afg)
+    if key not in _afg_serial_locks:
+        _afg_serial_locks[key] = _threading.Lock()
+    return _afg_serial_locks[key]
+
+
 def _poll_hw_async(afg, ch: int, on_result) -> None:
     """
     Query AFG channel status in a daemon thread; call on_result(text) on the
     Qt main thread when done.  Serialises concurrent callers on the same AFG
     connection so serial commands never interleave.
     """
-    key = id(afg)
-    if key not in _afg_serial_locks:
-        _afg_serial_locks[key] = _threading.Lock()
-    lock = _afg_serial_locks[key]
+    lock = _afg_lock(afg)
 
     def _run():
         with lock:
@@ -1563,6 +1568,109 @@ class FlashLampAdapter:
 
     def get_electrode_voltage(self) -> float:
         return self._control._voltage.value()
+
+
+# ---------------------------------------------------------------------------
+# Drive setback — park the drive tone at a low amplitude while charging
+# ---------------------------------------------------------------------------
+
+class DriveSetbackAdapter:
+    """
+    Actuator wrapper that parks the electrode drive tone at a low amplitude
+    while the wrapped actuator (the filament) is on.
+
+    enable():  read the setback params; if enabled, drop the monitored axis'
+               drive to the charging amplitude *before* enabling the actuator
+               (hardware only — the drive widget's amplitude spinbox keeps
+               the measurement setpoint) and call on_scale(charging/measure).
+               If the actuator then fails to enable, the drive is restored
+               immediately.
+    disable(): disable the wrapped actuator *first* (the field comes back up
+               only once the electron source is off), then restore the drive
+               to the amplitude captured at reduce time and call
+               on_scale(1.0).
+
+    Reduce/restore are idempotent, so ChargeController's
+    stop-everything-before-acting pattern (which calls disable() on inactive
+    actuators) is safe.  Wire on_scale to AnalysisTab.set_drive_scale so the
+    lock-in charge readout stays calibrated while the drive is reduced.
+
+    If the drive AFG is disconnected mid-actuation the restore is skipped on
+    hardware (nothing to talk to) but the scale is still reset — re-Apply the
+    drive channel after reconnecting.
+    """
+
+    def __init__(self, actuator, get_drive_widget, get_params, on_scale=None):
+        self._actuator = actuator
+        self._get_drive = get_drive_widget   # -> ChannelControlWidget
+        self._get_params = get_params        # -> {"enabled": bool, "charging_vpp": float}
+        self._on_scale = on_scale
+        self._lock = _threading.Lock()
+        self._reduced = False
+        self._measure_vpp: float = 0.0       # amplitude captured at reduce time
+
+    # -- actuator protocol ----------------------------------------------
+
+    def enable(self):
+        try:
+            params = self._get_params() or {}
+        except Exception:
+            params = {}
+        if params.get("enabled"):
+            self._reduce(float(params.get("charging_vpp", 0.0)))
+        ok = False
+        try:
+            ok = self._actuator.enable()
+        finally:
+            if not ok:
+                self._restore()
+        return ok
+
+    def disable(self):
+        try:
+            return self._actuator.disable()
+        finally:
+            self._restore()
+
+    @property
+    def is_connected(self) -> bool:
+        return self._actuator.is_connected
+
+    # -- internal ---------------------------------------------------------
+
+    def _reduce(self, charging_vpp: float):
+        with self._lock:
+            if self._reduced or charging_vpp <= 0:
+                return
+            drive = self._get_drive()
+            afg, ch = drive.get_afg_ch()
+            if afg is None:
+                return                        # no drive connected — nothing to park
+            measure_vpp = drive._amp.value()  # widget = measurement setpoint
+            if measure_vpp <= 0 or charging_vpp >= measure_vpp:
+                return                        # nothing to gain by "reducing"
+            with _afg_lock(afg):
+                afg.set_amplitude(ch, charging_vpp)
+            self._measure_vpp = measure_vpp
+            self._reduced = True
+            if self._on_scale:
+                self._on_scale(charging_vpp / measure_vpp)
+
+    def _restore(self):
+        with self._lock:
+            if not self._reduced:
+                return
+            drive = self._get_drive()
+            afg, ch = drive.get_afg_ch()
+            if afg is not None:
+                try:
+                    with _afg_lock(afg):
+                        afg.set_amplitude(ch, self._measure_vpp)
+                except Exception:
+                    pass
+            self._reduced = False
+            if self._on_scale:
+                self._on_scale(1.0)
 
 
 # ---------------------------------------------------------------------------

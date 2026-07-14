@@ -35,7 +35,7 @@ from charge_analysis import AnalysisTab
 from charge_control import ChargeController
 from charge_gui_tabs import ControlTab, CalibrationTab, ExperimentTab
 from photon_order_experiment import PhotonOrderExperiment
-from wg_control_tab import WaveformControlTab
+from wg_control_tab import WaveformControlTab, DriveSetbackAdapter
 
 # Rolling session log — sits alongside this script
 LOG_FILE = Path(__file__).parent / "charge_session_log.jsonl"
@@ -417,6 +417,17 @@ class ChargeWidget(QWidget):
         self._photon_exp = PhotonOrderExperiment()
         self._experiment_tab.set_experiment(self._photon_exp)
 
+        # --- Drive setback: park the drive tone low while the filament is on.
+        # Wraps the filament actuator; settings live in the Control tab, the
+        # reduced/restored scale feeds AnalysisTab so readings stay calibrated.
+        self._drive_setback = DriveSetbackAdapter(
+            actuator=self._wg_tab.filament,
+            get_drive_widget=lambda: getattr(
+                self._wg_tab, f"{self._analysis_tab.monitor_axis()}_drive"),
+            get_params=self._control_tab.get_setback_params,
+            on_scale=self._analysis_tab.set_drive_scale,
+        )
+
         # --- Wire analysis → control loop and experiment ---
         self._analysis_tab.charge_updated.connect(self._charge_ctrl.on_charge_update)
         self._analysis_tab.charge_updated.connect(self._photon_exp.on_charge_update)
@@ -456,11 +467,11 @@ class ChargeWidget(QWidget):
         """Wire WaveformControlTab actuators into ChargeController and PhotonOrderExperiment."""
         self._charge_ctrl.set_actuators(
             flashlamp=self._wg_tab.flashlamp,
-            filament=self._wg_tab.filament,
+            filament=self._drive_setback,   # filament wrapped: drive parks low while heating
         )
         self._photon_exp.set_actuators(
             flashlamp=self._wg_tab.flashlamp,
-            filament=self._wg_tab.filament,
+            filament=self._drive_setback,
         )
 
     def closeEvent(self, event):

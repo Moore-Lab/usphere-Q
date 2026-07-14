@@ -367,6 +367,7 @@ class LockInSource(ChargeStateSource):
         self._latest: dict | None = None
         self._running = False
         self._sample_count = 0
+        self._drive_scale = 1.0   # current drive amp / calibration drive amp
 
     # -- ChargeStateSource interface --
 
@@ -398,6 +399,15 @@ class LockInSource(ChargeStateSource):
         """Update the calibration factor on a running source."""
         self._volts_per_electron = vpe
 
+    def set_drive_scale(self, scale: float) -> None:
+        """
+        Current drive amplitude as a fraction of the amplitude the V/e
+        calibration was taken at.  The signal scales linearly with drive,
+        so charge = V / (vpe * scale) stays valid when the drive is reduced
+        (e.g. parked low while the filament charges the sphere).
+        """
+        self._drive_scale = scale if scale and scale > 0 else 1.0
+
     # -- internal --
 
     def _handle_voltage(self, volts: float):
@@ -405,7 +415,7 @@ class LockInSource(ChargeStateSource):
         polarity = 1.0 if volts >= 0 else -1.0
 
         if self._volts_per_electron > 0:
-            n_charges = volts / self._volts_per_electron
+            n_charges = volts / (self._volts_per_electron * self._drive_scale)
         else:
             n_charges = volts  # uncalibrated — just show raw voltage
 
@@ -423,6 +433,7 @@ class LockInSource(ChargeStateSource):
             "calibrated": self._volts_per_electron > 0
                           and self._volts_per_electron != 1.0,
             "raw_voltage": float(volts),
+            "drive_amp_scale": self._drive_scale,
             "raw": None,
             "_calibration": None,
         }
@@ -515,6 +526,7 @@ class SR530SerialSource(ChargeStateSource):
         self._latest: dict | None = None
         self._running = False
         self._sample_count = 0
+        self._drive_scale = 1.0   # current drive amp / calibration drive amp
 
     # -- ChargeStateSource interface --
 
@@ -546,6 +558,15 @@ class SR530SerialSource(ChargeStateSource):
         """Update the calibration factor on a running source."""
         self._volts_per_electron = vpe
 
+    def set_drive_scale(self, scale: float) -> None:
+        """
+        Current drive amplitude as a fraction of the amplitude the V/e
+        calibration was taken at.  The signal scales linearly with drive,
+        so charge = V / (vpe * scale) stays valid when the drive is reduced
+        (e.g. parked low while the filament charges the sphere).
+        """
+        self._drive_scale = scale if scale and scale > 0 else 1.0
+
     # -- internal --
 
     def _handle_snapshot(self, snap: dict):
@@ -555,7 +576,7 @@ class SR530SerialSource(ChargeStateSource):
         calibrated = self._volts_per_electron > 0 and self._volts_per_electron != 1.0
 
         if calibrated:
-            n_charges = x_v / self._volts_per_electron
+            n_charges = x_v / (self._volts_per_electron * self._drive_scale)
         else:
             n_charges = x_v        # uncalibrated — show raw voltage
 
@@ -575,6 +596,7 @@ class SR530SerialSource(ChargeStateSource):
             "raw_voltage":      x_v,
             "raw_y_voltage":    snap["y"],
             "raw_r_voltage":    snap["r"],
+            "drive_amp_scale":  self._drive_scale,
             # SR530 status
             "sr530_theta":      snap["theta"],
             "sr530_frequency":  snap["frequency"],
@@ -618,6 +640,7 @@ class AnalysisTab(QWidget):
         self._plot_widget = None
         self._plot_line_corr = None
         self._plot_line_pos = None
+        self._drive_scale = 1.0
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -930,6 +953,25 @@ class AnalysisTab(QWidget):
     # External calibration hand-off
     # ------------------------------------------------------------------
 
+    def monitor_axis(self) -> str:
+        """The electrode axis being driven for charge monitoring ('x'/'y'/'z')."""
+        return self._axis_combo.currentText().lower()
+
+    def set_drive_scale(self, scale: float) -> None:
+        """
+        Report the current drive amplitude as a fraction of the calibration
+        amplitude (1.0 = normal).  Forwards to the running lock-in source so
+        charge readings stay correct while the drive is reduced.
+
+        Thread-safe: touches no widgets — DriveSetbackAdapter calls this from
+        the ChargeController actuation-stop thread.
+        """
+        scale = float(scale) if scale and scale > 0 else 1.0
+        self._drive_scale = scale
+        src = self._source
+        if src is not None and hasattr(src, "set_drive_scale"):
+            src.set_drive_scale(scale)
+
     def set_volts_per_electron(self, vpe: float, source_kind: str) -> None:
         """
         Push a freshly measured volts-per-electron into the config field
@@ -1059,6 +1101,11 @@ class AnalysisTab(QWidget):
                     )
                 )
                 thread.error.connect(self._on_source_error)
+
+        # Carry the current drive scale over to the fresh source (e.g. if the
+        # drive is parked low right now, readings must still be normalized).
+        if self._source is not None and hasattr(self._source, "set_drive_scale"):
+            self._source.set_drive_scale(self._drive_scale)
 
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)

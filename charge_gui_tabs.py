@@ -362,6 +362,33 @@ class ControlTab(QWidget):
         tmg.addWidget(apply_timing_btn, 0, 6)
         outer.addWidget(timing_grp)
 
+        # --- Drive setback while charging ---
+        sb_grp = QGroupBox("Drive setback while charging")
+        sbg = QGridLayout(sb_grp)
+
+        self._setback_cb = QCheckBox(
+            "Reduce electrode drive while the filament is on"
+        )
+        self._setback_cb.setToolTip(
+            "Before the filament turns on, the monitored axis' drive tone is\n"
+            "dropped to the charging amplitude (better for a highly charged\n"
+            "sphere); it is restored right after the filament turns off.\n"
+            "The amplitude in the Electrodes tab stays the measurement\n"
+            "setpoint, and charge readings taken while reduced are\n"
+            "renormalized automatically, so the reported charge is unchanged."
+        )
+        sbg.addWidget(self._setback_cb, 0, 0, 1, 2)
+
+        sbg.addWidget(QLabel("Charging amplitude (Vpp):"), 1, 0)
+        self._setback_amp = QDoubleSpinBox()
+        self._setback_amp.setRange(0.001, 20.0)
+        self._setback_amp.setDecimals(3)
+        self._setback_amp.setValue(0.100)
+        self._setback_amp.setMaximumWidth(90)
+        sbg.addWidget(self._setback_amp, 1, 1)
+        sbg.setColumnStretch(2, 1)
+        outer.addWidget(sb_grp)
+
         # --- Threshold rules ---
         rules_grp = QGroupBox("Threshold rules")
         rg = QVBoxLayout(rules_grp)
@@ -548,6 +575,13 @@ class ControlTab(QWidget):
     # Config save / restore
     # ------------------------------------------------------------------
 
+    def get_setback_params(self) -> dict:
+        """Drive-setback settings, read by DriveSetbackAdapter at filament-on."""
+        return {
+            "enabled": self._setback_cb.isChecked(),
+            "charging_vpp": self._setback_amp.value(),
+        }
+
     def get_config(self) -> dict:
         cfg = self._ctrl.get_config()
         # Also save widget values
@@ -556,6 +590,8 @@ class ControlTab(QWidget):
         cfg["_gui_flash_dur"] = self._flash_dur.value()
         cfg["_gui_heat_dur"] = self._heat_dur.value()
         cfg["_gui_settle_dur"] = self._settle_dur.value()
+        cfg["_gui_setback_enabled"] = self._setback_cb.isChecked()
+        cfg["_gui_setback_vpp"] = self._setback_amp.value()
         return cfg
 
     def restore_config(self, cfg: dict):
@@ -570,6 +606,10 @@ class ControlTab(QWidget):
             self._heat_dur.setValue(float(cfg["_gui_heat_dur"]))
         if "_gui_settle_dur" in cfg:
             self._settle_dur.setValue(float(cfg["_gui_settle_dur"]))
+        if "_gui_setback_enabled" in cfg:
+            self._setback_cb.setChecked(bool(cfg["_gui_setback_enabled"]))
+        if "_gui_setback_vpp" in cfg:
+            self._setback_amp.setValue(float(cfg["_gui_setback_vpp"]))
         self._refresh_rules()
 
 
