@@ -511,6 +511,8 @@ class ChargeWidget(QWidget):
         )
         if "ElectrodeMap" in saved:
             self._wg_tab.electrode_map.restore_config(saved["ElectrodeMap"])
+        if "LockInRef" in saved:
+            self._wg_tab.lockin_ref.restore_config(saved["LockInRef"])
         if "NGEMap" in saved:
             self._wg_tab.nge_map.restore_config(saved["NGEMap"])
         if "FlashControl" in saved:
@@ -612,6 +614,7 @@ class ChargeWidget(QWidget):
         configs["Calibration"]   = self._calibration_tab.get_config()
         configs["Experiment"]    = self._experiment_tab.get_config()
         configs["ElectrodeMap"]  = self._wg_tab.electrode_map.get_config()
+        configs["LockInRef"]     = self._wg_tab.lockin_ref.get_config()
         configs["NGEMap"]        = self._wg_tab.nge_map.get_config()
         configs["FlashControl"]  = self._wg_tab.flash_control.get_config()
         configs["FilamentPower"] = self._wg_tab.filament_power.get_config()

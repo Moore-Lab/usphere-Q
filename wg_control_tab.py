@@ -482,6 +482,9 @@ class ChannelControlWidget(QWidget):
         super().__init__(parent)
         self._axis = axis
         self._map  = electrode_map
+        # Optional callback(axis) fired after a successful Apply — used to
+        # re-mirror the lock-in reference onto this channel if it mirrors it.
+        self._on_applied = None
         self._build()
 
     def _build(self):
@@ -929,6 +932,11 @@ class ChannelControlWidget(QWidget):
                 f"Applied — {wf}, {freq:.4g} Hz, {amp:.3g} Vpp"
             )
             self._update_hw_lbl()
+            if self._on_applied:
+                try:
+                    self._on_applied(self._axis)
+                except Exception:
+                    pass
         except Exception as e:
             self._set_status_err(f"Error: {e}")
 
@@ -1885,6 +1893,271 @@ class FlashLampAdapter:
 
     def get_electrode_voltage(self) -> float:
         return self._control.get_voltage()
+
+
+# ---------------------------------------------------------------------------
+# Lock-in reference — a WG channel that mirrors a drive channel
+# ---------------------------------------------------------------------------
+
+class LockInReferenceGroup(QGroupBox):
+    """
+    Lock-in reference output — a WG channel that mirrors the drive on the
+    opposite channel of the same WG.
+
+    It is a *true mirror*: the reference copies the mirrored drive's waveform
+    type (sine/square/pulse/ramp/noise), frequency and shape, and is
+    phase-locked to it (AFG ``sync_phases``).  The only user knob is the
+    reference amplitude — held fixed so the SR530 keeps its reference lock even
+    when the drive amplitude is reduced (e.g. during charging).
+
+    Assignment lives here (the WG analogue of the electrode / NGE channel
+    maps): pick the reference WG/CH and the drive WG/CH it mirrors.  A
+    phase-locked mirror is only possible between the two channels of one AFG,
+    so the reference must be the opposite channel of the same WG as its drive —
+    enforced with a validation note.
+
+    Re-mirrors automatically whenever that drive channel is (re)applied; press
+    Sync (or Output ON) after changing the reference amplitude.
+    """
+
+    _status_ready = pyqtSignal(bool, str)
+    _info_ready = pyqtSignal(str)
+
+    _DEFAULT_REF = ("WG1", "CH2")
+    _DEFAULT_MIRROR = ("WG1", "CH1")
+
+    def __init__(self, get_afg, electrode_map=None, parent=None):
+        super().__init__("Lock-in Reference", parent)
+        self._get_afg = get_afg
+        self._electrode_map = electrode_map
+        self._busy = False
+        self._build()
+        self._status_ready.connect(self._on_status)
+        self._info_ready.connect(lambda t: self._info.setText(t))
+
+    # -- UI ------------------------------------------------------------------
+
+    def _build(self):
+        g = QGridLayout(self)
+        g.setColumnStretch(5, 1)
+        row = 0
+
+        g.addWidget(QLabel("Reference output:"), row, 0, Qt.AlignRight)
+        self._ref_wg = QComboBox(); self._ref_wg.addItems(_WG_OPTIONS)
+        self._ref_wg.setCurrentText(self._DEFAULT_REF[0]); self._ref_wg.setMaximumWidth(70)
+        self._ref_ch = QComboBox(); self._ref_ch.addItems(_CH_OPTIONS)
+        self._ref_ch.setCurrentText(self._DEFAULT_REF[1]); self._ref_ch.setMaximumWidth(70)
+        g.addWidget(self._ref_wg, row, 1); g.addWidget(self._ref_ch, row, 2)
+        row += 1
+
+        g.addWidget(QLabel("Mirrors drive:"), row, 0, Qt.AlignRight)
+        self._mir_wg = QComboBox(); self._mir_wg.addItems(_WG_OPTIONS)
+        self._mir_wg.setCurrentText(self._DEFAULT_MIRROR[0]); self._mir_wg.setMaximumWidth(70)
+        self._mir_ch = QComboBox(); self._mir_ch.addItems(_CH_OPTIONS)
+        self._mir_ch.setCurrentText(self._DEFAULT_MIRROR[1]); self._mir_ch.setMaximumWidth(70)
+        g.addWidget(self._mir_wg, row, 1); g.addWidget(self._mir_ch, row, 2)
+        self._valid_lbl = QLabel(); g.addWidget(self._valid_lbl, row, 3, 1, 2)
+        row += 1
+
+        g.addWidget(QLabel("Amplitude:"), row, 0, Qt.AlignRight)
+        self._amp = QDoubleSpinBox(); self._amp.setRange(0.001, 10.0)
+        self._amp.setDecimals(3); self._amp.setValue(1.0); self._amp.setSuffix(" Vpp")
+        self._amp.setMinimumWidth(110)
+        g.addWidget(self._amp, row, 1, 1, 2)
+        row += 1
+
+        btn = QHBoxLayout()
+        sync_btn = QPushButton("Sync now"); sync_btn.clicked.connect(self.sync_reference)
+        btn.addWidget(sync_btn)
+        on_btn = QPushButton("Output ON"); on_btn.setStyleSheet(_GREEN)
+        on_btn.clicked.connect(self._output_on); btn.addWidget(on_btn)
+        off_btn = QPushButton("Output OFF"); off_btn.setStyleSheet(_RED)
+        off_btn.clicked.connect(self._output_off); btn.addWidget(off_btn)
+        btn.addStretch()
+        g.addLayout(btn, row, 0, 1, 6)
+        row += 1
+
+        self._status = QLabel("—"); self._status.setStyleSheet("color: gray;")
+        g.addWidget(self._status, row, 0, 1, 6); row += 1
+        self._info = QLabel("mirroring: —"); self._info.setStyleSheet("color: gray;")
+        g.addWidget(self._info, row, 0, 1, 6); row += 1
+
+        note = QLabel(
+            "The reference mirrors the drive on the opposite channel of the same "
+            "WG — same waveform type,\nfrequency and phase (phase-locked). Only "
+            "the amplitude is set here (kept fixed so the lock-in\nstays locked). "
+            "Re-syncs automatically when that drive channel is applied."
+        )
+        note.setStyleSheet(_HINT)
+        g.addWidget(note, row, 0, 1, 6)
+
+        self._ref_wg.currentIndexChanged.connect(self._on_ref_changed)
+        self._ref_ch.currentIndexChanged.connect(self._on_ref_changed)
+        self._mir_wg.currentIndexChanged.connect(self._validate)
+        self._mir_ch.currentIndexChanged.connect(self._validate)
+        self._validate()
+
+    def _on_ref_changed(self):
+        # Auto-suggest the mirror = same WG, opposite CH (the only valid choice).
+        self._mir_wg.blockSignals(True); self._mir_ch.blockSignals(True)
+        self._mir_wg.setCurrentText(self._ref_wg.currentText())
+        self._mir_ch.setCurrentText("CH1" if self._ref_ch.currentText() == "CH2" else "CH2")
+        self._mir_wg.blockSignals(False); self._mir_ch.blockSignals(False)
+        self._validate()
+
+    def _is_valid(self) -> bool:
+        return (self._ref_wg.currentText() == self._mir_wg.currentText()
+                and self._ref_ch.currentText() != self._mir_ch.currentText())
+
+    def _drive_name(self) -> str:
+        wg, ch = self._mir_wg.currentText(), self._mir_ch.currentText()
+        if self._electrode_map is not None:
+            for axis in ("x", "y", "z"):
+                if (self._electrode_map._wg[axis].currentText() == wg
+                        and self._electrode_map._ch[axis].currentText() == ch):
+                    return f"{wg}-{ch} = {axis.upper()} drive"
+        return f"{wg}-{ch}"
+
+    def _validate(self):
+        if self._is_valid():
+            self._valid_lbl.setText(f"✓ {self._drive_name()}")
+            self._valid_lbl.setStyleSheet("color: green;")
+        else:
+            self._valid_lbl.setText("⚠ must be the opposite CH on the same WG")
+            self._valid_lbl.setStyleSheet("color: #C62828;")
+
+    # -- hardware ------------------------------------------------------------
+
+    def _program(self, afg, ref_ch: int, mir_ch: int, amp: float):
+        """Mirror the mirror-channel waveform onto ref_ch at *amp* and
+        phase-lock.  Caller holds the AFG serial lock.  Returns (ok, msg)."""
+        wf = (afg.get_waveform_type(mir_ch) or "").upper()
+        freq = afg.get_frequency(mir_ch)
+        if freq is None:
+            return False, "cannot read mirrored channel"
+        if "SIN" in wf:
+            afg.setup_sine(ref_ch, freq, amp, 0.0); shape = "Sine"
+        elif "SQU" in wf:
+            afg.setup_square(ref_ch, freq, amp, 0.0,
+                             duty_cycle=afg.waveform.get_square_duty_cycle(mir_ch))
+            shape = "Square"
+        elif "PULS" in wf:
+            afg.setup_pulse(ref_ch, freq, amp, 0.0,
+                            width=afg.waveform.get_pulse_width(mir_ch))
+            shape = "Pulse"
+        elif "RAMP" in wf:
+            afg.setup_ramp(ref_ch, freq, amp, 0.0,
+                           symmetry=afg.waveform.get_ramp_symmetry(mir_ch))
+            shape = "Ramp"
+        elif "NOIS" in wf:
+            afg.setup_noise(ref_ch, amp, 0.0); shape = "Noise"
+        else:
+            return False, f"cannot mirror '{wf}' (e.g. ARB / comb) — set reference manually"
+        afg.waveform.sync_phases()
+        return True, f"{shape} @ {freq:.4g} Hz"
+
+    def _resolve(self):
+        """(afg, ref_ch, mir_ch, amp) or (None, reason)."""
+        if not self._is_valid():
+            return None, "invalid mirror (opposite CH, same WG)"
+        afg = self._get_afg(self._ref_wg.currentIndex() + 1)
+        if afg is None or not afg.is_connected:
+            return None, f"{self._ref_wg.currentText()} not connected"
+        return afg, (self._ref_ch.currentIndex() + 1,
+                     self._mir_ch.currentIndex() + 1, self._amp.value())
+
+    def _run(self, worker):
+        def _job():
+            for _ in range(50):
+                if not self._busy:
+                    break
+                time.sleep(0.02)
+            self._busy = True
+            try:
+                worker()
+            finally:
+                self._busy = False
+        _threading.Thread(target=_job, daemon=True).start()
+
+    def sync_reference(self, enable: bool = False):
+        afg, rest = self._resolve()
+        if afg is None:
+            self._on_status(False, rest)
+            return
+        ref_ch, mir_ch, amp = rest
+
+        def _work():
+            try:
+                with _afg_lock(afg):
+                    ok, msg = self._program(afg, ref_ch, mir_ch, amp)
+                    if ok and enable:
+                        afg.output_on(ref_ch)
+            except Exception as e:
+                ok, msg = False, f"{type(e).__name__}: {e}"
+            if ok:
+                self._status_ready.emit(
+                    True, ("output ON — " if enable else "synced — ") + msg)
+                self._info_ready.emit(
+                    f"mirroring CH{mir_ch}: {msg} at {amp:.3g} Vpp (phase-locked)")
+            else:
+                self._status_ready.emit(False, msg)
+        self._run(_work)
+
+    def _output_on(self):
+        self.sync_reference(enable=True)
+
+    def _output_off(self):
+        afg, rest = self._resolve()
+        if afg is None:
+            self._on_status(False, rest)
+            return
+        ref_ch = rest[0]
+
+        def _work():
+            try:
+                with _afg_lock(afg):
+                    ok = afg.output_off(ref_ch)
+            except Exception as e:
+                ok = False
+                self._status_ready.emit(False, f"{type(e).__name__}: {e}")
+                return
+            self._status_ready.emit(bool(ok), "output OFF" if ok else "output-off failed")
+        self._run(_work)
+
+    def notify_drive_applied(self, wg_n: int, ch: int):
+        """Called when a drive channel is applied; re-mirror if it is ours."""
+        if (self._is_valid()
+                and wg_n == self._mir_wg.currentIndex() + 1
+                and ch == self._mir_ch.currentIndex() + 1):
+            self.sync_reference(enable=False)
+
+    # -- signal slots --------------------------------------------------------
+
+    def _on_status(self, ok: bool, msg: str):
+        self._status.setText(msg)
+        self._status.setStyleSheet("color: green;" if ok else "color: red;")
+
+    # -- config --------------------------------------------------------------
+
+    def get_config(self) -> dict:
+        return {
+            "ref_wg": self._ref_wg.currentText(),
+            "ref_ch": self._ref_ch.currentText(),
+            "mirror_wg": self._mir_wg.currentText(),
+            "mirror_ch": self._mir_ch.currentText(),
+            "amplitude": self._amp.value(),
+        }
+
+    def restore_config(self, cfg: dict):
+        for key, wg, ch in (("ref", self._ref_wg, self._ref_ch),
+                            ("mirror", self._mir_wg, self._mir_ch)):
+            if f"{key}_wg" in cfg:
+                wg.setCurrentText(str(cfg[f"{key}_wg"]))
+            if f"{key}_ch" in cfg:
+                ch.setCurrentText(str(cfg[f"{key}_ch"]))
+        if "amplitude" in cfg:
+            self._amp.setValue(float(cfg["amplitude"]))
+        self._validate()
 
 
 # ---------------------------------------------------------------------------
@@ -3280,22 +3553,26 @@ class WaveformControlTab(QWidget):
 
         tabs = QTabWidget()
 
-        # --- Channel Map (electrodes + power supply) ---
+        # --- Channel Map (electrodes + lock-in reference + power supply) ---
         map_w = QWidget()
         map_v = QVBoxLayout(map_w)
         map_v.setContentsMargins(8, 8, 8, 8)
         self.electrode_map = ElectrodeMapWidget(self._get_afg)
+        self.lockin_ref = LockInReferenceGroup(self._get_afg, self.electrode_map)
         self.nge_map = NGEChannelMap(self._get_nge)
         map_v.addWidget(self.electrode_map)
+        map_v.addWidget(self.lockin_ref)
         map_v.addWidget(self.nge_map)
         map_v.addStretch()
-        tabs.addTab(map_w, "Channel Map")
+        tabs.addTab(_make_scroll(map_w), "Channel Map")
 
         # --- X / Y / Z electrode tabs ---
         for axis in ("x", "y", "z"):
             inner = QWidget()
             vbox  = QVBoxLayout(inner)
             ctrl  = ChannelControlWidget(axis, self.electrode_map)
+            # Auto-mirror the lock-in reference when this drive is (re)applied.
+            ctrl._on_applied = self._on_drive_applied
             setattr(self, f"{axis}_drive", ctrl)
             vbox.addWidget(ctrl)
             tabs.addTab(_make_scroll(inner), f"{axis.upper()} Electrode")
@@ -3337,3 +3614,10 @@ class WaveformControlTab(QWidget):
         tabs.addTab(_make_scroll(self.sweep), "Sweep")
 
         outer.addWidget(tabs)
+
+    def _on_drive_applied(self, axis: str):
+        """A drive channel was applied — re-mirror the lock-in reference if it
+        mirrors this channel (keeps a square drive -> square reference, etc.)."""
+        wg_n = self.electrode_map.get_wg_n(axis)
+        ch = self.electrode_map.get_ch(axis)
+        self.lockin_ref.notify_drive_applied(wg_n, ch)
