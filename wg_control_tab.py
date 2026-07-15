@@ -14,13 +14,15 @@ Sub-tabs:
 
 Public attributes on WaveformControlTab (for control-loop wiring):
     electrode_map  : ElectrodeMapWidget
+    nge_map        : NGEChannelMap
     x_drive        : ChannelControlWidget
     y_drive        : ChannelControlWidget
     z_drive        : ChannelControlWidget
-    filament       : PulseGroup
-    flash_trigger  : PulseGroup
-    flash_control  : DCGroup
-    flashlamp      : FlashLampAdapter
+    filament       : PulseGroup          (WG3-CH2 trigger to the SSR)
+    filament_power : NGEControlGroup     (NGE filament power line)
+    flash_trigger  : PulseGroup          (WG3-CH1 trigger pulse)
+    flash_control  : NGEControlGroup     (NGE flash-lamp control voltage)
+    flashlamp      : FlashLampAdapter    (trigger + NGE control)
     sweep          : SweepTab
 """
 
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import math
 import threading as _threading
+import time
 
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -225,19 +228,22 @@ class ElectrodeMapWidget(QGroupBox):
     """
     Maps electrode axes (X, Y, Z) to WG/CH pairs.
 
-    Default mapping:
-        X → WG1-CH1
-        Y → WG1-CH2
-        Z → WG2-CH1
+    Default mapping (2026-07-15 hardware, verified against the DAQ):
+        X → WG2-CH1   (AI18)
+        Y → WG1-CH1   (AI19)
+        Z → WG2-CH2   (AI20)
+    WG1-CH2 is the lock-in reference (fixed amplitude into SR530 REF IN — not
+    an electrode, so it is not in this map); WG3 carries the flash-lamp trigger
+    (CH1) and filament trigger (CH2).
 
     The electrode drive tabs read from this map at call time, so changes
     take effect immediately without restarting.
     """
 
     _DEFAULTS: dict[str, tuple[str, str]] = {
-        "x": ("WG1", "CH1"),
-        "y": ("WG1", "CH2"),
-        "z": ("WG2", "CH1"),
+        "x": ("WG2", "CH1"),
+        "y": ("WG1", "CH1"),
+        "z": ("WG2", "CH2"),
     }
 
     def __init__(self, get_afg, parent=None):
@@ -275,7 +281,8 @@ class ElectrodeMapWidget(QGroupBox):
 
         note = QLabel(
             "Changes take effect immediately — electrode tabs read from this map.\n"
-            "Default: X → WG1-CH1,  Y → WG1-CH2,  Z → WG2-CH1"
+            "Default: X → WG2-CH1,  Y → WG1-CH1,  Z → WG2-CH2   "
+            "(WG1-CH2 = lock-in reference)"
         )
         note.setStyleSheet(_HINT)
         g.addWidget(note, 4, 0, 1, 4)
@@ -1533,16 +1540,326 @@ class DCGroup(QGroupBox):
 
 
 # ---------------------------------------------------------------------------
+# NGE100 power-supply DC control (replaces the AFG-DC "flash control" line,
+# and adds a controllable filament power line).
+# ---------------------------------------------------------------------------
+
+_NGE_ROLES = [
+    ("flash_control",  "Flash-lamp control"),
+    ("filament_power", "Filament power"),
+]
+_NGE_CH_OPTIONS = ["CH1", "CH2", "CH3"]
+
+
+class NGEChannelMap(QGroupBox):
+    """
+    Maps power-supply roles to NGE100 channels — the PSU analogue of the
+    electrode channel map.
+
+    Default (2026-07-15 hardware):
+        Flash-lamp control → NGE CH1   (wired to DAQ AI23)
+        Filament power     → NGE CH2   (no ADC monitor — readback via NGE)
+
+    Control groups read from this map at call time, so reassignment takes
+    effect immediately.
+    """
+
+    _DEFAULTS: dict[str, str] = {
+        "flash_control":  "CH1",
+        "filament_power": "CH2",
+    }
+
+    def __init__(self, get_nge, parent=None):
+        super().__init__("Power-Supply Channel Map (NGE100)", parent)
+        self._get_nge = get_nge
+        self._ch: dict[str, QComboBox] = {}
+        self._build()
+
+    def _build(self):
+        g = QGridLayout(self)
+        g.setColumnStretch(2, 1)
+        for col, hdr in enumerate(["Role", "NGE channel"]):
+            lbl = QLabel(hdr)
+            lbl.setStyleSheet("font-weight: bold;")
+            g.addWidget(lbl, 0, col, Qt.AlignLeft)
+
+        for r, (role, label) in enumerate(_NGE_ROLES, 1):
+            g.addWidget(QLabel(f"{label}:"), r, 0, Qt.AlignRight)
+            cb = QComboBox()
+            cb.addItems(_NGE_CH_OPTIONS)
+            cb.setCurrentText(self._DEFAULTS[role])
+            cb.setMaximumWidth(80)
+            g.addWidget(cb, r, 1)
+            self._ch[role] = cb
+
+        note = QLabel(
+            "Default: flash-lamp control → NGE CH1,  filament power → NGE CH2.\n"
+            "Flash-lamp control is monitored on DAQ AI23; filament power has no "
+            "ADC — verify it from the NGE readback."
+        )
+        note.setStyleSheet(_HINT)
+        g.addWidget(note, len(_NGE_ROLES) + 1, 0, 1, 3)
+
+    # -- Accessors -----------------------------------------------------------
+
+    def get_ch(self, role: str) -> int:
+        """NGE channel number (1/2/3) for a role."""
+        return self._ch[role].currentIndex() + 1
+
+    def get_nge(self):
+        """Live NGESupplyController, or None."""
+        return self._get_nge()
+
+    def assignment_str(self, role: str) -> str:
+        return f"NGE-{self._ch[role].currentText()}"
+
+    # -- Config persistence --------------------------------------------------
+
+    def get_config(self) -> dict:
+        return {role: cb.currentText() for role, cb in self._ch.items()}
+
+    def restore_config(self, cfg: dict):
+        for role, cb in self._ch.items():
+            if role in cfg:
+                cb.setCurrentText(str(cfg[role]))
+
+
+class NGEControlGroup(QGroupBox):
+    """
+    DC control for one NGE role (flash-lamp control or filament power).
+
+    Voltage / current-limit setpoints + Apply / Output ON / Output OFF, with a
+    live measured V/I readback.  The NGE channel is read from the shared
+    NGEChannelMap at call time.  All instrument I/O runs in short-lived daemon
+    threads (NGE serial round-trips are ~0.2–0.5 s); results are marshalled back
+    to the GUI thread through signals.
+    """
+
+    _status_ready = pyqtSignal(bool, str)
+    _meas_ready = pyqtSignal(object)   # dict | None
+
+    def __init__(self, title: str, role: str, nge_map: NGEChannelMap,
+                 default_current_a: float = 0.1, parent=None):
+        super().__init__(title, parent)
+        self._role = role
+        self._map = nge_map
+        self._default_current = default_current_a
+        self._busy = False   # guard: at most one in-flight serial op per group
+        self._build()
+        self._status_ready.connect(self._on_status)
+        self._meas_ready.connect(self._on_meas)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll)
+        self._poll_timer.start(2000)
+
+    # -- UI ------------------------------------------------------------------
+
+    def _build(self):
+        g = QGridLayout(self)
+        g.setColumnStretch(4, 1)
+        row = 0
+
+        self._assign_lbl = QLabel()
+        self._assign_lbl.setStyleSheet(_HINT)
+        g.addWidget(self._assign_lbl, row, 0, 1, 5)
+        row += 1
+
+        g.addWidget(QLabel("Voltage:"), row, 0, Qt.AlignRight)
+        self._voltage = QDoubleSpinBox()
+        self._voltage.setRange(0.0, 32.0)
+        self._voltage.setDecimals(3)
+        self._voltage.setSuffix(" V")
+        self._voltage.setMinimumWidth(110)
+        g.addWidget(self._voltage, row, 1)
+
+        g.addWidget(QLabel("Current limit:"), row, 2, Qt.AlignRight)
+        self._current = QDoubleSpinBox()
+        self._current.setRange(0.0, 3.0)
+        self._current.setDecimals(3)
+        self._current.setValue(self._default_current)
+        self._current.setSuffix(" A")
+        self._current.setMinimumWidth(110)
+        g.addWidget(self._current, row, 3)
+        row += 1
+
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self._apply)
+        btn_row.addWidget(apply_btn)
+        on_btn = QPushButton("Output ON")
+        on_btn.setStyleSheet(_GREEN)
+        on_btn.clicked.connect(self._output_on)
+        btn_row.addWidget(on_btn)
+        off_btn = QPushButton("Output OFF")
+        off_btn.setStyleSheet(_RED)
+        off_btn.clicked.connect(self._output_off)
+        btn_row.addWidget(off_btn)
+        btn_row.addStretch()
+        g.addLayout(btn_row, row, 0, 1, 5)
+        row += 1
+
+        self._meas_lbl = QLabel("measured: —")
+        self._meas_lbl.setStyleSheet("color: gray;")
+        g.addWidget(self._meas_lbl, row, 0, 1, 5)
+        row += 1
+
+        self._status = QLabel("—")
+        self._status.setStyleSheet("color: gray;")
+        g.addWidget(self._status, row, 0, 1, 5)
+
+        self._refresh_assign_lbl()
+
+    def _refresh_assign_lbl(self):
+        self._assign_lbl.setText(f"Assigned: {self._map.assignment_str(self._role)}")
+
+    # -- hardware helpers ----------------------------------------------------
+
+    def _nge_ch(self):
+        """(NGESupplyController | None, channel:int)."""
+        return self._map.get_nge(), self._map.get_ch(self._role)
+
+    def _run(self, fn):
+        """Run fn() in a daemon thread; fn returns (ok, msg) via _status_ready.
+        User actions take priority: they wait briefly for an in-flight poll to
+        clear rather than being dropped."""
+        def _work():
+            for _ in range(50):            # up to ~1 s waiting for a poll to finish
+                if not self._busy:
+                    break
+                time.sleep(0.02)
+            self._busy = True
+            try:
+                ok, msg = fn()
+            except Exception as e:
+                ok, msg = False, f"{type(e).__name__}: {e}"
+            finally:
+                self._busy = False
+            self._status_ready.emit(ok, msg)
+        _threading.Thread(target=_work, daemon=True).start()
+
+    def _apply(self):
+        self._refresh_assign_lbl()
+        v, i = self._voltage.value(), self._current.value()
+        nge, ch = self._nge_ch()
+        if nge is None or not nge.is_connected:
+            self._on_status(False, "NGE not connected")
+            return
+
+        def _do():
+            ok = nge.set_channel(ch, v, i)
+            return ok, (f"set {v:.3f} V, {i:.3f} A limit on CH{ch}"
+                        if ok else "set failed")
+        self._run(_do)
+
+    def _output_on(self):
+        nge, ch = self._nge_ch()
+        if nge is None or not nge.is_connected:
+            self._on_status(False, "NGE not connected")
+            return
+
+        def _do():
+            # Program the setpoint first, then enable the output.
+            nge.set_channel(ch, self._voltage.value(), self._current.value())
+            ok = nge.output_on(ch)
+            return ok, (f"CH{ch} output ON" if ok else "output-on failed")
+        self._run(_do)
+
+    def _output_off(self):
+        nge, ch = self._nge_ch()
+        if nge is None or not nge.is_connected:
+            self._on_status(False, "NGE not connected")
+            return
+
+        def _do():
+            ok = nge.output_off(ch)
+            return ok, (f"CH{ch} output OFF" if ok else "output-off failed")
+        self._run(_do)
+
+    def _poll(self):
+        self._refresh_assign_lbl()
+        nge, ch = self._nge_ch()
+        if nge is None or not nge.is_connected:
+            self._meas_ready.emit(None)
+            return
+        if self._busy:
+            return   # a user action (or prior poll) is using the serial port
+
+        def _work():
+            self._busy = True
+            try:
+                m = nge.measure(ch)
+                m["output_on"] = nge.is_output_on(ch)
+            except Exception:
+                m = None
+            finally:
+                self._busy = False
+            self._meas_ready.emit(m)
+        _threading.Thread(target=_work, daemon=True).start()
+
+    # -- signal slots (GUI thread) ------------------------------------------
+
+    def _on_status(self, ok: bool, msg: str):
+        self._status.setText(msg)
+        self._status.setStyleSheet("color: green;" if ok else "color: red;")
+
+    def _on_meas(self, m):
+        if not m:
+            self._meas_lbl.setText("measured: — (NGE not connected)")
+            self._meas_lbl.setStyleSheet("color: gray;")
+            return
+        v, i = m.get("voltage"), m.get("current")
+        on = m.get("output_on")
+        state = "ON" if on else "off"
+        self._meas_lbl.setText(
+            f"measured: {v:.3f} V, {i:.4f} A   [output {state}]"
+            if v is not None else "measured: —"
+        )
+        self._meas_lbl.setStyleSheet(
+            "color: #1565C0;" if on else "color: gray;"
+        )
+
+    # -- external control (FlashLampAdapter / experiment scripts) -----------
+
+    def set_voltage(self, v: float):
+        """Set the DC setpoint from code (thread-safe; commands hardware
+        directly and does not toggle the output — turn the output on first)."""
+        nge, ch = self._nge_ch()
+        if nge is not None and nge.is_connected:
+            nge.set_voltage(ch, v)
+
+    def get_voltage(self) -> float:
+        return self._voltage.value()
+
+    @property
+    def is_connected(self) -> bool:
+        nge, _ = self._nge_ch()
+        return nge is not None and nge.is_connected
+
+    # -- config --------------------------------------------------------------
+
+    def get_config(self) -> dict:
+        return {"voltage": self._voltage.value(), "current": self._current.value()}
+
+    def restore_config(self, cfg: dict):
+        if "voltage" in cfg:
+            self._voltage.setValue(float(cfg["voltage"]))
+        if "current" in cfg:
+            self._current.setValue(float(cfg["current"]))
+
+
+# ---------------------------------------------------------------------------
 # FlashLampAdapter
-# Wraps flash_trigger (PulseGroup) + flash_control (DCGroup) into a single
-# object matching the FlashLampController interface expected by
-# ChargeController and PhotonOrderExperiment.
+# Wraps flash_trigger (PulseGroup) + flash_control (NGEControlGroup) into a
+# single object matching the FlashLampController interface expected by
+# ChargeController and PhotonOrderExperiment.  The trigger is the gating
+# actuator (enable/disable); the control voltage is an NGE setpoint.
 # ---------------------------------------------------------------------------
 
 class FlashLampAdapter:
-    """Combines PulseGroup and DCGroup into a FlashLampController-compatible object."""
+    """Combines a trigger PulseGroup and an NGEControlGroup into a
+    FlashLampController-compatible object."""
 
-    def __init__(self, trigger: PulseGroup, control: DCGroup):
+    def __init__(self, trigger: PulseGroup, control: NGEControlGroup):
         self._trigger = trigger
         self._control = control
 
@@ -1567,7 +1884,7 @@ class FlashLampAdapter:
         return self._trigger._freq.value()
 
     def get_electrode_voltage(self) -> float:
-        return self._control._voltage.value()
+        return self._control.get_voltage()
 
 
 # ---------------------------------------------------------------------------
@@ -2946,11 +3263,15 @@ class WaveformControlTab(QWidget):
     get_afg : callable
         ``get_afg(wg_index: int)`` → ``AFG2225Controller | None``,
         wg_index is 1, 2, or 3.
+    get_nge : callable
+        ``get_nge()`` → ``NGESupplyController | None`` — the DC power supply
+        used for the flash-lamp control and filament power lines.
     """
 
-    def __init__(self, get_afg, parent=None):
+    def __init__(self, get_afg, get_nge=None, parent=None):
         super().__init__(parent)
         self._get_afg = get_afg
+        self._get_nge = get_nge if get_nge is not None else (lambda: None)
         self._build()
 
     def _build(self):
@@ -2959,14 +3280,16 @@ class WaveformControlTab(QWidget):
 
         tabs = QTabWidget()
 
-        # --- Electrode Map ---
+        # --- Channel Map (electrodes + power supply) ---
         map_w = QWidget()
         map_v = QVBoxLayout(map_w)
         map_v.setContentsMargins(8, 8, 8, 8)
         self.electrode_map = ElectrodeMapWidget(self._get_afg)
+        self.nge_map = NGEChannelMap(self._get_nge)
         map_v.addWidget(self.electrode_map)
+        map_v.addWidget(self.nge_map)
         map_v.addStretch()
-        tabs.addTab(map_w, "Electrode Map")
+        tabs.addTab(map_w, "Channel Map")
 
         # --- X / Y / Z electrode tabs ---
         for axis in ("x", "y", "z"):
@@ -2977,24 +3300,30 @@ class WaveformControlTab(QWidget):
             vbox.addWidget(ctrl)
             tabs.addTab(_make_scroll(inner), f"{axis.upper()} Electrode")
 
-        # --- Filament ---
+        # --- Filament: trigger (WG3-CH2 pulse to SSR) + power (NGE) ---
         fil_w = QWidget()
         fil_v = QVBoxLayout(fil_w)
         self.filament = PulseGroup(
-            "Filament (pulse to SSR)", self._get_afg, "WG2", "CH2"
+            "Filament — Trigger (pulse to SSR)", self._get_afg, "WG3", "CH2"
+        )
+        self.filament_power = NGEControlGroup(
+            "Filament — Power (NGE)", "filament_power", self.nge_map,
+            default_current_a=3.0,
         )
         fil_v.addWidget(self.filament)
+        fil_v.addWidget(self.filament_power)
         fil_v.addStretch()
         tabs.addTab(_make_scroll(fil_w), "Filament")
 
-        # --- Flash Lamp ---
+        # --- Flash Lamp: trigger (WG3-CH1 pulse) + control (NGE) ---
         flash_w = QWidget()
         flash_v = QVBoxLayout(flash_w)
         self.flash_trigger = PulseGroup(
             "Flash Lamp — Trigger (pulse)", self._get_afg, "WG3", "CH1"
         )
-        self.flash_control = DCGroup(
-            "Flash Lamp — Control (DC)", self._get_afg, "WG3", "CH2"
+        self.flash_control = NGEControlGroup(
+            "Flash Lamp — Control (NGE)", "flash_control", self.nge_map,
+            default_current_a=0.1,
         )
         flash_v.addWidget(self.flash_trigger)
         flash_v.addWidget(self.flash_control)

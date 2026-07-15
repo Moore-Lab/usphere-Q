@@ -7,3 +7,6 @@
 [submodule "resources/SR530_controller"]
 	path = resources/SR530_controller
 	url = https://github.com/Moore-Lab/SR530_controller
+[submodule "resources/NGE100_controller"]
+	path = resources/NGE100_controller
+	url = https://github.com/Moore-Lab/NGE100_controller

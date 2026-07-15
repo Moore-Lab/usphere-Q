@@ -51,6 +51,9 @@ try:
 except ImportError:
     _AFG_AVAILABLE = False
 
+# NGE100 DC power supply (flash-lamp control + filament power lines)
+from nge_supply import NGESupplyController, NGE_AVAILABLE as _NGE_AVAILABLE
+
 # SR530 submodule path
 _SR530_PATH = Path(__file__).parent / "resources" / "SR530_controller"
 if _SR530_PATH.exists() and str(_SR530_PATH) not in sys.path:
@@ -308,13 +311,115 @@ class _WGPanel(QGroupBox):
 
 
 # ---------------------------------------------------------------------------
+# NGE100 power-supply connection panel
+# ---------------------------------------------------------------------------
+
+class _NGEPanel(QGroupBox):
+    """
+    Connection panel for the R&S NGE100 DC power supply.
+
+    Holds an NGESupplyController; exposes it via .nge (None when disconnected).
+    """
+
+    def __init__(self, saved_port: str = "", parent=None):
+        super().__init__("Power Supply — R&S NGE100", parent)
+        self._psu: NGESupplyController | None = None
+        self._workers: list[_Worker] = []
+        self._build(saved_port)
+
+    def _build(self, saved_port: str):
+        h = QHBoxLayout(self)
+        h.addWidget(QLabel("COM port:"))
+        # Default to COM3 (current NGE port) — auto-discover is timing-flaky,
+        # connect-by-port is reliable.  User-editable; last value is saved.
+        self._port_edit = QLineEdit(saved_port or "COM3")
+        self._port_edit.setPlaceholderText("e.g. COM3 (blank = auto-discover)")
+        self._port_edit.setMaximumWidth(160)
+        h.addWidget(self._port_edit)
+
+        self._connect_btn = QPushButton("Connect")
+        self._connect_btn.setMinimumWidth(80)
+        self._connect_btn.clicked.connect(self._on_connect)
+        h.addWidget(self._connect_btn)
+
+        self._disconnect_btn = QPushButton("Disconnect")
+        self._disconnect_btn.setMinimumWidth(80)
+        self._disconnect_btn.setEnabled(False)
+        self._disconnect_btn.clicked.connect(self._on_disconnect)
+        h.addWidget(self._disconnect_btn)
+
+        self._status = QLabel("—")
+        self._status.setStyleSheet("color: gray;")
+        self._status.setMinimumWidth(260)
+        h.addWidget(self._status)
+        h.addStretch()
+
+    def _set_status(self, ok, msg):
+        self._status.setText(msg)
+        self._status.setStyleSheet(
+            "color: green;" if ok is True else
+            "color: red;" if ok is False else "color: gray;")
+
+    def _run_worker(self, fn, *args, on_done=None):
+        w = _Worker(fn, *args)
+        if on_done:
+            w.done.connect(on_done)
+        w.done.connect(lambda _ok, _msg, ww=w: self._workers.remove(ww)
+                       if ww in self._workers else None)
+        w.finished.connect(w.deleteLater)
+        self._workers.append(w)
+        w.start()
+
+    def _on_connect(self):
+        if not _NGE_AVAILABLE:
+            self._set_status(False, "NGE100 driver not found")
+            return
+        port = self._port_edit.text().strip()
+        self._set_status(None, "Connecting…")
+        self._psu = NGESupplyController({"com_port": port})
+
+        def _do():
+            ok = self._psu.connect()
+            return ok, (f"Connected — {self._psu.idn or 'unknown'}"
+                        if ok else "connect() returned False")
+
+        def _after(ok, msg):
+            if not ok:
+                self._psu = None
+            self._set_status(ok, msg)
+            self._connect_btn.setEnabled(not ok)
+            self._disconnect_btn.setEnabled(ok)
+
+        self._run_worker(_do, on_done=_after)
+
+    def _on_disconnect(self):
+        if self._psu:
+            try:
+                self._psu.disconnect()   # turns all outputs off, releases to local
+            except Exception:
+                pass
+            self._psu = None
+        self._set_status(None, "Disconnected")
+        self._connect_btn.setEnabled(True)
+        self._disconnect_btn.setEnabled(False)
+
+    def get_config(self) -> dict:
+        return {"com_port": self._port_edit.text().strip()}
+
+    @property
+    def nge(self) -> NGESupplyController | None:
+        return self._psu if (self._psu and self._psu.is_connected) else None
+
+
+# ---------------------------------------------------------------------------
 # Connections tab
 # ---------------------------------------------------------------------------
 
 class ConnectionsTab(QWidget):
     """
-    Three WG connection panels (WG1 / WG2 / WG3) plus a
-    "Launch Charge Control" button that switches to the WaveformControlTab.
+    Three WG connection panels (WG1 / WG2 / WG3) plus the NGE100 power supply,
+    and a "Launch Charge Control" button that switches to the
+    WaveformControlTab.
     """
 
     launch_clicked = pyqtSignal()
@@ -322,6 +427,7 @@ class ConnectionsTab(QWidget):
     def __init__(self, saved_configs: dict, parent=None):
         super().__init__(parent)
         self._panels: dict[str, _WGPanel] = {}
+        self._nge_panel: _NGEPanel | None = None
         self._build(saved_configs)
 
     def _build(self, saved: dict):
@@ -334,6 +440,10 @@ class ConnectionsTab(QWidget):
             panel = _WGPanel(name, saved_port=port)
             self._panels[name] = panel
             outer.addWidget(panel)
+
+        nge_port = saved.get("NGE", {}).get("com_port", "")
+        self._nge_panel = _NGEPanel(saved_port=nge_port)
+        outer.addWidget(self._nge_panel)
 
         outer.addSpacing(12)
 
@@ -365,13 +475,20 @@ class ConnectionsTab(QWidget):
         _append_log(self.get_all_configs())
 
     def get_all_configs(self) -> dict:
-        return {name: panel.get_config() for name, panel in self._panels.items()}
+        cfg = {name: panel.get_config() for name, panel in self._panels.items()}
+        if self._nge_panel is not None:
+            cfg["NGE"] = self._nge_panel.get_config()
+        return cfg
 
     def get_afg(self, wg_index: int) -> AFG2225Controller | None:
         """Return the live AFG2225Controller for WG{wg_index}, or None."""
         name = f"WG{wg_index}"
         panel = self._panels.get(name)
         return panel.afg if panel else None
+
+    def get_nge(self) -> NGESupplyController | None:
+        """Return the live NGESupplyController, or None."""
+        return self._nge_panel.nge if self._nge_panel else None
 
 
 # ---------------------------------------------------------------------------
@@ -389,10 +506,17 @@ class ChargeWidget(QWidget):
 
         # --- WaveformControl tab ---
         self._wg_tab = WaveformControlTab(
-            lambda wg_n: self._connections_tab.get_afg(wg_n)
+            lambda wg_n: self._connections_tab.get_afg(wg_n),
+            get_nge=self._connections_tab.get_nge,
         )
         if "ElectrodeMap" in saved:
             self._wg_tab.electrode_map.restore_config(saved["ElectrodeMap"])
+        if "NGEMap" in saved:
+            self._wg_tab.nge_map.restore_config(saved["NGEMap"])
+        if "FlashControl" in saved:
+            self._wg_tab.flash_control.restore_config(saved["FlashControl"])
+        if "FilamentPower" in saved:
+            self._wg_tab.filament_power.restore_config(saved["FilamentPower"])
 
         # --- Analysis tab ---
         self._analysis_tab = AnalysisTab()
@@ -488,7 +612,17 @@ class ChargeWidget(QWidget):
         configs["Calibration"]   = self._calibration_tab.get_config()
         configs["Experiment"]    = self._experiment_tab.get_config()
         configs["ElectrodeMap"]  = self._wg_tab.electrode_map.get_config()
+        configs["NGEMap"]        = self._wg_tab.nge_map.get_config()
+        configs["FlashControl"]  = self._wg_tab.flash_control.get_config()
+        configs["FilamentPower"] = self._wg_tab.filament_power.get_config()
         _append_log(configs)
+        # Release the power supply (all outputs off, local control).
+        try:
+            nge = self._connections_tab.get_nge()
+            if nge is not None:
+                nge.disconnect()
+        except Exception:
+            pass
         event.accept()
 
 
