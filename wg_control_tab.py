@@ -485,6 +485,9 @@ class ChannelControlWidget(QWidget):
         # Optional callback(axis) fired after a successful Apply — used to
         # re-mirror the lock-in reference onto this channel if it mirrors it.
         self._on_applied = None
+        # Optional callback(axis, is_on) fired after Output ON/OFF — used to
+        # mirror this channel's output state onto the lock-in reference.
+        self._on_output_changed = None
         self._build()
 
     def _build(self):
@@ -948,6 +951,7 @@ class ChannelControlWidget(QWidget):
             afg.output_on(ch)
             self._set_status_ok("Output ON")
             self._update_hw_lbl()
+            self._notify_output(True)
         except Exception as e:
             self._set_status_err(f"Error: {e}")
 
@@ -960,8 +964,16 @@ class ChannelControlWidget(QWidget):
             self._status.setText("Output OFF")
             self._status.setStyleSheet("color: gray;")
             self._update_hw_lbl()
+            self._notify_output(False)
         except Exception as e:
             self._set_status_err(f"Error: {e}")
+
+    def _notify_output(self, is_on: bool):
+        if self._on_output_changed:
+            try:
+                self._on_output_changed(self._axis, is_on)
+            except Exception:
+                pass
 
     # -- Frequency comb ------------------------------------------------------
 
@@ -1916,8 +1928,10 @@ class LockInReferenceGroup(QGroupBox):
     so the reference must be the opposite channel of the same WG as its drive —
     enforced with a validation note.
 
-    Re-mirrors automatically whenever that drive channel is (re)applied; press
-    Sync (or Output ON) after changing the reference amplitude.
+    Re-mirrors automatically whenever that drive channel is (re)applied, and
+    follows the drive's output on/off (turning the drive off turns the
+    reference off; turning it on syncs and enables the reference); press Sync
+    (or Output ON) after changing the reference amplitude.
     """
 
     _status_ready = pyqtSignal(bool, str)
@@ -1986,7 +2000,8 @@ class LockInReferenceGroup(QGroupBox):
             "The reference mirrors the drive on the opposite channel of the same "
             "WG — same waveform type,\nfrequency and phase (phase-locked). Only "
             "the amplitude is set here (kept fixed so the lock-in\nstays locked). "
-            "Re-syncs automatically when that drive channel is applied."
+            "Re-syncs when that drive is applied, and follows its output on/off "
+            "(drive off → reference off)."
         )
         note.setStyleSheet(_HINT)
         g.addWidget(note, row, 0, 1, 6)
@@ -2126,10 +2141,24 @@ class LockInReferenceGroup(QGroupBox):
 
     def notify_drive_applied(self, wg_n: int, ch: int):
         """Called when a drive channel is applied; re-mirror if it is ours."""
-        if (self._is_valid()
-                and wg_n == self._mir_wg.currentIndex() + 1
-                and ch == self._mir_ch.currentIndex() + 1):
+        if self._mirrors(wg_n, ch):
             self.sync_reference(enable=False)
+
+    def notify_drive_output(self, wg_n: int, ch: int, is_on: bool):
+        """Called when a drive channel's output is toggled; mirror the state
+        onto the reference (drive off -> reference off, drive on -> sync +
+        reference on) if that channel is the one we mirror."""
+        if not self._mirrors(wg_n, ch):
+            return
+        if is_on:
+            self.sync_reference(enable=True)
+        else:
+            self._output_off()
+
+    def _mirrors(self, wg_n: int, ch: int) -> bool:
+        return (self._is_valid()
+                and wg_n == self._mir_wg.currentIndex() + 1
+                and ch == self._mir_ch.currentIndex() + 1)
 
     # -- signal slots --------------------------------------------------------
 
@@ -3571,8 +3600,10 @@ class WaveformControlTab(QWidget):
             inner = QWidget()
             vbox  = QVBoxLayout(inner)
             ctrl  = ChannelControlWidget(axis, self.electrode_map)
-            # Auto-mirror the lock-in reference when this drive is (re)applied.
+            # Auto-mirror the lock-in reference when this drive is (re)applied
+            # or its output is toggled.
             ctrl._on_applied = self._on_drive_applied
+            ctrl._on_output_changed = self._on_drive_output_changed
             setattr(self, f"{axis}_drive", ctrl)
             vbox.addWidget(ctrl)
             tabs.addTab(_make_scroll(inner), f"{axis.upper()} Electrode")
@@ -3621,3 +3652,10 @@ class WaveformControlTab(QWidget):
         wg_n = self.electrode_map.get_wg_n(axis)
         ch = self.electrode_map.get_ch(axis)
         self.lockin_ref.notify_drive_applied(wg_n, ch)
+
+    def _on_drive_output_changed(self, axis: str, is_on: bool):
+        """A drive channel's output was toggled — mirror the on/off state onto
+        the lock-in reference if it mirrors this channel."""
+        wg_n = self.electrode_map.get_wg_n(axis)
+        ch = self.electrode_map.get_ch(axis)
+        self.lockin_ref.notify_drive_output(wg_n, ch, is_on)
