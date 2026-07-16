@@ -635,9 +635,9 @@ class CalibrationTab(QWidget):
     ``AnalysisTab.set_volts_per_electron`` (done in charge_gui.py).
     """
 
-    # Emitted after a successful auto-calibration: (volts_per_electron, kind)
-    # where kind is 'sr530' or 'esp32'.
-    lockin_cal_saved = pyqtSignal(float, str)
+    # Emitted after a successful lock-in calibration:
+    # (volts_per_electron, drive_amplitude_vpp, kind) where kind is 'sr530'/'esp32'.
+    lockin_cal_saved = pyqtSignal(float, float, str)
 
     # SEM criterion may only trigger after this many samples.
     _AUTO_MIN_SAMPLES = 100
@@ -650,7 +650,20 @@ class CalibrationTab(QWidget):
         self._auto_m2 = 0.0
         self._auto_kind = ""
         self._auto_snap: dict = {}
+        # Optional callable() -> current electrode drive amplitude (Vpp), set by
+        # the ChargeWidget so calibrations record the drive amplitude in use.
+        self._drive_amp_provider = None
         self._build_ui()
+
+    def _current_drive_amp(self) -> float:
+        """Current drive amplitude (Vpp), or 0.0 if unknown."""
+        if self._drive_amp_provider is None:
+            return 0.0
+        try:
+            v = self._drive_amp_provider()
+            return float(v) if v and v > 0 else 0.0
+        except Exception:
+            return 0.0
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -1030,6 +1043,7 @@ class CalibrationTab(QWidget):
             self._auto_status.setStyleSheet("color: red;")
             return
 
+        drive_amp = self._current_drive_amp()
         try:
             from charge_calibration import calibrate_lockin_from_voltage
             cal = calibrate_lockin_from_voltage(
@@ -1038,19 +1052,22 @@ class CalibrationTab(QWidget):
                 sphere_diameter_um=float(self._diam_edit.text()),
                 drive_frequency_hz=float(self._freq_edit.text()),
                 calibration_file=self._cal_file_edit.text().strip(),
+                drive_amplitude_vpp=drive_amp,
                 sr530_sensitivity_idx=int(
                     self._auto_snap.get("sensitivity_idx", -1)),
                 sr530_phase=float(self._auto_snap.get("phase", 0.0)),
             )
             vpe = cal["volts_per_electron"]
+            amp_txt = (f", drive={drive_amp:.4g} Vpp" if drive_amp > 0
+                       else " (drive amp unknown)")
             self._auto_status.setText(
                 f"Saved: {vpe:.6e} V/e from n={n} samples "
                 f"(mean={mean_v:.4e} V, SEM={sem_pct:.2f}%, "
-                f"charge={charge:+d}e) — Analysis tab updated."
+                f"charge={charge:+d}e{amp_txt}) — Analysis tab updated."
             )
             self._auto_status.setStyleSheet("color: green;")
             self._refresh_cal_list()
-            self.lockin_cal_saved.emit(vpe, self._auto_kind or "sr530")
+            self.lockin_cal_saved.emit(vpe, drive_amp, self._auto_kind or "sr530")
         except Exception as e:
             self._auto_status.setText(f"{type(e).__name__}: {e}")
             self._auto_status.setStyleSheet("color: red;")
@@ -1071,6 +1088,7 @@ class CalibrationTab(QWidget):
             self._li_cal_status.setStyleSheet("color: red;")
             return
 
+        drive_amp = self._current_drive_amp()
         try:
             from charge_calibration import calibrate_lockin_from_voltage
             cal = calibrate_lockin_from_voltage(
@@ -1079,14 +1097,17 @@ class CalibrationTab(QWidget):
                 sphere_diameter_um=diam,
                 drive_frequency_hz=freq,
                 calibration_file=self._cal_file_edit.text().strip(),
+                drive_amplitude_vpp=drive_amp,
             )
             vpe = cal["volts_per_electron"]
+            amp_txt = f"  drive={drive_amp:.4g}Vpp" if drive_amp > 0 else ""
             self._li_cal_status.setText(
-                f"Saved: {vpe:.6f} V/e  "
-                f"(d={diam}µm, f={freq}Hz)"
+                f"Saved: {vpe:.6f} V/e  (d={diam}µm, f={freq}Hz){amp_txt}"
             )
             self._li_cal_status.setStyleSheet("color: green;")
             self._refresh_cal_list()
+            # Manual cal also feeds the Analysis tab (kind: assume SR530 direct)
+            self.lockin_cal_saved.emit(vpe, drive_amp, "sr530")
         except Exception as e:
             self._li_cal_status.setText(f"{type(e).__name__}: {e}")
             self._li_cal_status.setStyleSheet("color: red;")

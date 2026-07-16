@@ -2201,32 +2201,35 @@ class DriveSetbackAdapter:
     enable():  read the setback params; if enabled, drop the monitored axis'
                drive to the charging amplitude *before* enabling the actuator
                (hardware only — the drive widget's amplitude spinbox keeps
-               the measurement setpoint) and call on_scale(charging/measure).
-               If the actuator then fails to enable, the drive is restored
-               immediately.
+               the measurement setpoint) and report the new absolute drive
+               amplitude via on_drive_amp(charging_vpp).  If the actuator then
+               fails to enable, the drive is restored immediately.
     disable(): disable the wrapped actuator *first* (the field comes back up
                only once the electron source is off), then restore the drive
-               to the amplitude captured at reduce time and call
-               on_scale(1.0).
+               to the amplitude captured at reduce time and report it via
+               on_drive_amp(measure_vpp).
 
     Reduce/restore are idempotent, so ChargeController's
     stop-everything-before-acting pattern (which calls disable() on inactive
-    actuators) is safe.  Wire on_scale to AnalysisTab.set_drive_scale so the
-    lock-in charge readout stays calibrated while the drive is reduced.
+    actuators) is safe.  Wire on_drive_amp to AnalysisTab.set_current_drive_amp
+    so the lock-in charge readout stays normalized while the drive is reduced.
+    effective_amplitude() gives the current actual drive amplitude for a poller
+    to push periodically (catches manual drive-amplitude changes too).
 
     If the drive AFG is disconnected mid-actuation the restore is skipped on
     hardware (nothing to talk to) but the scale is still reset — re-Apply the
     drive channel after reconnecting.
     """
 
-    def __init__(self, actuator, get_drive_widget, get_params, on_scale=None):
+    def __init__(self, actuator, get_drive_widget, get_params, on_drive_amp=None):
         self._actuator = actuator
         self._get_drive = get_drive_widget   # -> ChannelControlWidget
         self._get_params = get_params        # -> {"enabled": bool, "charging_vpp": float}
-        self._on_scale = on_scale
+        self._on_drive_amp = on_drive_amp    # callback(absolute_vpp)
         self._lock = _threading.Lock()
         self._reduced = False
         self._measure_vpp: float = 0.0       # amplitude captured at reduce time
+        self._charging_vpp: float = 0.0      # amplitude while parked
 
     # -- actuator protocol ----------------------------------------------
 
@@ -2255,6 +2258,18 @@ class DriveSetbackAdapter:
     def is_connected(self) -> bool:
         return self._actuator.is_connected
 
+    def effective_amplitude(self):
+        """Current actual drive amplitude (Vpp): the charging value while
+        parked, else the monitored drive widget's measurement setpoint.
+        Returns None if no drive widget is available."""
+        with self._lock:
+            if self._reduced:
+                return self._charging_vpp
+        try:
+            return self._get_drive()._amp.value()
+        except Exception:
+            return None
+
     # -- internal ---------------------------------------------------------
 
     def _reduce(self, charging_vpp: float):
@@ -2271,9 +2286,11 @@ class DriveSetbackAdapter:
             with _afg_lock(afg):
                 afg.set_amplitude(ch, charging_vpp)
             self._measure_vpp = measure_vpp
+            self._charging_vpp = charging_vpp
             self._reduced = True
-            if self._on_scale:
-                self._on_scale(charging_vpp / measure_vpp)
+            cb, amp = self._on_drive_amp, charging_vpp
+        if cb:
+            cb(amp)                           # report absolute amplitude (outside lock)
 
     def _restore(self):
         with self._lock:
@@ -2288,8 +2305,9 @@ class DriveSetbackAdapter:
                 except Exception:
                     pass
             self._reduced = False
-            if self._on_scale:
-                self._on_scale(1.0)
+            cb, amp = self._on_drive_amp, self._measure_vpp
+        if cb:
+            cb(amp)                           # report restored amplitude (outside lock)
 
 
 # ---------------------------------------------------------------------------

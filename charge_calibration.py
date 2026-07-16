@@ -131,15 +131,24 @@ class CalibrationStore:
         sphere_diameter_um: float,
         drive_frequency_hz: float,
         volts_per_electron: float,
+        drive_amplitude_vpp: float = 0.0,
         sr530_sensitivity_idx: int = -1,
         sr530_phase: float = 0.0,
         notes: str = "",
     ) -> dict:
-        """Create a lock-in calibration dict."""
+        """Create a lock-in calibration dict.
+
+        drive_amplitude_vpp is the electrode drive amplitude (Vpp) present when
+        the calibration was taken.  The live readout normalizes every reading by
+        (current drive amplitude / this value), since the lock-in response is
+        linear in the drive amplitude — so the reported charge is unchanged when
+        the drive amplitude is varied.  0.0 means "unknown" (no normalization).
+        """
         return {
             "sphere_diameter_um": sphere_diameter_um,
             "drive_frequency_hz": drive_frequency_hz,
             "volts_per_electron": volts_per_electron,
+            "drive_amplitude_vpp": drive_amplitude_vpp,
             "sr530_sensitivity_idx": sr530_sensitivity_idx,
             "sr530_phase": sr530_phase,
             "calibration_date": str(date.today()),
@@ -231,6 +240,7 @@ def calibrate_lockin_from_voltage(
     sphere_diameter_um: float,
     drive_frequency_hz: float,
     calibration_file: str = DEFAULT_CAL_FILE,
+    drive_amplitude_vpp: float = 0.0,
     sr530_sensitivity_idx: int = -1,
     sr530_phase: float = 0.0,
 ) -> dict:
@@ -247,6 +257,9 @@ def calibrate_lockin_from_voltage(
         Microsphere diameter in microns.
     drive_frequency_hz : float
         Drive frequency in Hz.
+    drive_amplitude_vpp : float
+        Electrode drive amplitude (Vpp) present during calibration; recorded so
+        the live readout can normalize by (current drive / this).  0.0 = unknown.
 
     Returns
     -------
@@ -258,14 +271,16 @@ def calibrate_lockin_from_voltage(
 
     volts_per_electron = measured_voltage / known_charge
 
+    amp_note = f", drive={drive_amplitude_vpp:.4g}Vpp" if drive_amplitude_vpp > 0 else ""
     store = CalibrationStore(calibration_file)
     cal = store.make_lockin_cal(
         sphere_diameter_um=sphere_diameter_um,
         drive_frequency_hz=drive_frequency_hz,
         volts_per_electron=volts_per_electron,
+        drive_amplitude_vpp=drive_amplitude_vpp,
         sr530_sensitivity_idx=sr530_sensitivity_idx,
         sr530_phase=sr530_phase,
-        notes=f"Calibrated at {known_charge}e, V={measured_voltage:.6f}V",
+        notes=f"Calibrated at {known_charge}e, V={measured_voltage:.6f}V{amp_note}",
     )
     store.save_lockin_cal(cal)
     return cal

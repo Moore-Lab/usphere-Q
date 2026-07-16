@@ -544,15 +544,20 @@ class ChargeWidget(QWidget):
         self._experiment_tab.set_experiment(self._photon_exp)
 
         # --- Drive setback: park the drive tone low while the filament is on.
-        # Wraps the filament actuator; settings live in the Control tab, the
-        # reduced/restored scale feeds AnalysisTab so readings stay calibrated.
+        # Wraps the filament actuator; settings live in the Control tab. The
+        # reduced/restored absolute drive amplitude feeds AnalysisTab so the
+        # lock-in charge readout stays normalized (charge ∝ X / drive amp).
         self._drive_setback = DriveSetbackAdapter(
             actuator=self._wg_tab.filament,
             get_drive_widget=lambda: getattr(
                 self._wg_tab, f"{self._analysis_tab.monitor_axis()}_drive"),
             get_params=self._control_tab.get_setback_params,
-            on_scale=self._analysis_tab.set_drive_scale,
+            on_drive_amp=self._analysis_tab.set_current_drive_amp,
         )
+        # Calibrations record the drive amplitude in use (the effective drive
+        # amplitude of the monitored axis).
+        self._calibration_tab._drive_amp_provider = (
+            self._drive_setback.effective_amplitude)
 
         # --- Wire analysis → control loop and experiment ---
         self._analysis_tab.charge_updated.connect(self._charge_ctrl.on_charge_update)
@@ -561,8 +566,7 @@ class ChargeWidget(QWidget):
         # --- Wire analysis → auto lock-in calibration (and result back) ---
         self._analysis_tab.charge_updated.connect(
             self._calibration_tab.on_charge_update)
-        self._calibration_tab.lockin_cal_saved.connect(
-            self._analysis_tab.set_volts_per_electron)
+        self._calibration_tab.lockin_cal_saved.connect(self._on_lockin_cal_saved)
 
         # --- Actuator sync (wires WG tab groups to ChargeController) ---
         self._actuator_timer = QTimer(self)
@@ -589,8 +593,17 @@ class ChargeWidget(QWidget):
 
         QVBoxLayout(self).addWidget(self._tabs)
 
+    def _on_lockin_cal_saved(self, vpe: float, drive_amp: float, kind: str):
+        """A lock-in calibration was saved — push V/e and the calibration drive
+        amplitude into the Analysis tab so the live readout normalizes by it."""
+        self._analysis_tab.set_volts_per_electron(vpe, kind)
+        self._analysis_tab.set_cal_drive_amp(drive_amp, kind)
+
     def _sync_actuators(self):
-        """Wire WaveformControlTab actuators into ChargeController and PhotonOrderExperiment."""
+        """Wire WaveformControlTab actuators into ChargeController and
+        PhotonOrderExperiment, and keep the Analysis tab's drive-amplitude
+        normalization current (catches manual Electrodes-tab amplitude changes;
+        the setback pushes immediately during charging)."""
         self._charge_ctrl.set_actuators(
             flashlamp=self._wg_tab.flashlamp,
             filament=self._drive_setback,   # filament wrapped: drive parks low while heating
@@ -599,6 +612,8 @@ class ChargeWidget(QWidget):
             flashlamp=self._wg_tab.flashlamp,
             filament=self._drive_setback,
         )
+        self._analysis_tab.set_current_drive_amp(
+            self._drive_setback.effective_amplitude())
 
     def closeEvent(self, event):
         self._sr530_tab.stop()

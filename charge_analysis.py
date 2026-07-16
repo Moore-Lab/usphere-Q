@@ -632,6 +632,9 @@ class AnalysisTab(QWidget):
 
     # Emitted whenever a new charge measurement arrives — control loop can connect
     charge_updated = pyqtSignal(dict)
+    # Internal: marshals the drive-normalization label text to the GUI thread
+    # (set_current_drive_amp may be called from the actuator thread).
+    _norm_changed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -641,7 +644,10 @@ class AnalysisTab(QWidget):
         self._plot_line_corr = None
         self._plot_line_pos = None
         self._drive_scale = 1.0
+        self._cal_drive_amp = 0.0    # A_cal: drive Vpp the calibration was taken at (0=unknown)
+        self._meas_drive_amp = 0.0   # A_now: current actual drive Vpp (0=unknown)
         self._build_ui()
+        self._norm_changed.connect(self._set_norm_lbl)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -765,6 +771,20 @@ class AnalysisTab(QWidget):
         lg.addWidget(self._li_vpe_edit, row, 1)
         row += 1
 
+        lg.addWidget(QLabel("Cal drive amp (Vpp):"), row, 0)
+        self._li_calamp_edit = QLineEdit("0")
+        self._li_calamp_edit.setToolTip(
+            "Drive amplitude (Vpp) the V/e calibration was taken at.\n"
+            "Every reading is normalized by (current drive / this), so the\n"
+            "reported charge is unchanged when the drive amplitude is varied.\n"
+            "0 = unknown (no amplitude normalization).  Auto-filled by the\n"
+            "Calibration tab."
+        )
+        self._li_calamp_edit.setMaximumWidth(120)
+        self._li_calamp_edit.editingFinished.connect(self._on_calamp_edited)
+        lg.addWidget(self._li_calamp_edit, row, 1)
+        row += 1
+
         lg.addWidget(QLabel("SR530 serial port (optional):"), row, 0)
         self._sr530_port_edit = QLineEdit("")
         self._sr530_port_edit.setPlaceholderText("e.g. COM5 — leave blank to skip")
@@ -812,6 +832,20 @@ class AnalysisTab(QWidget):
         sg.addWidget(self._sr_vpe_edit, row, 1)
         row += 1
 
+        sg.addWidget(QLabel("Cal drive amp (Vpp):"), row, 0)
+        self._sr_calamp_edit = QLineEdit("0")
+        self._sr_calamp_edit.setToolTip(
+            "Drive amplitude (Vpp) the V/e calibration was taken at.\n"
+            "Every reading is normalized by (current drive / this), so the\n"
+            "reported charge is unchanged when the drive amplitude is varied.\n"
+            "0 = unknown (no amplitude normalization).  Auto-filled by the\n"
+            "Calibration tab."
+        )
+        self._sr_calamp_edit.setMaximumWidth(120)
+        self._sr_calamp_edit.editingFinished.connect(self._on_calamp_edited)
+        sg.addWidget(self._sr_calamp_edit, row, 1)
+        row += 1
+
         self._config_stack.addWidget(sr_cfg)
 
         outer.addWidget(self._config_stack)
@@ -836,6 +870,11 @@ class AnalysisTab(QWidget):
         btn_row.addWidget(self._status_lbl)
 
         outer.addLayout(btn_row)
+
+        # Drive-amplitude normalization readout
+        self._norm_lbl = QLabel("drive-amplitude normalization: off")
+        self._norm_lbl.setStyleSheet("color: gray; font-size: 11px;")
+        outer.addWidget(self._norm_lbl)
 
         # --- Live charge display ---
         readout = QGroupBox("Live charge readout")
@@ -912,11 +951,13 @@ class AnalysisTab(QWidget):
             "li_serial_port": self._li_port_edit.text(),
             "li_baud_rate": self._li_baud_edit.text(),
             "li_volts_per_electron": self._li_vpe_edit.text(),
+            "li_cal_drive_amp": self._li_calamp_edit.text(),
             "sr530_serial_port": self._sr530_port_edit.text(),
             # Lock-in (SR530 direct)
             "sr_port": self._sr_port_edit.text(),
             "sr_poll_hz": self._sr_poll_edit.text(),
             "sr_volts_per_electron": self._sr_vpe_edit.text(),
+            "sr_cal_drive_amp": self._sr_calamp_edit.text(),
         }
 
     def restore_config(self, cfg: dict):
@@ -940,6 +981,8 @@ class AnalysisTab(QWidget):
             self._li_baud_edit.setText(str(cfg["li_baud_rate"]))
         if "li_volts_per_electron" in cfg:
             self._li_vpe_edit.setText(str(cfg["li_volts_per_electron"]))
+        if "li_cal_drive_amp" in cfg:
+            self._li_calamp_edit.setText(str(cfg["li_cal_drive_amp"]))
         if "sr530_serial_port" in cfg:
             self._sr530_port_edit.setText(str(cfg["sr530_serial_port"]))
         if "sr_port" in cfg:
@@ -948,6 +991,8 @@ class AnalysisTab(QWidget):
             self._sr_poll_edit.setText(str(cfg["sr_poll_hz"]))
         if "sr_volts_per_electron" in cfg:
             self._sr_vpe_edit.setText(str(cfg["sr_volts_per_electron"]))
+        if "sr_cal_drive_amp" in cfg:
+            self._sr_calamp_edit.setText(str(cfg["sr_cal_drive_amp"]))
 
     # ------------------------------------------------------------------
     # External calibration hand-off
@@ -957,20 +1002,78 @@ class AnalysisTab(QWidget):
         """The electrode axis being driven for charge monitoring ('x'/'y'/'z')."""
         return self._axis_combo.currentText().lower()
 
-    def set_drive_scale(self, scale: float) -> None:
+    def set_current_drive_amp(self, amp) -> None:
         """
-        Report the current drive amplitude as a fraction of the calibration
-        amplitude (1.0 = normal).  Forwards to the running lock-in source so
-        charge readings stay correct while the drive is reduced.
+        Report the current ACTUAL electrode drive amplitude (Vpp).  The reading
+        is normalized by (this / calibration amplitude), so the reported charge
+        is unchanged whether the drive is at its measurement amplitude or parked
+        low during charging.
 
-        Thread-safe: touches no widgets — DriveSetbackAdapter calls this from
-        the ChargeController actuation-stop thread.
+        Thread-safe: touches NO widgets directly — the DriveSetbackAdapter calls
+        this from the actuation thread; the label update is marshalled to the
+        GUI thread via a signal.
         """
-        scale = float(scale) if scale and scale > 0 else 1.0
+        try:
+            self._meas_drive_amp = float(amp) if amp and amp > 0 else 0.0
+        except (TypeError, ValueError):
+            self._meas_drive_amp = 0.0
+        self._recompute_drive_scale()
+
+    def set_cal_drive_amp(self, amp: float, source_kind: str) -> None:
+        """Set the calibration drive amplitude (Vpp) for a source kind and fill
+        its field.  Called by the Calibration tab after a calibration.  GUI
+        thread only (writes a widget)."""
+        try:
+            amp = float(amp)
+        except (TypeError, ValueError):
+            return
+        edit = self._sr_calamp_edit if source_kind == "sr530" else self._li_calamp_edit
+        edit.setText(f"{amp:.6g}" if amp > 0 else "0")
+        if self._source_kind_matches(source_kind) or self._source is None:
+            self._cal_drive_amp = amp if amp > 0 else 0.0
+            self._recompute_drive_scale()
+
+    def _source_kind_matches(self, kind: str) -> bool:
+        if kind == "sr530":
+            return isinstance(self._source, SR530SerialSource)
+        if kind == "esp32":
+            return isinstance(self._source, LockInSource)
+        return False
+
+    def _active_calamp_edit(self):
+        """The cal-amp field matching the running source (SR530 default)."""
+        return (self._li_calamp_edit
+                if isinstance(self._source, LockInSource)
+                else self._sr_calamp_edit)
+
+    def _on_calamp_edited(self):
+        """User edited a cal-amp field — refresh if it drives the live source."""
+        try:
+            self._cal_drive_amp = max(0.0, float(self._active_calamp_edit().text()))
+        except ValueError:
+            self._cal_drive_amp = 0.0
+        self._recompute_drive_scale()
+
+    def _recompute_drive_scale(self) -> None:
+        """drive_scale = A_now / A_cal (both known & >0, else 1.0); push to the
+        source and refresh the readout.  Widget-free (safe off the GUI thread)."""
+        cal, now = self._cal_drive_amp, self._meas_drive_amp
+        scale = (now / cal) if (cal > 0 and now > 0) else 1.0
         self._drive_scale = scale
         src = self._source
         if src is not None and hasattr(src, "set_drive_scale"):
             src.set_drive_scale(scale)
+        if cal > 0 and now > 0:
+            txt = (f"drive {now:.4g} Vpp / cal {cal:.4g} Vpp  "
+                   f"→ charge ×{cal / now:.3g}")
+        elif now > 0:
+            txt = f"drive {now:.4g} Vpp — set a cal drive amp to normalize"
+        else:
+            txt = "drive-amplitude normalization: off"
+        self._norm_changed.emit(txt)
+
+    def _set_norm_lbl(self, text: str) -> None:
+        self._norm_lbl.setText(text)
 
     def set_volts_per_electron(self, vpe: float, source_kind: str) -> None:
         """
@@ -1102,10 +1205,14 @@ class AnalysisTab(QWidget):
                 )
                 thread.error.connect(self._on_source_error)
 
-        # Carry the current drive scale over to the fresh source (e.g. if the
+        # Load the calibration drive amplitude from the started source's field
+        # and (re)compute the normalization for the fresh source (e.g. if the
         # drive is parked low right now, readings must still be normalized).
-        if self._source is not None and hasattr(self._source, "set_drive_scale"):
-            self._source.set_drive_scale(self._drive_scale)
+        try:
+            self._cal_drive_amp = max(0.0, float(self._active_calamp_edit().text()))
+        except ValueError:
+            self._cal_drive_amp = 0.0
+        self._recompute_drive_scale()
 
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
