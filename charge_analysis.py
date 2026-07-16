@@ -457,22 +457,33 @@ class _SR530PollThread(QThread):
     snapshot_ready = pyqtSignal(dict)   # full snapshot dict from SR530Controller
     error = pyqtSignal(str)
 
-    def __init__(self, port: str, poll_hz: float = 10.0):
+    def __init__(self, port: str, poll_hz: float = 10.0, controller=None):
         super().__init__()
         self._port = port
         self._poll_interval = 1.0 / max(poll_hz, 1.0)
         self._running = False
+        self._controller = controller   # shared SR530Controller, or None to open own
 
     def run(self):
-        from sr530_controller import SR530Controller
         self._running = True
-        try:
-            lia = SR530Controller(self._port)
-            lia.connect()
-        except Exception as e:
-            self.error.emit(f"Cannot connect to SR530 on {self._port}: {e}")
-            self._running = False
-            return
+        owns = self._controller is None
+        if owns:
+            # Open our own connection (no shared SR530 from the Lock-In tab).
+            from sr530_controller import SR530Controller
+            try:
+                lia = SR530Controller(self._port)
+                lia.connect()
+            except Exception as e:
+                self.error.emit(f"Cannot connect to SR530 on {self._port}: {e}")
+                self._running = False
+                return
+        else:
+            # Reuse the connection already open in the Lock-In (SR530) tab.
+            lia = self._controller
+            if not getattr(lia, "is_connected", False):
+                self.error.emit("Shared SR530 (Lock-In tab) is not connected")
+                self._running = False
+                return
 
         try:
             while self._running:
@@ -488,10 +499,11 @@ class _SR530PollThread(QThread):
                 if sleep_time > 0:
                     time.sleep(sleep_time)
         finally:
-            try:
-                lia.disconnect()
-            except Exception:
-                pass
+            if owns:                       # only close a connection we opened
+                try:
+                    lia.disconnect()
+                except Exception:
+                    pass
             self._running = False
 
     def stop(self):
@@ -515,12 +527,14 @@ class SR530SerialSource(ChargeStateSource):
         poll_hz: float = 30.0,
         on_result: Callable[[dict], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        controller=None,
     ):
         self._serial_port = serial_port
         self._volts_per_electron = volts_per_electron
         self._poll_hz = poll_hz
         self._on_result = on_result
         self._on_error = on_error
+        self._controller = controller   # shared SR530Controller (Lock-In tab), or None
 
         self._thread: _SR530PollThread | None = None
         self._latest: dict | None = None
@@ -538,7 +552,8 @@ class SR530SerialSource(ChargeStateSource):
             return
         self._running = True
         self._sample_count = 0
-        self._thread = _SR530PollThread(self._serial_port, self._poll_hz)
+        self._thread = _SR530PollThread(
+            self._serial_port, self._poll_hz, controller=self._controller)
         self._thread.snapshot_ready.connect(self._handle_snapshot)
         self._thread.error.connect(self._handle_error)
         self._thread.start()
@@ -646,6 +661,7 @@ class AnalysisTab(QWidget):
         self._drive_scale = 1.0
         self._cal_drive_amp = 0.0    # A_cal: drive Vpp the calibration was taken at (0=unknown)
         self._meas_drive_amp = 0.0   # A_now: current actual drive Vpp (0=unknown)
+        self._sr530_provider = None  # callable() -> shared SR530Controller (Lock-In tab), or None
         self._build_ui()
         self._norm_changed.connect(self._set_norm_lbl)
 
@@ -800,14 +816,23 @@ class AnalysisTab(QWidget):
         sg.setColumnStretch(1, 1)
         row = 0
 
-        sg.addWidget(QLabel("SR530 serial port:"), row, 0)
-        self._sr_port_edit = QLineEdit("COM5")
-        self._sr_port_edit.setToolTip(
-            "COM port for the SR530 RS232 connection.\n"
-            "If using a Brainbox serial-to-ethernet, enter\n"
-            "the virtual COM port assigned by the driver."
+        sr_note = QLabel(
+            "Uses the SR530 already connected in the Lock-In (SR530) tab — "
+            "connect there once.\nThe port below is only a fallback if the "
+            "Lock-In tab is not connected (a serial\nport can't be opened twice)."
         )
-        self._sr_port_edit.setMaximumWidth(120)
+        sr_note.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+        sg.addWidget(sr_note, row, 0, 1, 2)
+        row += 1
+
+        sg.addWidget(QLabel("SR530 serial port (fallback):"), row, 0)
+        self._sr_port_edit = QLineEdit("")
+        self._sr_port_edit.setPlaceholderText("blank = use Lock-In tab connection")
+        self._sr_port_edit.setToolTip(
+            "Only used if the Lock-In (SR530) tab is NOT connected.\n"
+            "COM port for a standalone SR530 RS232 connection."
+        )
+        self._sr_port_edit.setMaximumWidth(200)
         sg.addWidget(self._sr_port_edit, row, 1)
         row += 1
 
@@ -998,6 +1023,12 @@ class AnalysisTab(QWidget):
     # External calibration hand-off
     # ------------------------------------------------------------------
 
+    def set_sr530_provider(self, provider) -> None:
+        """Supply a callable() -> live SR530Controller (or None) so the SR530
+        direct source reuses the Lock-In tab's connection instead of opening a
+        second one on the same serial port."""
+        self._sr530_provider = provider
+
     def monitor_axis(self) -> str:
         """The electrode axis being driven for charge monitoring ('x'/'y'/'z')."""
         return self._axis_combo.currentText().lower()
@@ -1176,9 +1207,18 @@ class AnalysisTab(QWidget):
 
         elif source_type == 2:
             # --- SR530 direct RS232 source ---
+            # Prefer the connection already open in the Lock-In (SR530) tab so
+            # the SR530 is opened only once (a serial port can't be shared).
+            shared = None
+            if self._sr530_provider is not None:
+                try:
+                    shared = self._sr530_provider()
+                except Exception:
+                    shared = None
             port = self._sr_port_edit.text().strip()
-            if not port:
-                self._status_lbl.setText("Enter SR530 serial port")
+            if shared is None and not port:
+                self._status_lbl.setText(
+                    "Connect the SR530 in the Lock-In tab, or enter a port here")
                 self._status_lbl.setStyleSheet("color: red;")
                 return
             try:
@@ -1194,6 +1234,7 @@ class AnalysisTab(QWidget):
                 serial_port=port,
                 volts_per_electron=vpe,
                 poll_hz=poll_hz,
+                controller=shared,
             )
             self._source.start()
             thread = self._source._thread

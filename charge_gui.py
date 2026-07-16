@@ -139,6 +139,7 @@ class SR530Tab(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._controller = None   # live SR530Controller when connected (shared)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -173,17 +174,25 @@ class SR530Tab(QWidget):
         outer.addWidget(self._tabs)
 
     def _on_connected(self, ctrl) -> None:
+        self._controller = ctrl
         self._params_tab.set_controller(ctrl)
         self._monitor_tab.set_controller(ctrl)
         self._tabs.setTabEnabled(1, True)
         self._tabs.setTabEnabled(2, True)
 
     def _on_disconnected(self) -> None:
+        self._controller = None
         self._monitor_tab.stop()
         self._params_tab.set_controller(None)
         self._monitor_tab.set_controller(None)
         self._tabs.setTabEnabled(1, False)
         self._tabs.setTabEnabled(2, False)
+
+    def controller(self):
+        """The live SR530Controller if connected, else None — shared with the
+        Analysis tab so the SR530 is opened only once."""
+        c = self._controller
+        return c if (c is not None and getattr(c, "is_connected", False)) else None
 
     def stop(self) -> None:
         if self._tabs and self._monitor_tab:
@@ -599,6 +608,9 @@ class ChargeWidget(QWidget):
 
         # --- SR530 tab ---
         self._sr530_tab = SR530Tab()
+        # The Analysis tab's SR530 source reuses this tab's connection (a serial
+        # port can't be opened twice), so you connect the SR530 only once.
+        self._analysis_tab.set_sr530_provider(self._sr530_tab.controller)
 
         # --- Build tab widget ---
         self._tabs = QTabWidget()
