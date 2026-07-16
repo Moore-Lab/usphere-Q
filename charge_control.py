@@ -81,6 +81,53 @@ class ThresholdRule:
     name: str = ""
 
 
+@dataclass
+class FilamentRamp:
+    """
+    Ramp definition for gentle filament heating.
+
+    The filament (a WG pulse triggering an SSR into the filament) tends to run
+    away — hard to get a *small* charge because once it's hot it dumps a lot, and
+    the threshold shifts day to day.  Instead of a fixed setting, ramp one
+    parameter up from a gentle start so the onset of charging is gradual and the
+    control loop can catch it within a poll or two.
+
+    mode:
+        "off"   — no ramp (fixed freq/width, timed heat pulses).
+        "freq"  — ramp the trigger frequency from ``start`` by ``increment`` up
+                  to ``maximum`` (Hz); pulse width fixed at ``fixed_width_ms``.
+        "width" — ramp the pulse width from ``start`` by ``increment`` up to
+                  ``maximum`` (ms); frequency fixed at ``fixed_hz``.
+
+    step_interval_s throttles how often the ramp advances (0 = every poll); the
+    charge is still *checked* every poll so the onset is caught fast.
+    """
+    mode: str = "off"              # off | freq | width
+    fixed_hz: float = 70.0         # frequency when ramping width
+    fixed_width_ms: float = 5.0    # pulse width when ramping freq (SSR min ~5 ms)
+    start: float = 5.0             # starting value of the ramped parameter
+    increment: float = 1.0         # per-step increment
+    maximum: float = 200.0         # ceiling of the ramped parameter
+    step_interval_s: float = 0.0   # min seconds between increments (0 = every poll)
+
+    def freq_width(self, value: float) -> tuple[float, float]:
+        """(frequency_hz, width_ms) for a given ramp value."""
+        v = min(value, self.maximum)
+        if self.mode == "freq":
+            return (max(0.001, v), self.fixed_width_ms)
+        if self.mode == "width":
+            return (self.fixed_hz, max(0.001, v))
+        return (self.fixed_hz, self.fixed_width_ms)
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode in ("freq", "width")
+
+    @property
+    def unit(self) -> str:
+        return "Hz" if self.mode == "freq" else "ms"
+
+
 # ---------------------------------------------------------------------------
 # ChargeController
 # ---------------------------------------------------------------------------
@@ -146,6 +193,12 @@ class ChargeController(QObject):
         self._max_consecutive: int = 20
         self._consecutive_count: int = 0
 
+        # Filament ramp (gentle heating toward a target)
+        self._filament_ramp = FilamentRamp()
+        self._ramping: bool = False
+        self._ramp_value: float = 0.0
+        self._ramp_last_step: float = 0.0
+
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
@@ -180,6 +233,15 @@ class ChargeController(QObject):
             self._flashlamp = flashlamp
         if filament is not None:
             self._filament = filament
+
+    def set_filament_ramp(self, ramp: FilamentRamp) -> None:
+        """Configure the filament heating ramp (see FilamentRamp)."""
+        self._filament_ramp = ramp
+        log.info("Filament ramp: mode=%s start=%.3g inc=%.3g max=%.3g",
+                 ramp.mode, ramp.start, ramp.increment, ramp.maximum)
+
+    def get_filament_ramp(self) -> FilamentRamp:
+        return self._filament_ramp
 
     # ------------------------------------------------------------------
     # Threshold rules
@@ -234,6 +296,7 @@ class ChargeController(QObject):
         """Disable the control loop, stop pulsing, and disarm (NGE DC off)."""
         self._enabled = False
         self._stop_all_actuators()
+        self._reset_ramp()
         self._arm_actuators(False)
         self._current_action = Action.NONE
         log.info("Control loop stopped")
@@ -302,6 +365,10 @@ class ChargeController(QObject):
         error = charge - self._target_charge
         if abs(error) <= self._tolerance:
             if self._current_action != Action.AT_TARGET:
+                # Reached target — stop actuating (the ramp has no scheduled
+                # stop, so this is what turns the filament off when caught).
+                self._stop_all_actuators()
+                self._reset_ramp()
                 self._current_action = Action.AT_TARGET
                 self._consecutive_count = 0
                 self._log_event(charge, Action.AT_TARGET, "At target")
@@ -374,6 +441,15 @@ class ChargeController(QObject):
         """Fire the appropriate actuator."""
         now = time.time()
 
+        # Ramped heating is evaluated every poll (to advance the ramp), so it
+        # bypasses the "already doing this action" skip below.
+        if action == Action.HEAT and self._filament_ramp.enabled:
+            self._execute_heat_ramp(charge, error, now)
+            return
+
+        # A non-ramp action ends any ramp in progress.
+        self._reset_ramp()
+
         # If we're already doing this action and it hasn't timed out, skip
         if self._current_action == action and now - self._action_start < self._get_duration(action):
             return
@@ -418,6 +494,53 @@ class ChargeController(QObject):
 
             # Schedule stop after duration
             self._schedule_stop(Action.HEAT, self._heat_duration_s)
+
+    def _execute_heat_ramp(self, charge: float, error: float, now: float):
+        """Gentle ramped heating: advance one parameter (freq or width) up from
+        a low start, keeping the filament on, until the target is reached (the
+        at-target check stops it).  Called every poll; the ramp only advances
+        every step_interval_s so the charge is checked faster than it ramps."""
+        ramp = self._filament_ramp
+        if self._filament is None or not self._filament.is_connected:
+            self.action_changed.emit("Filament not connected!")
+            return
+        if not hasattr(self._filament, "set_pulse"):
+            self.action_changed.emit("Filament actuator has no ramp support")
+            return
+
+        if self._current_action != Action.HEAT or not self._ramping:
+            # (Re)start the ramp from the gentle starting value.
+            self._stop_all_actuators()
+            self._ramp_value = ramp.start
+            self._ramp_last_step = now
+            self._ramping = True
+            self._current_action = Action.HEAT
+            self._action_start = now
+        elif (now - self._ramp_last_step >= ramp.step_interval_s
+              and self._ramp_value < ramp.maximum):
+            # Advance the ramp.
+            self._ramp_value = min(self._ramp_value + ramp.increment, ramp.maximum)
+            self._ramp_last_step = now
+
+        freq, width = ramp.freq_width(self._ramp_value)
+        try:
+            self._filament.set_pulse(freq, width)
+        except Exception as e:
+            self.action_changed.emit(f"Filament error: {e}")
+            return
+
+        at_max = self._ramp_value >= ramp.maximum
+        detail = f"ramp {ramp.mode}={self._ramp_value:.4g} {ramp.unit}"
+        self._log_event(charge, Action.HEAT, detail)
+        self.action_changed.emit(
+            f"Heating (ramp {ramp.mode} {self._ramp_value:.4g} {ramp.unit}"
+            f"{' — at max' if at_max else ''}) — charge {charge:+.1f} e"
+        )
+
+    def _reset_ramp(self):
+        """Clear ramp state (call when the ramp ends: at target, on FLASH, stop)."""
+        self._ramping = False
+        self._ramp_value = 0.0
 
     def _schedule_stop(self, action: Action, duration_s: float):
         """

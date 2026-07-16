@@ -389,6 +389,24 @@ class ControlTab(QWidget):
         sbg.setColumnStretch(2, 1)
         outer.addWidget(sb_grp)
 
+        # --- Filament ramp (gentle heating) ---
+        from wg_control_tab import FilamentRampConfig
+        ramp_grp = QGroupBox("Filament ramp (gentle heating toward target)")
+        rag = QVBoxLayout(ramp_grp)
+        note = QLabel(
+            "Instead of a fixed filament setting (which runs away — hard to get a "
+            "small charge),\nramp one parameter up gently each poll until the "
+            "charge reaches the target, then stop.")
+        note.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+        rag.addWidget(note)
+        self._ramp_config = FilamentRampConfig()
+        rag.addWidget(self._ramp_config)
+        apply_ramp_btn = QPushButton("Apply ramp")
+        apply_ramp_btn.setMaximumWidth(110)
+        apply_ramp_btn.clicked.connect(self._on_apply_ramp)
+        rag.addWidget(apply_ramp_btn)
+        outer.addWidget(ramp_grp)
+
         # --- Threshold rules ---
         rules_grp = QGroupBox("Threshold rules")
         rg = QVBoxLayout(rules_grp)
@@ -508,6 +526,9 @@ class ControlTab(QWidget):
         self._ctrl.clear_rules()
         self._refresh_rules()
 
+    def _on_apply_ramp(self):
+        self._ctrl.set_filament_ramp(self._ramp_config.get_ramp())
+
     def _refresh_rules(self):
         rules = self._ctrl.get_rules()
         if not rules:
@@ -525,6 +546,7 @@ class ControlTab(QWidget):
     def _on_start(self):
         self._on_set_target()
         self._on_apply_timing()
+        self._on_apply_ramp()
         self._ctrl.start()
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -592,6 +614,7 @@ class ControlTab(QWidget):
         cfg["_gui_settle_dur"] = self._settle_dur.value()
         cfg["_gui_setback_enabled"] = self._setback_cb.isChecked()
         cfg["_gui_setback_vpp"] = self._setback_amp.value()
+        cfg["_gui_filament_ramp"] = self._ramp_config.get_config()
         return cfg
 
     def restore_config(self, cfg: dict):
@@ -610,6 +633,8 @@ class ControlTab(QWidget):
             self._setback_cb.setChecked(bool(cfg["_gui_setback_enabled"]))
         if "_gui_setback_vpp" in cfg:
             self._setback_amp.setValue(float(cfg["_gui_setback_vpp"]))
+        if "_gui_filament_ramp" in cfg:
+            self._ramp_config.restore_config(cfg["_gui_filament_ramp"])
         self._refresh_rules()
 
 

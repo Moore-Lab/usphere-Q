@@ -46,6 +46,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QStackedWidget,
     QSpinBox,
     QTabWidget,
     QTextEdit,
@@ -1949,6 +1950,222 @@ class FilamentAdapter:
         """Session off: turn the NGE filament-power output off."""
         self._power._output_off()
 
+    def set_pulse(self, freq_hz: float, width_ms: float) -> bool:
+        """Program the filament trigger pulse (freq + width) and keep it running.
+        Used by the ChargeController's filament ramp; call from the GUI thread."""
+        self._trigger._freq.setValue(freq_hz)
+        self._trigger._width_ms.setValue(width_ms)
+        return self._trigger.enable()   # re-programs at the new freq/width, output on
+
+
+# ---------------------------------------------------------------------------
+# Filament ramp — reusable config editor + manual (out-of-loop) runner
+# ---------------------------------------------------------------------------
+
+class FilamentRampConfig(QWidget):
+    """
+    Reusable editor for a FilamentRamp (mode + parameters).  Used both by the
+    Control tab (drives the ChargeController's in-loop ramp) and by the Filament
+    tab's manual runner (out-of-loop play).
+    """
+
+    _MODES = [("off", "Off (fixed)"), ("freq", "Frequency ramp"),
+              ("width", "Pulse-width ramp")]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._build()
+
+    def _build(self):
+        g = QGridLayout(self)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.addWidget(QLabel("Ramp:"), 0, 0, Qt.AlignRight)
+        self._mode = QComboBox()
+        for _, label in self._MODES:
+            self._mode.addItem(label)
+        self._mode.currentIndexChanged.connect(self._on_mode)
+        self._mode.setMaximumWidth(150)
+        g.addWidget(self._mode, 0, 1)
+
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._off_page())
+        self._stack.addWidget(self._freq_page())
+        self._stack.addWidget(self._width_page())
+        g.addWidget(self._stack, 1, 0, 1, 4)
+
+        g.addWidget(QLabel("Step interval (s):"), 2, 0, Qt.AlignRight)
+        self._step = QDoubleSpinBox(); self._step.setRange(0.0, 100.0)
+        self._step.setDecimals(2); self._step.setValue(0.0); self._step.setMaximumWidth(80)
+        self._step.setToolTip("Minimum seconds between ramp increments.\n"
+                              "0 = advance every lock-in poll. The charge is checked\n"
+                              "every poll regardless, so the onset is caught fast.")
+        g.addWidget(self._step, 2, 1)
+        g.setColumnStretch(3, 1)
+
+    @staticmethod
+    def _spin(lo, hi, dec, val, suffix):
+        s = QDoubleSpinBox(); s.setRange(lo, hi); s.setDecimals(dec)
+        s.setValue(val); s.setSuffix(suffix); s.setMaximumWidth(100)
+        return s
+
+    def _off_page(self):
+        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel("No ramp — fixed filament pulse (uses the Filament tab settings).")
+        lbl.setStyleSheet(_HINT); v.addWidget(lbl)
+        return w
+
+    def _freq_page(self):
+        w = QWidget(); g = QGridLayout(w); g.setContentsMargins(0, 0, 0, 0)
+        g.addWidget(QLabel("Fixed pulse width:"), 0, 0, Qt.AlignRight)
+        self._f_fixed_w = self._spin(0.001, 1e5, 3, 5.0, " ms"); g.addWidget(self._f_fixed_w, 0, 1)
+        g.addWidget(QLabel("Start freq:"), 0, 2, Qt.AlignRight)
+        self._f_start = self._spin(0.001, 1e6, 3, 10.0, " Hz"); g.addWidget(self._f_start, 0, 3)
+        g.addWidget(QLabel("Increment:"), 1, 0, Qt.AlignRight)
+        self._f_inc = self._spin(0.001, 1e6, 3, 2.0, " Hz"); g.addWidget(self._f_inc, 1, 1)
+        g.addWidget(QLabel("Max freq:"), 1, 2, Qt.AlignRight)
+        self._f_max = self._spin(0.001, 1e6, 3, 200.0, " Hz"); g.addWidget(self._f_max, 1, 3)
+        g.setColumnStretch(4, 1)
+        return w
+
+    def _width_page(self):
+        w = QWidget(); g = QGridLayout(w); g.setContentsMargins(0, 0, 0, 0)
+        g.addWidget(QLabel("Fixed freq:"), 0, 0, Qt.AlignRight)
+        self._w_fixed_f = self._spin(0.001, 1e6, 3, 70.0, " Hz"); g.addWidget(self._w_fixed_f, 0, 1)
+        g.addWidget(QLabel("Start width:"), 0, 2, Qt.AlignRight)
+        self._w_start = self._spin(0.001, 1e5, 3, 5.0, " ms"); g.addWidget(self._w_start, 0, 3)
+        g.addWidget(QLabel("Increment:"), 1, 0, Qt.AlignRight)
+        self._w_inc = self._spin(0.001, 1e5, 3, 1.0, " ms"); g.addWidget(self._w_inc, 1, 1)
+        g.addWidget(QLabel("Max width:"), 1, 2, Qt.AlignRight)
+        self._w_max = self._spin(0.001, 1e5, 3, 100.0, " ms"); g.addWidget(self._w_max, 1, 3)
+        g.setColumnStretch(4, 1)
+        return w
+
+    def _on_mode(self, idx):
+        self._stack.setCurrentIndex(idx)
+
+    def get_ramp(self):
+        from charge_control import FilamentRamp
+        mode = self._MODES[self._mode.currentIndex()][0]
+        if mode == "freq":
+            return FilamentRamp(mode="freq", fixed_width_ms=self._f_fixed_w.value(),
+                                start=self._f_start.value(), increment=self._f_inc.value(),
+                                maximum=self._f_max.value(), step_interval_s=self._step.value())
+        if mode == "width":
+            return FilamentRamp(mode="width", fixed_hz=self._w_fixed_f.value(),
+                                start=self._w_start.value(), increment=self._w_inc.value(),
+                                maximum=self._w_max.value(), step_interval_s=self._step.value())
+        return FilamentRamp(mode="off")
+
+    def get_config(self) -> dict:
+        return {
+            "mode": self._MODES[self._mode.currentIndex()][0],
+            "step_s": self._step.value(),
+            "f_fixed_w": self._f_fixed_w.value(), "f_start": self._f_start.value(),
+            "f_inc": self._f_inc.value(), "f_max": self._f_max.value(),
+            "w_fixed_f": self._w_fixed_f.value(), "w_start": self._w_start.value(),
+            "w_inc": self._w_inc.value(), "w_max": self._w_max.value(),
+        }
+
+    def restore_config(self, cfg: dict):
+        keys = [k for k, _ in self._MODES]
+        if cfg.get("mode") in keys:
+            self._mode.setCurrentIndex(keys.index(cfg["mode"]))
+        for key, spin in (("step_s", self._step),
+                          ("f_fixed_w", self._f_fixed_w), ("f_start", self._f_start),
+                          ("f_inc", self._f_inc), ("f_max", self._f_max),
+                          ("w_fixed_f", self._w_fixed_f), ("w_start", self._w_start),
+                          ("w_inc", self._w_inc), ("w_max", self._w_max)):
+            if key in cfg:
+                spin.setValue(float(cfg[key]))
+
+
+class FilamentRampWidget(QGroupBox):
+    """
+    Manual (out-of-loop) filament ramp runner for the Filament tab: play with a
+    ramp without the charge loop.  Ramps the given filament PulseGroup on a
+    timer (freq or width) from start toward max, so you can watch the filament
+    behaviour and find good settings.
+    """
+
+    def __init__(self, get_filament, parent=None):
+        super().__init__("Filament ramp (manual)", parent)
+        self._get_filament = get_filament     # -> PulseGroup
+        self._value = 0.0
+        self._ramp = None
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._build()
+
+    def _build(self):
+        v = QVBoxLayout(self)
+        self._cfg = FilamentRampConfig()
+        v.addWidget(self._cfg)
+        row = QHBoxLayout()
+        self._start_btn = QPushButton("Start ramp"); self._start_btn.setStyleSheet(_GREEN)
+        self._start_btn.clicked.connect(self._start)
+        row.addWidget(self._start_btn)
+        self._stop_btn = QPushButton("Stop"); self._stop_btn.setStyleSheet(_RED)
+        self._stop_btn.setEnabled(False); self._stop_btn.clicked.connect(self._stop)
+        row.addWidget(self._stop_btn)
+        self._status = QLabel("—"); self._status.setStyleSheet("color: gray;")
+        row.addWidget(self._status); row.addStretch()
+        v.addLayout(row)
+
+    def _start(self):
+        self._ramp = self._cfg.get_ramp()
+        if not self._ramp.enabled:
+            self._status.setText("Pick a ramp mode (frequency or pulse-width)")
+            self._status.setStyleSheet("color: #C62828;")
+            return
+        fil = self._get_filament()
+        if fil is None or not getattr(fil, "is_connected", False):
+            self._status.setText("Filament WG not connected")
+            self._status.setStyleSheet("color: #C62828;")
+            return
+        self._value = self._ramp.start
+        self._apply()
+        self._start_btn.setEnabled(False); self._stop_btn.setEnabled(True)
+        interval_ms = max(20, int(self._ramp.step_interval_s * 1000) or 200)
+        self._timer.start(interval_ms)
+
+    def _tick(self):
+        if self._value >= self._ramp.maximum:
+            self._status.setText(f"At max ({self._value:.4g} {self._ramp.unit}) — "
+                                 f"still pulsing; Stop when done")
+            return
+        self._value = min(self._value + self._ramp.increment, self._ramp.maximum)
+        self._apply()
+
+    def _apply(self):
+        fil = self._get_filament()
+        if fil is None:
+            self._stop(); return
+        freq, width = self._ramp.freq_width(self._value)
+        try:
+            fil._freq.setValue(freq); fil._width_ms.setValue(width); fil.enable()
+        except Exception as e:
+            self._status.setText(f"Error: {e}"); self._stop(); return
+        self._status.setText(f"Ramping {self._ramp.mode} = {self._value:.4g} "
+                             f"{self._ramp.unit}  (f={freq:.4g} Hz, w={width:.4g} ms)")
+        self._status.setStyleSheet("color: #1565C0;")
+
+    def _stop(self):
+        self._timer.stop()
+        fil = self._get_filament()
+        if fil is not None:
+            try:
+                fil.disable()
+            except Exception:
+                pass
+        self._start_btn.setEnabled(True); self._stop_btn.setEnabled(False)
+        self._status.setText("Stopped"); self._status.setStyleSheet("color: gray;")
+
+    def get_config(self) -> dict:
+        return self._cfg.get_config()
+
+    def restore_config(self, cfg: dict):
+        self._cfg.restore_config(cfg)
+
 
 # ---------------------------------------------------------------------------
 # Lock-in reference — a WG channel that mirrors a drive channel
@@ -2311,6 +2528,19 @@ class DriveSetbackAdapter:
         fn = getattr(self._actuator, "disarm", None)
         if fn:
             fn()
+
+    def set_pulse(self, freq_hz: float, width_ms: float):
+        """Ramp support: park the drive (like enable) on the first pulse of a
+        heating session, then program the filament pulse.  Reduce is idempotent,
+        so subsequent ramp steps only reprogram the pulse."""
+        try:
+            params = self._get_params() or {}
+        except Exception:
+            params = {}
+        if params.get("enabled"):
+            self._reduce(float(params.get("charging_vpp", 0.0)))
+        fn = getattr(self._actuator, "set_pulse", None)
+        return fn(freq_hz, width_ms) if fn else False
 
     def effective_amplitude(self):
         """Current actual drive amplitude (Vpp): the charging value while
@@ -3789,8 +4019,10 @@ class WaveformControlTab(QWidget):
             "Filament — Power (NGE)", "filament_power", self.nge_map,
             default_current_a=3.0,
         )
+        self.filament_ramp = FilamentRampWidget(lambda: self.filament)
         fil_v.addWidget(self.filament)
         fil_v.addWidget(self.filament_power)
+        fil_v.addWidget(self.filament_ramp)
         fil_v.addStretch()
         tabs.addTab(_make_scroll(fil_w), "Filament")
 
