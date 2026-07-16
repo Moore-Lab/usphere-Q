@@ -554,6 +554,10 @@ class ChargeWidget(QWidget):
         self._sequencer_tab.set_sequencer(self._sequencer)
         if "Sequencer" in saved:
             self._sequencer_tab.restore_config(saved["Sequencer"])
+        # The sequencer's "set electrode" step requests a drive-amplitude change;
+        # apply it on the GUI thread (spinbox = source of truth) so the field,
+        # reference mirror, and charge normalization all stay consistent.
+        self._sequencer.set_electrode_requested.connect(self._on_seq_set_electrode)
 
         # --- Drive setback: park the drive tone low while the filament is on.
         # Wraps the filament actuator; settings live in the Control tab. The
@@ -610,6 +614,19 @@ class ChargeWidget(QWidget):
         )
 
         QVBoxLayout(self).addWidget(self._tabs)
+
+    def _on_seq_set_electrode(self, amp: float):
+        """Sequencer 'set electrode' step: set the monitored-axis drive
+        amplitude (Vpp), re-apply it (programs the AFG + re-mirrors the lock-in
+        reference), and update the charge normalization immediately.  Runs on
+        the GUI thread (queued from the sequencer worker)."""
+        axis = self._analysis_tab.monitor_axis()
+        drive = getattr(self._wg_tab, f"{axis}_drive", None)
+        if drive is None:
+            return
+        drive._amp.setValue(amp)
+        drive._apply()
+        self._analysis_tab.set_current_drive_amp(amp)
 
     def _on_lockin_cal_saved(self, vpe: float, drive_amp: float, kind: str):
         """A lock-in calibration was saved — push V/e and the calibration drive

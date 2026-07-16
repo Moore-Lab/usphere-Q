@@ -64,6 +64,10 @@ class SeqStep:
     threshold_e: float = 1.0
     timeout_s: float = 60.0
 
+    # set electrode drive field (on the monitored axis)
+    electrode_amp_vpp: float = 0.5
+    electrode_settle_s: float = 0.5
+
     # wait
     wait_s: float = 1.0
 
@@ -83,6 +87,9 @@ class SeqStep:
     def summary(self) -> str:
         if self.action == "wait":
             return f"Wait {self.wait_s:g} s"
+        if self.action == "set_electrode":
+            return (f"Set electrode drive → {self.electrode_amp_vpp:g} Vpp"
+                    f" (settle {self.electrode_settle_s:g} s)")
         cmp = COMPARES.get(self.compare, self.compare)
         if self.action == "discharge":
             return (f"Discharge (flash {self.flash_rate_hz:g} Hz, "
@@ -133,6 +140,9 @@ class ChargeSequencer(QObject):
     step_changed = pyqtSignal(int, int, str)
     log_msg = pyqtSignal(str)
     sequence_done = pyqtSignal(bool)
+    # Requests the GUI set the monitored-axis drive amplitude (Vpp).  Kept as a
+    # signal so the engine stays GUI-agnostic and headless-testable.
+    set_electrode_requested = pyqtSignal(float)
 
     def __init__(self, actuators=None, parent: QObject | None = None):
         super().__init__(parent)
@@ -263,6 +273,14 @@ class ChargeSequencer(QObject):
         if step.action == "wait":
             self.log_msg.emit(f"Wait {step.wait_s:g} s")
             self._sleep(step.wait_s)
+            return
+
+        if step.action == "set_electrode":
+            # Request the GUI change the drive amplitude (source of truth =
+            # the drive spinbox), then settle so the field/normalization update.
+            self.set_electrode_requested.emit(step.electrode_amp_vpp)
+            self.log_msg.emit(f"Set electrode drive → {step.electrode_amp_vpp:g} Vpp")
+            self._sleep(step.electrode_settle_s)
             return
 
         # Start the actuator

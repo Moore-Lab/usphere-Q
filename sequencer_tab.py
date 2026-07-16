@@ -22,8 +22,9 @@ from PyQt5.QtWidgets import (
 
 from charge_sequence import ChargeSequencer, SeqStep, COMPARES
 
-_ACTIONS = ["Discharge (flash lamp)", "Recharge (filament)", "Wait"]
-_ACTION_KEYS = ["discharge", "recharge", "wait"]
+_ACTIONS = ["Discharge (flash lamp)", "Recharge (filament)",
+            "Set electrode field", "Wait (delay)"]
+_ACTION_KEYS = ["discharge", "recharge", "set_electrode", "wait"]
 
 
 class SequencerTab(QWidget):
@@ -101,6 +102,7 @@ class SequencerTab(QWidget):
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_discharge_page())
         self._stack.addWidget(self._build_recharge_page())
+        self._stack.addWidget(self._build_setelec_page())
         self._stack.addWidget(self._build_wait_page())
         edl.addWidget(self._stack)
 
@@ -199,6 +201,25 @@ class SequencerTab(QWidget):
         self._r_cmp, self._r_thr, self._r_to = self._stop_cond_row(g, 1)
         return w
 
+    def _build_setelec_page(self):
+        w = QWidget(); g = QGridLayout(w); g.setColumnStretch(4, 1)
+        g.addWidget(QLabel("Drive amplitude:"), 0, 0)
+        self._e_amp = QDoubleSpinBox(); self._e_amp.setRange(0.0, 20.0)
+        self._e_amp.setDecimals(3); self._e_amp.setValue(0.5); self._e_amp.setSuffix(" Vpp")
+        self._e_amp.setMaximumWidth(110); g.addWidget(self._e_amp, 0, 1)
+        g.addWidget(QLabel("Settle:"), 0, 2)
+        self._e_settle = QDoubleSpinBox(); self._e_settle.setRange(0.0, 100000)
+        self._e_settle.setDecimals(2); self._e_settle.setValue(0.5); self._e_settle.setSuffix(" s")
+        self._e_settle.setMaximumWidth(90); g.addWidget(self._e_settle, 0, 3)
+        hint = QLabel(
+            "Sets the drive amplitude on the monitored axis; the reported charge "
+            "stays\nnormalized (quanta). Drop the field low before recharging so "
+            "the filament\ndoesn't knock the sphere out; raise it for a "
+            "better-SNR discharge measurement.")
+        hint.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+        g.addWidget(hint, 1, 0, 1, 5)
+        return w
+
     def _build_wait_page(self):
         w = QWidget(); g = QGridLayout(w); g.setColumnStretch(2, 1)
         g.addWidget(QLabel("Duration:"), 0, 0)
@@ -231,6 +252,10 @@ class SequencerTab(QWidget):
                            compare=self._r_cmp.currentData(),
                            threshold_e=self._r_thr.value(),
                            timeout_s=self._r_to.value())
+        if action == "set_electrode":
+            return SeqStep(action="set_electrode",
+                           electrode_amp_vpp=self._e_amp.value(),
+                           electrode_settle_s=self._e_settle.value())
         return SeqStep(action="wait", wait_s=self._w_dur.value())
 
     def _step_to_editor(self, s: SeqStep):
@@ -245,6 +270,9 @@ class SequencerTab(QWidget):
             self._r_power.setValue(s.fil_power_v)
             self._r_cmp.setCurrentIndex(max(0, self._r_cmp.findData(s.compare)))
             self._r_thr.setValue(s.threshold_e); self._r_to.setValue(s.timeout_s)
+        elif s.action == "set_electrode":
+            self._e_amp.setValue(s.electrode_amp_vpp)
+            self._e_settle.setValue(s.electrode_settle_s)
         elif s.action == "wait":
             self._w_dur.setValue(s.wait_s)
 
