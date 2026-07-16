@@ -2311,6 +2311,105 @@ class DriveSetbackAdapter:
 
 
 # ---------------------------------------------------------------------------
+# ChargeSequencerActuators — resolved-at-start hardware driver for the sequencer
+# ---------------------------------------------------------------------------
+
+class ChargeSequencerActuators:
+    """
+    Actuator driver for ChargeSequencer.
+
+    prepare() runs on the GUI thread and snapshots the resolved hardware
+    handles (AFG controllers + channels + pulse amplitudes, NGE controllers +
+    channels + current limits) from the flash/filament trigger PulseGroups and
+    the flash-control / filament-power NGEControlGroups.  start_discharge /
+    start_recharge / stop_all / all_off then run on the sequencer worker thread
+    and program those controllers directly (no widget access), so the sequencer
+    is thread-safe.  AFG access is serialized with the shared per-AFG lock.
+    """
+
+    def __init__(self, wg_tab):
+        self._wg = wg_tab
+        self._h: dict = {}
+
+    # -- GUI thread ----------------------------------------------------------
+
+    def prepare(self):
+        """Resolve and capture all hardware handles.  Call on the GUI thread."""
+        wg = self._wg
+        ft_afg, ft_ch = wg.flash_trigger._afg_ch()
+        fc_nge, fc_ch = wg.flash_control._nge_ch()
+        fl_afg, fl_ch = wg.filament._afg_ch()
+        fp_nge, fp_ch = wg.filament_power._nge_ch()
+        self._h = {
+            "ft_afg": ft_afg, "ft_ch": ft_ch,
+            "ft_vhigh": wg.flash_trigger._amp.value(),
+            "ft_off": wg.flash_trigger._get_offset(),
+            "ft_width_s": wg.flash_trigger._width_ms.value() * 1e-3,
+            "fc_nge": fc_nge, "fc_ch": fc_ch,
+            "fc_ilim": wg.flash_control._current.value(),
+            "fl_afg": fl_afg, "fl_ch": fl_ch,
+            "fl_vhigh": wg.filament._amp.value(),
+            "fl_off": wg.filament._get_offset(),
+            "fp_nge": fp_nge, "fp_ch": fp_ch,
+            "fp_ilim": wg.filament_power._current.value(),
+        }
+
+    # -- worker thread -------------------------------------------------------
+
+    def start_discharge(self, flash_rate_hz: float, ctrl_v: float):
+        h = self._h
+        nge, ch = h.get("fc_nge"), h.get("fc_ch")
+        if nge is not None and nge.is_connected:
+            nge.set_channel(ch, max(0.0, ctrl_v), h["fc_ilim"])
+            nge.output_on(ch)
+        afg, ach = h.get("ft_afg"), h.get("ft_ch")
+        if afg is None:
+            raise RuntimeError("flash-lamp trigger WG not connected")
+        with _afg_lock(afg):
+            afg.setup_pulse(ach, frequency=flash_rate_hz, amplitude=h["ft_vhigh"],
+                            offset=h["ft_off"], width=h["ft_width_s"])
+            afg.output_on(ach)
+
+    def start_recharge(self, fil_freq_hz: float, fil_width_ms: float,
+                       power_v: float = 0.0):
+        h = self._h
+        if power_v > 0:
+            nge, ch = h.get("fp_nge"), h.get("fp_ch")
+            if nge is not None and nge.is_connected:
+                nge.set_channel(ch, power_v, h["fp_ilim"])
+                nge.output_on(ch)
+        afg, ach = h.get("fl_afg"), h.get("fl_ch")
+        if afg is None:
+            raise RuntimeError("filament trigger WG not connected")
+        with _afg_lock(afg):
+            afg.setup_pulse(ach, frequency=fil_freq_hz, amplitude=h["fl_vhigh"],
+                            offset=h["fl_off"], width=fil_width_ms * 1e-3)
+            afg.output_on(ach)
+
+    def stop_all(self):
+        """Stop actuation (both triggers off — gating stops all flashing/heating)."""
+        for afg_key, ch_key in (("ft_afg", "ft_ch"), ("fl_afg", "fl_ch")):
+            afg, ch = self._h.get(afg_key), self._h.get(ch_key)
+            if afg is not None:
+                try:
+                    with _afg_lock(afg):
+                        afg.output_off(ch)
+                except Exception:
+                    pass
+
+    def all_off(self):
+        """Full quiescent state — triggers off and NGE control/power outputs off."""
+        self.stop_all()
+        for nge_key, ch_key in (("fc_nge", "fc_ch"), ("fp_nge", "fp_ch")):
+            nge, ch = self._h.get(nge_key), self._h.get(ch_key)
+            if nge is not None:
+                try:
+                    nge.output_off(ch)
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
 # Sweep automation — worker thread
 # ---------------------------------------------------------------------------
 

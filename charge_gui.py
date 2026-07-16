@@ -35,7 +35,11 @@ from charge_analysis import AnalysisTab
 from charge_control import ChargeController
 from charge_gui_tabs import ControlTab, CalibrationTab, ExperimentTab
 from photon_order_experiment import PhotonOrderExperiment
-from wg_control_tab import WaveformControlTab, DriveSetbackAdapter
+from charge_sequence import ChargeSequencer
+from sequencer_tab import SequencerTab
+from wg_control_tab import (
+    WaveformControlTab, DriveSetbackAdapter, ChargeSequencerActuators,
+)
 
 # Rolling session log — sits alongside this script
 LOG_FILE = Path(__file__).parent / "charge_session_log.jsonl"
@@ -536,12 +540,20 @@ class ChargeWidget(QWidget):
         if "Calibration" in saved:
             self._calibration_tab.restore_config(saved["Calibration"])
 
-        # --- Experiment tab ---
+        # --- Experiment tab (Photon Order) ---
         self._experiment_tab = ExperimentTab()
         if "Experiment" in saved:
             self._experiment_tab.restore_config(saved["Experiment"])
         self._photon_exp = PhotonOrderExperiment()
         self._experiment_tab.set_experiment(self._photon_exp)
+
+        # --- Command sequencer (charge/discharge cycles) ---
+        self._seq_actuators = ChargeSequencerActuators(self._wg_tab)
+        self._sequencer = ChargeSequencer(self._seq_actuators)
+        self._sequencer_tab = SequencerTab()
+        self._sequencer_tab.set_sequencer(self._sequencer)
+        if "Sequencer" in saved:
+            self._sequencer_tab.restore_config(saved["Sequencer"])
 
         # --- Drive setback: park the drive tone low while the filament is on.
         # Wraps the filament actuator; settings live in the Control tab. The
@@ -559,9 +571,10 @@ class ChargeWidget(QWidget):
         self._calibration_tab._drive_amp_provider = (
             self._drive_setback.effective_amplitude)
 
-        # --- Wire analysis → control loop and experiment ---
+        # --- Wire analysis → control loop, experiment, and sequencer ---
         self._analysis_tab.charge_updated.connect(self._charge_ctrl.on_charge_update)
         self._analysis_tab.charge_updated.connect(self._photon_exp.on_charge_update)
+        self._analysis_tab.charge_updated.connect(self._sequencer.on_charge_update)
 
         # --- Wire analysis → auto lock-in calibration (and result back) ---
         self._analysis_tab.charge_updated.connect(
@@ -584,7 +597,12 @@ class ChargeWidget(QWidget):
         self._tabs.addTab(self._analysis_tab,    "Analysis")
         self._tabs.addTab(self._control_tab,     "Control")
         self._tabs.addTab(self._calibration_tab, "Calibration")
-        self._tabs.addTab(self._experiment_tab,  "Experiment")
+
+        # Experiment tab holds the photon-order scan and the command sequencer.
+        self._experiment_container = QTabWidget()
+        self._experiment_container.addTab(self._experiment_tab, "Photon Order")
+        self._experiment_container.addTab(self._sequencer_tab, "Command Sequence")
+        self._tabs.addTab(self._experiment_container, "Experiment")
 
         # "Launch Charge Control" → switch to Waveform Control tab
         self._connections_tab.launch_clicked.connect(
@@ -623,11 +641,14 @@ class ChargeWidget(QWidget):
             self._charge_ctrl.stop()
         if self._photon_exp.is_running:
             self._photon_exp.abort()
+        if self._sequencer.is_running:
+            self._sequencer.stop()
         configs = self._connections_tab.get_all_configs()
         configs["Analysis"]      = self._analysis_tab.get_config()
         configs["Control"]       = self._control_tab.get_config()
         configs["Calibration"]   = self._calibration_tab.get_config()
         configs["Experiment"]    = self._experiment_tab.get_config()
+        configs["Sequencer"]     = self._sequencer_tab.get_config()
         configs["ElectrodeMap"]  = self._wg_tab.electrode_map.get_config()
         configs["LockInRef"]     = self._wg_tab.lockin_ref.get_config()
         configs["NGEMap"]        = self._wg_tab.nge_map.get_config()
