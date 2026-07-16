@@ -217,20 +217,38 @@ class ChargeController(QObject):
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Enable the control loop."""
+        """Enable the control loop.
+
+        Arms both actuators for the session (turns the NGE flash-control and
+        filament-power DC outputs on at their setpoints) so the trigger pulses
+        actually flash/heat; the pulses gate the actuation, the DC stays on.
+        """
         self._enabled = True
         self._consecutive_count = 0
         self._settling = False
+        self._arm_actuators(True)
         log.info("Control loop started — target %+.1f e", self._target_charge)
         self.action_changed.emit(f"Started — target {self._target_charge:+.1f} e")
 
     def stop(self) -> None:
-        """Disable the control loop and turn off all actuators."""
+        """Disable the control loop, stop pulsing, and disarm (NGE DC off)."""
         self._enabled = False
         self._stop_all_actuators()
+        self._arm_actuators(False)
         self._current_action = Action.NONE
         log.info("Control loop stopped")
         self.action_changed.emit("Stopped")
+
+    def _arm_actuators(self, on: bool) -> None:
+        """Arm/disarm the session DC outputs on both actuators (if supported)."""
+        method = "arm" if on else "disarm"
+        for act in (self._flashlamp, self._filament):
+            fn = getattr(act, method, None) if act is not None else None
+            if fn is not None:
+                try:
+                    fn()
+                except Exception as e:
+                    log.warning("actuator %s() failed: %s", method, e)
 
     @property
     def is_running(self) -> bool:

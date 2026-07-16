@@ -1893,6 +1893,15 @@ class FlashLampAdapter:
     def is_connected(self) -> bool:
         return self._trigger.is_connected
 
+    def arm(self):
+        """Session on: turn the NGE flash-control output on at its setpoint, so
+        the trigger pulses actually flash.  Called by ChargeController.start()."""
+        self._control._output_on()
+
+    def disarm(self):
+        """Session off: turn the NGE flash-control output off."""
+        self._control._output_off()
+
     def set_flash_rate(self, rate_hz: float):
         self._trigger._freq.setValue(rate_hz)
         self._trigger._apply()
@@ -1905,6 +1914,40 @@ class FlashLampAdapter:
 
     def get_electrode_voltage(self) -> float:
         return self._control.get_voltage()
+
+
+# ---------------------------------------------------------------------------
+# FilamentAdapter
+# Wraps the filament trigger (PulseGroup, WG3-CH2) + the filament power
+# (NGEControlGroup) into a single actuator matching the enable/disable +
+# arm/disarm interface ChargeController uses.  The trigger gates heating; the
+# NGE power is the session-on DC supply.
+# ---------------------------------------------------------------------------
+
+class FilamentAdapter:
+    """Combines the filament trigger PulseGroup and its NGE power group."""
+
+    def __init__(self, trigger: PulseGroup, power: NGEControlGroup):
+        self._trigger = trigger
+        self._power = power
+
+    def enable(self) -> bool:
+        return self._trigger.enable()
+
+    def disable(self) -> bool:
+        return self._trigger.disable()
+
+    @property
+    def is_connected(self) -> bool:
+        return self._trigger.is_connected
+
+    def arm(self):
+        """Session on: turn the NGE filament-power output on at its setpoint."""
+        self._power._output_on()
+
+    def disarm(self):
+        """Session off: turn the NGE filament-power output off."""
+        self._power._output_off()
 
 
 # ---------------------------------------------------------------------------
@@ -2257,6 +2300,17 @@ class DriveSetbackAdapter:
     @property
     def is_connected(self) -> bool:
         return self._actuator.is_connected
+
+    def arm(self):
+        """Delegate session-on (NGE filament power on) to the wrapped actuator."""
+        fn = getattr(self._actuator, "arm", None)
+        if fn:
+            fn()
+
+    def disarm(self):
+        fn = getattr(self._actuator, "disarm", None)
+        if fn:
+            fn()
 
     def effective_amplitude(self):
         """Current actual drive amplitude (Vpp): the charging value while

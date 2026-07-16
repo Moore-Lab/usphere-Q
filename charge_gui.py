@@ -38,7 +38,8 @@ from photon_order_experiment import PhotonOrderExperiment
 from charge_sequence import ChargeSequencer
 from sequencer_tab import SequencerTab
 from wg_control_tab import (
-    WaveformControlTab, DriveSetbackAdapter, ChargeSequencerActuators,
+    WaveformControlTab, DriveSetbackAdapter, FilamentAdapter,
+    ChargeSequencerActuators,
 )
 
 # Rolling session log — sits alongside this script
@@ -559,12 +560,18 @@ class ChargeWidget(QWidget):
         # reference mirror, and charge normalization all stay consistent.
         self._sequencer.set_electrode_requested.connect(self._on_seq_set_electrode)
 
+        # --- Filament actuator: trigger (WG3-CH2) + NGE power, so the control
+        # loop can arm the filament-power DC output for the session.
+        self._filament_actuator = FilamentAdapter(
+            self._wg_tab.filament, self._wg_tab.filament_power)
+
         # --- Drive setback: park the drive tone low while the filament is on.
         # Wraps the filament actuator; settings live in the Control tab. The
         # reduced/restored absolute drive amplitude feeds AnalysisTab so the
         # lock-in charge readout stays normalized (charge ∝ X / drive amp).
+        # arm()/disarm() pass through to the filament power.
         self._drive_setback = DriveSetbackAdapter(
-            actuator=self._wg_tab.filament,
+            actuator=self._filament_actuator,
             get_drive_widget=lambda: getattr(
                 self._wg_tab, f"{self._analysis_tab.monitor_axis()}_drive"),
             get_params=self._control_tab.get_setback_params,
