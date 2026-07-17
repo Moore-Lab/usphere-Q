@@ -1057,16 +1057,10 @@ class CalibrationTab(QWidget):
             self._auto_status.setStyleSheet("color: red;")
             return
 
-        # A sign mismatch would produce a negative V/e, which the sources
-        # treat as "uncalibrated" — refuse and point at the likely cause.
-        if (mean_v > 0) != (charge > 0):
-            self._auto_status.setText(
-                f"Mean X = {mean_v:.4e} V has the opposite sign to the "
-                f"selected polarity ({charge:+d}e) — check the SR530 phase "
-                f"or the polarity choice. Nothing saved."
-            )
-            self._auto_status.setStyleSheet("color: red;")
-            return
+        # NOTE: a negative volts-per-electron (X sign opposite to the charge
+        # polarity) is a VALID calibration — the sign just records the arbitrary
+        # lock-in phase alignment.  It is stored signed and the sources apply it
+        # correctly; we do not reject it.
 
         drive_amp = self._current_drive_amp()
         try:

@@ -412,12 +412,16 @@ class LockInSource(ChargeStateSource):
 
     def _handle_voltage(self, volts: float):
         self._sample_count += 1
-        polarity = 1.0 if volts >= 0 else -1.0
+        # Signed volts-per-electron (see SR530SerialSource): a negative V/e is a
+        # valid calibration — the sign absorbs the arbitrary lock-in phase.
+        vpe = self._volts_per_electron
+        calibrated = vpe != 0.0 and abs(vpe) != 1.0
 
-        if self._volts_per_electron > 0:
-            n_charges = volts / (self._volts_per_electron * self._drive_scale)
+        if calibrated:
+            n_charges = volts / (vpe * self._drive_scale)
         else:
             n_charges = volts  # uncalibrated — just show raw voltage
+        polarity = 1.0 if n_charges >= 0 else -1.0
 
         result = {
             "charge_e": float(n_charges),
@@ -430,8 +434,7 @@ class LockInSource(ChargeStateSource):
             "timestamp": time.time(),
             "duration": 0.0,
             "file": f"sample #{self._sample_count}",
-            "calibrated": self._volts_per_electron > 0
-                          and self._volts_per_electron != 1.0,
+            "calibrated": calibrated,
             "raw_voltage": float(volts),
             "drive_amp_scale": self._drive_scale,
             "raw": None,
@@ -587,13 +590,18 @@ class SR530SerialSource(ChargeStateSource):
     def _handle_snapshot(self, snap: dict):
         self._sample_count += 1
         x_v = snap["x"]            # X output in real volts (QX)
-        polarity = 1.0 if x_v >= 0 else -1.0
-        calibrated = self._volts_per_electron > 0 and self._volts_per_electron != 1.0
+        # volts-per-electron is SIGNED: its sign absorbs the (arbitrary) lock-in
+        # phase alignment, so a positive charge may give a negative X.  A
+        # negative V/e is a perfectly valid calibration.
+        vpe = self._volts_per_electron
+        calibrated = vpe != 0.0 and abs(vpe) != 1.0
 
         if calibrated:
-            n_charges = x_v / (self._volts_per_electron * self._drive_scale)
+            n_charges = x_v / (vpe * self._drive_scale)
         else:
             n_charges = x_v        # uncalibrated — show raw voltage
+        # Charge sign comes from the (signed) reading, not the raw voltage sign.
+        polarity = 1.0 if n_charges >= 0 else -1.0
 
         result = {
             "charge_e":         float(n_charges),
@@ -781,6 +789,7 @@ class AnalysisTab(QWidget):
         self._li_vpe_edit.setToolTip(
             "Calibration: lock-in X output voltage per unit charge.\n"
             "Set to 1.0 for uncalibrated (shows raw voltage).\n"
+            "May be negative — the sign records the lock-in phase.\n"
             "Determine from known charge states."
         )
         self._li_vpe_edit.setMaximumWidth(120)
@@ -851,6 +860,7 @@ class AnalysisTab(QWidget):
         self._sr_vpe_edit.setToolTip(
             "Calibration: SR530 X output (volts) per unit charge.\n"
             "Set to 1.0 for uncalibrated (shows raw voltage).\n"
+            "May be negative — the sign records the lock-in phase.\n"
             "Determine from known charge states."
         )
         self._sr_vpe_edit.setMaximumWidth(120)
