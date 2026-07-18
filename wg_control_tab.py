@@ -2046,9 +2046,9 @@ class _FilamentPulser(QThread):
     def fire(self, afg, ch, amp, offset, hi_z, width_ms):
         self._q.put(("fire", (afg, ch, amp, offset, hi_z, float(width_ms))))
 
-    def hold(self, afg, ch, amp, offset, hi_z, freq_hz=1000.0, duty=0.99):
-        """Hold the output HIGH (a ~duty pulse) so the SSR stays closed."""
-        self._q.put(("hold", (afg, ch, amp, offset, hi_z, freq_hz, duty)))
+    def hold(self, afg, ch, dc_level, hi_z):
+        """Hold the output at a constant DC ``dc_level`` so the SSR stays closed."""
+        self._q.put(("hold", (afg, ch, dc_level, hi_z)))
 
     def off(self, afg, ch):
         self._q.put(("off", (afg, ch)))
@@ -2083,14 +2083,12 @@ class _FilamentPulser(QThread):
             except Exception:
                 pass
 
-    def _hold(self, afg, ch, amp, offset, hi_z, freq_hz, duty):
-        """Hold the SSR closed: a ~duty-cycle pulse (near-DC high)."""
-        period = 1.0 / max(freq_hz, 1e-3)
-        width_s = period * max(0.01, min(0.999, duty))
+    def _hold(self, afg, ch, dc_level, hi_z):
+        """Hold the SSR closed with a constant DC output (the AFG's DC offset —
+        a ~0-amplitude sine at ``dc_level``, as the old flash-control DC used)."""
         with _afg_lock(afg):
             (afg.set_load_high_z if hi_z else afg.set_load_50_ohm)(ch)
-            afg.setup_pulse(ch, frequency=freq_hz, amplitude=amp,
-                            offset=offset, width=width_s)
+            afg.setup_sine(ch, frequency=1.0, amplitude=0.001, offset=dc_level)
             afg.output_on(ch)
         self._key = None          # invalidate the single-pulse setup cache
         self._cur_width = None
@@ -2240,15 +2238,16 @@ class FilamentAdapter:
     # -- power-ramp mode: hold the SSR closed + ramp the NGE voltage ---------
 
     def hold_ssr_on(self) -> bool:
-        """Hold the filament trigger HIGH (SSR closed) so the NGE power can be
-        ramped continuously.  Non-blocking (background pulser)."""
+        """Hold the filament trigger at a constant DC high (SSR closed) so the
+        NGE power can be ramped continuously.  Uses the AFG's DC offset at the
+        pulse HIGH level.  Non-blocking (background pulser)."""
         trig = self._trigger
         afg, ch = trig._afg_ch()
         if afg is None:
             return False
         hi_z = (trig._imp.currentIndex() == 1)
-        self._ensure_pulser().hold(afg, ch, trig._amp.value(),
-                                   trig._get_offset(), hi_z)
+        dc_level = trig._get_offset() + trig._amp.value() / 2.0   # pulse HIGH level
+        self._ensure_pulser().hold(afg, ch, dc_level, hi_z)
         return True
 
     def set_power_voltage(self, v: float) -> bool:
