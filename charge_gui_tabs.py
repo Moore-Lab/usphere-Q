@@ -422,6 +422,15 @@ class ControlTab(QWidget):
         sbg.setColumnStretch(2, 1)
         outer.addWidget(sb_grp)
 
+        # --- Safety ---------------------------------------------------------
+        self._overload_cb = QCheckBox("Stop on lock-in overload")
+        self._overload_cb.setChecked(True)
+        self._overload_cb.setToolTip(
+            "End the run if the SR530 reports an overload — an overloaded "
+            "reading is invalid (e.g. wrong range while the drive is parked "
+            "low), so the loop would otherwise chase a bogus charge.")
+        outer.addWidget(self._overload_cb)
+
         # --- Status + Cancel ------------------------------------------------
         status_row = QHBoxLayout()
         self._status = QLabel("Idle")
@@ -458,30 +467,28 @@ class ControlTab(QWidget):
     # ------------------------------------------------------------------
 
     def _apply_common(self):
-        """Settings applied on every run (safety timeout)."""
+        """Settings applied on every run (safety timeout + overload stop)."""
         self._ctrl.set_timeout(self._timeout_spin.value() * 60.0)
+        self._ctrl.set_stop_on_overload(self._overload_cb.isChecked())
 
     def _on_flash(self):
         self._apply_common()
-        self._ctrl.set_policy("flash")
         self._ctrl.set_flash_params(rate_hz=self._flash_rate.value(),
                                     control_v=self._flash_ctrl.value())
-        delta = self._flash_delta.value()
-        self._ctrl.set_relative_target(delta if delta > 0 else 1e6, tolerance=0.5)
+        # Change charge by |Δq|; 0 = until cancel.  Sign-independent stop.
+        self._ctrl.set_change_by(self._flash_delta.value(), "flash")
         self._begin()
 
     def _on_filament(self):
         self._apply_common()
-        self._ctrl.set_policy("filament")
         self._ctrl.set_filament_ramp(self._ramp_config.get_ramp())
-        delta = self._fil_delta.value()
-        self._ctrl.set_relative_target(-(delta if delta > 0 else 1e6), tolerance=0.5)
+        self._ctrl.set_change_by(self._fil_delta.value(), "filament")
         self._begin()
 
     def _on_target(self):
         self._apply_common()
-        self._ctrl.set_policy("auto")
         self._ctrl.set_target(self._target_spin.value(), self._tol_spin.value())
+        self._ctrl.set_policy("auto")
         self._ctrl.set_flash_params(rate_hz=self._flash_rate.value(),
                                     control_v=self._flash_ctrl.value())
         self._ctrl.set_filament_ramp(self._ramp_config.get_ramp())
@@ -562,6 +569,7 @@ class ControlTab(QWidget):
         cfg["_gui_timeout_min"] = self._timeout_spin.value()
         cfg["_gui_setback_enabled"] = self._setback_cb.isChecked()
         cfg["_gui_setback_vpp"] = self._setback_amp.value()
+        cfg["_gui_stop_on_overload"] = self._overload_cb.isChecked()
         cfg["_gui_filament_ramp"] = self._ramp_config.get_config()
         return cfg
 
@@ -582,6 +590,8 @@ class ControlTab(QWidget):
                 spin.setValue(float(cfg[key]))
         if "_gui_setback_enabled" in cfg:
             self._setback_cb.setChecked(bool(cfg["_gui_setback_enabled"]))
+        if "_gui_stop_on_overload" in cfg:
+            self._overload_cb.setChecked(bool(cfg["_gui_stop_on_overload"]))
         if "_gui_filament_ramp" in cfg:
             self._ramp_config.restore_config(cfg["_gui_filament_ramp"])
             self._ramp_config._enable.setChecked(True)

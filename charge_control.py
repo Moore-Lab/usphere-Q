@@ -256,12 +256,22 @@ class ChargeController(QObject):
         self._setback = None                       # optional drive-setback
 
         # Target / policy
+        self._mode: str = "target"                 # "target" | "change"
         self._target_charge: float = 0.0
         self._tolerance: float = 0.5
         self._policy: str = "auto"                 # auto | flash | filament
         self._timeout_s: float = 600.0             # safety stop (10 min)
-        self._pending_delta: float | None = None   # relative "change by" target
         self._enabled: bool = False
+
+        # "Change charge by this amount" mode: stop when |charge - start| >= amount
+        # (sign-independent), so a move past the requested magnitude in EITHER
+        # direction ends the run.
+        self._change_amount: float = 0.0
+        self._start_charge: float | None = None
+
+        # Overload safety: end the loop if the lock-in reading overloads.
+        self._stop_on_overload: bool = True
+        self._overload_count: int = 0
 
         # State
         self._current_action = Action.NONE
@@ -291,21 +301,36 @@ class ChargeController(QObject):
     # ------------------------------------------------------------------
 
     def set_target(self, charge_e: float, tolerance: float = 0.5) -> None:
-        """Set an absolute target charge (electrons) and tolerance."""
+        """Go-to-target mode: reach an absolute target charge (± tolerance)."""
+        self._mode = "target"
         self._target_charge = charge_e
         self._tolerance = tolerance
-        self._pending_delta = None
         log.info("Target set: %+.1f e  (±%.1f)", charge_e, tolerance)
 
-    def set_relative_target(self, delta_e: float, tolerance: float = 0.5) -> None:
-        """Target = (charge at start) + delta_e, resolved on the first reading.
-        Used for a manual 'change charge by this much' run."""
-        self._pending_delta = delta_e
-        self._tolerance = tolerance
+    def set_change_by(self, amount_e: float, tool: str) -> None:
+        """Change-by-amount mode: run ``tool`` ('flash' or 'filament') until the
+        charge has moved by ``|amount_e|`` from where it started — in EITHER
+        direction (sign-independent), so a runaway past the requested magnitude
+        also stops it.  ``amount_e`` <= 0 means run until cancel."""
+        self._mode = "change"
+        self._change_amount = abs(float(amount_e))
+        self._policy = tool if tool in ("flash", "filament") else "flash"
+        self._start_charge = None
 
     def get_target(self) -> tuple[float, float]:
         """Return (target_charge, tolerance)."""
         return self._target_charge, self._tolerance
+
+    def set_stop_on_overload(self, on: bool) -> None:
+        """When on (default), end the loop on a lock-in overload reading."""
+        self._stop_on_overload = bool(on)
+
+    def _goal_met(self, charge: float) -> bool:
+        """True when the run's goal is reached."""
+        if self._mode == "change":
+            return (self._start_charge is not None and self._change_amount > 0
+                    and abs(charge - self._start_charge) >= self._change_amount)
+        return abs(charge - self._target_charge) <= self._tolerance
 
     def set_policy(self, policy: str) -> None:
         """'auto' picks flash/filament by direction; 'flash' or 'filament'
@@ -365,15 +390,17 @@ class ChargeController(QObject):
         self._pulse_runner = None
         self._flash_on = False
         self._flash_ref_charge = None
+        self._start_charge = None
+        self._overload_count = 0
         self._current_action = Action.NONE
         self._arm_actuators(True)
         self._watchdog.start()
-        if self._pending_delta is not None:
-            if abs(self._pending_delta) >= 1e5:
-                msg = f"Started — {self._policy} until cancel"
-            else:
-                msg = (f"Started — change charge by {self._pending_delta:+.1f} e "
+        if self._mode == "change":
+            if self._change_amount > 0:
+                msg = (f"Started — change charge by {self._change_amount:.1f} e "
                        f"({self._policy})")
+            else:
+                msg = f"Started — {self._policy} until cancel"
         else:
             msg = (f"Started — target {self._target_charge:+.1f} e "
                    f"± {self._tolerance:.1f} ({self._policy})")
@@ -428,12 +455,22 @@ class ChargeController(QObject):
             return
         self._last_charge = charge
 
-        # Resolve a relative "change by Δ" target on the first reading.
-        if self._pending_delta is not None:
-            self._target_charge = charge + self._pending_delta
-            self._pending_delta = None
-            self.action_changed.emit(
-                f"Target {self._target_charge:+.1f} e  (start {charge:+.1f} e)")
+        # Safety: end the loop on a lock-in overload — an overloaded reading is
+        # invalid (e.g. the drive parked low + wrong range → a pinned, bogus
+        # charge), so acting on it would run away.  Debounced by 2 reads so a
+        # single spike doesn't trip it.
+        if self._stop_on_overload and result.get("sr530_overloaded"):
+            self._overload_count += 1
+            if self._overload_count >= 2:
+                self.stop("Lock-in OVERLOAD — stopped (increase the range / "
+                          "auto-range)")
+                return
+        else:
+            self._overload_count = 0
+
+        # Record the starting charge for a change-by-amount run.
+        if self._mode == "change" and self._start_charge is None:
+            self._start_charge = charge
 
         # The pulse ramp owns the loop while it runs (reads only when the
         # filament is off); only the safety timeout can interrupt it.
@@ -449,21 +486,23 @@ class ChargeController(QObject):
             self.stop(self._timeout_msg())
             return
 
-        # At target?
-        if abs(charge - self._target_charge) <= self._tolerance:
-            self._reach_target(charge)
+        # Goal reached?
+        if self._goal_met(charge):
+            self._reach_goal(charge)
             return
 
-        # Decide which tool moves the charge toward the target.
+        # Decide which tool to run.
         dev = self._decide(charge)
         if dev == "flash":
+            if self._pulse_runner is not None:
+                return
             self._do_flash(charge)
         elif dev == "filament":
             if self._flash_on:
                 self._flash_stop()
             self._start_pulse_ramp(charge)
         else:
-            # Forced policy can't correct in the needed direction (overshoot).
+            # Forced (target-mode) policy can't correct in the needed direction.
             self.stop(
                 f"Overshot: {charge:+.1f} e vs target "
                 f"{self._target_charge:+.1f} e — {self._policy} can't reverse it")
@@ -476,6 +515,9 @@ class ChargeController(QObject):
     def _timeout_msg(self) -> str:
         t = self._timeout_s
         span = f"{t / 60.0:.1f} min" if t >= 60 else f"{t:.0f} s"
+        if self._mode == "change":
+            return (f"Safety timeout — charge didn't move by "
+                    f"{self._change_amount:.1f} e in {span}")
         return (f"Safety timeout — target {self._target_charge:+.1f} e not "
                 f"reached in {span}")
 
@@ -486,6 +528,9 @@ class ChargeController(QObject):
     def _decide(self, charge: float) -> str | None:
         """Return the tool to use: 'flash' (raise +), 'filament' (lower −), or
         None if the policy can't move in the needed direction."""
+        if self._mode == "change":
+            # Forced tool; the |Δq| goal (either direction) stops the run.
+            return self._policy if self._policy in ("flash", "filament") else "flash"
         err = charge - self._target_charge   # >0: too high → lower; <0: too low → raise
         if self._policy == "flash":
             return "flash" if err < 0 else None
@@ -552,7 +597,7 @@ class ChargeController(QObject):
     # ------------------------------------------------------------------
 
     def _start_pulse_ramp(self, charge: float):
-        """Begin the pulse-wait-read filament ramp toward the target (lower −)."""
+        """Begin the pulse-wait-read filament ramp (lower −)."""
         if self._filament is None or not getattr(self._filament, "is_connected", False):
             self.action_changed.emit("Filament not connected!")
             return
@@ -560,13 +605,18 @@ class ChargeController(QObject):
             self.action_changed.emit("Filament actuator has no pulse support")
             return
         self._park_setback()
-        tgt, tol = self._target_charge, self._tolerance
-        # Filament lowers the charge; stop once it reaches the target band.
-        self._pulse_runner = PulseRampRunner(
-            self._filament_ramp, condition=lambda q: q <= tgt + tol)
+        if self._mode == "change":
+            # Stop once the charge has moved by the requested amount (either way).
+            self._pulse_runner = PulseRampRunner(
+                self._filament_ramp, condition=self._goal_met)
+        else:
+            tgt, tol = self._target_charge, self._tolerance
+            # Filament lowers the charge; stop once it reaches the target band.
+            self._pulse_runner = PulseRampRunner(
+                self._filament_ramp, condition=lambda q: q <= tgt + tol)
         self._current_action = Action.HEAT
         self.action_changed.emit(
-            f"Ramping filament (lower −) — target {tgt:+.1f} e, "
+            f"Ramping filament (lower −) — "
             f"start {self._filament_ramp.start_width_ms:.3g} ms, "
             f"{self._filament_ramp.timeout_cycles} cycles/read")
 
@@ -592,25 +642,27 @@ class ChargeController(QObject):
         if r["done"]:
             self._pulse_runner = None
             self._filament_pulse_off()
-            if r.get("reason") == "maxed":
-                # Ramp reached the max width without meeting the target — stop
+            if self._goal_met(charge):
+                self._reach_goal(charge)
+            elif r.get("reason") == "maxed":
+                # Ramp reached the max width without meeting the goal — stop
                 # (bounded ramp; the filament couldn't get there).
                 self.stop(
                     f"Filament reached max width "
-                    f"{self._filament_ramp.max_width_ms:.3g} ms — target "
-                    f"{self._target_charge:+.1f} e not reached (charge {charge:+.1f} e)")
-            elif abs(charge - self._target_charge) <= self._tolerance:
-                self._reach_target(charge)
-            elif self._policy == "filament":
+                    f"{self._filament_ramp.max_width_ms:.3g} ms — goal not "
+                    f"reached (charge {charge:+.1f} e)")
+            elif self._mode == "target" and self._policy == "filament":
                 # Forced filament overshot below the band — it can't raise back.
                 self.stop(f"Overshot: {charge:+.1f} e below target "
                           f"{self._target_charge:+.1f} e — filament can't raise it")
-            else:
+            elif self._mode == "target":
                 # Auto: overshot below the band; the next poll re-decides and
                 # flashes the charge back up toward the target.
                 self._current_action = Action.NONE
                 self.action_changed.emit(
                     f"Filament overshot to {charge:+.1f} e — correcting with flash")
+            else:
+                self.stop(f"Filament stopped at {charge:+.1f} e")
 
     def _filament_fire_pulse(self, width_ms: float, charge: float):
         """Fire a single filament pulse of the given width (see FilamentAdapter
@@ -644,12 +696,16 @@ class ChargeController(QObject):
     # Target reached / actuator + setback helpers
     # ------------------------------------------------------------------
 
-    def _reach_target(self, charge: float):
-        """Target reached — record it and stop (outputs off)."""
-        self._log_event(charge, Action.AT_TARGET, "at target")
+    def _reach_goal(self, charge: float):
+        """Goal reached — record it and stop (outputs off)."""
+        self._log_event(charge, Action.AT_TARGET, "goal reached")
         self.target_reached.emit(charge)
-        self.stop(f"Reached target: {charge:+.1f} e "
-                  f"(target {self._target_charge:+.1f})")
+        if self._mode == "change":
+            dq = charge - (self._start_charge if self._start_charge is not None else charge)
+            self.stop(f"Changed charge by {dq:+.1f} e — now {charge:+.1f} e")
+        else:
+            self.stop(f"Reached target: {charge:+.1f} e "
+                      f"(target {self._target_charge:+.1f})")
 
     def _park_setback(self):
         if self._setback is not None:
