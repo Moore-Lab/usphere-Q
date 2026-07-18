@@ -451,6 +451,107 @@ class LockInSource(ChargeStateSource):
 
 
 # ---------------------------------------------------------------------------
+# AutoRanger — SR530 sensitivity auto-ranging (runs on the poll thread)
+# ---------------------------------------------------------------------------
+
+class AutoRanger(QObject):
+    """Auto-ranges the SR530 sensitivity to keep the signal on-scale without
+    overloading.
+
+    ``step(snap, controller)`` is called from the poll thread (background) on
+    every reading.  It bumps the sensitivity by one index at a time — more
+    sensitive when there's headroom, less sensitive on overload — with a settle
+    window between steps so the analog output can re-settle.  Two modes:
+
+      * one-shot (``request_oneshot``): converge once, then stop.  Triggered on
+        the four control clicks / whenever the drive amplitude changes.
+      * continuous (``set_continuous(True)``): keep evaluating every reading.
+
+    ``range_changed(idx, label)`` and ``status(msg)`` are emitted (queued to the
+    GUI thread) as the range changes / a one-shot converges.
+    """
+
+    range_changed = pyqtSignal(int, str)   # sensitivity index, human label
+    status = pyqtSignal(str)
+
+    MIN_IDX = 4     # SR530 without a preamp: usable range starts at index 4
+    MAX_IDX = 24
+    SETTLE_S = 0.5
+    HI_FRAC = 0.9   # step down (less sensitive) at/above this fraction of full scale
+    LO_FRAC = 0.15  # step up (more sensitive) below this fraction
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.continuous = False
+        self._oneshot = False
+        self._last_step = 0.0
+        self._stable = 0
+
+    def request_oneshot(self):
+        """Run one converge pass (evaluated on the poll thread)."""
+        self._oneshot = True
+        self._stable = 0
+        self._last_step = 0.0
+
+    def set_continuous(self, on: bool):
+        self.continuous = bool(on)
+
+    def step(self, snap: dict, controller):
+        """Poll-thread hook: step the sensitivity by one if warranted."""
+        if not (self.continuous or self._oneshot):
+            return
+        now = time.time()
+        if now - self._last_step < self.SETTLE_S:
+            return                        # let the previous change settle
+        idx = snap.get("sensitivity_idx")
+        if idx is None:
+            return
+        overloaded = bool(snap.get("overloaded", False))
+        frac = snap.get("r_frac")
+        if frac is None:
+            frac = abs(snap.get("x_frac", 0.0) or 0.0)
+        new_idx = idx
+        if overloaded or frac >= self.HI_FRAC:
+            new_idx = min(idx + 1, self.MAX_IDX)      # less sensitive (larger FS)
+        elif frac < self.LO_FRAC:
+            new_idx = max(idx - 1, self.MIN_IDX)      # more sensitive (smaller FS)
+        if new_idx != idx:
+            try:
+                controller.set_sensitivity(new_idx)
+            except Exception:
+                return
+            self._last_step = now
+            self._stable = 0
+            self._emit(new_idx)
+        else:
+            self._stable += 1
+            if self._oneshot and self._stable >= 2:
+                self._oneshot = False
+                self._emit(idx, final=True)
+
+    def _emit(self, idx: int, final: bool = False):
+        self.range_changed.emit(idx, _sens_label(idx))
+        if final:
+            self.status.emit(f"Auto-ranged to {_sens_label(idx)}")
+
+
+def _sens_label(idx: int) -> str:
+    """Human label for a sensitivity index (falls back to the index)."""
+    try:
+        from sr530_controller import sensitivity_index_to_volts
+        v = sensitivity_index_to_volts(idx)
+        if v >= 1.0:
+            return f"{v:.3g} V"
+        if v >= 1e-3:
+            return f"{v * 1e3:.3g} mV"
+        if v >= 1e-6:
+            return f"{v * 1e6:.3g} µV"
+        return f"{v * 1e9:.3g} nV"
+    except Exception:
+        return f"idx {idx}"
+
+
+# ---------------------------------------------------------------------------
 # SR530SerialSource — polls SR530 directly over RS232 (no ESP32 needed)
 # ---------------------------------------------------------------------------
 
@@ -460,12 +561,14 @@ class _SR530PollThread(QThread):
     snapshot_ready = pyqtSignal(dict)   # full snapshot dict from SR530Controller
     error = pyqtSignal(str)
 
-    def __init__(self, port: str, poll_hz: float = 10.0, controller=None):
+    def __init__(self, port: str, poll_hz: float = 10.0, controller=None,
+                 autoranger=None):
         super().__init__()
         self._port = port
         self._poll_interval = 1.0 / max(poll_hz, 1.0)
         self._running = False
         self._controller = controller   # shared SR530Controller, or None to open own
+        self._autoranger = autoranger    # AutoRanger, or None
 
     def run(self):
         self._running = True
@@ -494,6 +597,11 @@ class _SR530PollThread(QThread):
                 try:
                     snap = lia.snapshot()
                     self.snapshot_ready.emit(snap)
+                    if self._autoranger is not None:
+                        try:
+                            self._autoranger.step(snap, lia)
+                        except Exception:
+                            pass
                 except Exception as e:
                     self.error.emit(f"SR530 read error: {e}")
                     break
@@ -531,6 +639,7 @@ class SR530SerialSource(ChargeStateSource):
         on_result: Callable[[dict], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         controller=None,
+        autoranger=None,
     ):
         self._serial_port = serial_port
         self._volts_per_electron = volts_per_electron
@@ -538,6 +647,7 @@ class SR530SerialSource(ChargeStateSource):
         self._on_result = on_result
         self._on_error = on_error
         self._controller = controller   # shared SR530Controller (Lock-In tab), or None
+        self._autoranger = autoranger    # AutoRanger, or None
 
         self._thread: _SR530PollThread | None = None
         self._latest: dict | None = None
@@ -556,7 +666,8 @@ class SR530SerialSource(ChargeStateSource):
         self._running = True
         self._sample_count = 0
         self._thread = _SR530PollThread(
-            self._serial_port, self._poll_hz, controller=self._controller)
+            self._serial_port, self._poll_hz, controller=self._controller,
+            autoranger=self._autoranger)
         self._thread.snapshot_ready.connect(self._handle_snapshot)
         self._thread.error.connect(self._handle_error)
         self._thread.start()
@@ -658,6 +769,8 @@ class AnalysisTab(QWidget):
     # Internal: marshals the drive-normalization label text to the GUI thread
     # (set_current_drive_amp may be called from the actuator thread).
     _norm_changed = pyqtSignal(str)
+    # "Start charge monitor" one-click macro request (handled by ChargeWidget).
+    start_monitor_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -670,15 +783,18 @@ class AnalysisTab(QWidget):
         self._cal_drive_amp = 0.0    # A_cal: drive Vpp the calibration was taken at (0=unknown)
         self._meas_drive_amp = 0.0   # A_now: current actual drive Vpp (0=unknown)
         self._sr530_provider = None  # callable() -> shared SR530Controller (Lock-In tab), or None
+        self._autoranger = AutoRanger(self)   # SR530 sensitivity auto-ranger
         self._build_ui()
         self._norm_changed.connect(self._set_norm_lbl)
+        self._autoranger.range_changed.connect(self._on_range_changed)
+        self._autoranger.status.connect(self._set_status)
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        from PyQt5.QtWidgets import QComboBox, QStackedWidget
+        from PyQt5.QtWidgets import QComboBox, QStackedWidget, QCheckBox
 
         outer = QVBoxLayout(self)
         outer.setSpacing(8)
@@ -908,6 +1024,42 @@ class AnalysisTab(QWidget):
 
         outer.addLayout(btn_row)
 
+        # --- One-click "start charge monitor" macro ---
+        macro_row = QHBoxLayout()
+        self._start_monitor_btn = QPushButton("▶ Start charge monitor")
+        self._start_monitor_btn.setMinimumWidth(220)
+        self._start_monitor_btn.setStyleSheet(
+            "font-weight: bold; background-color: #2E7D32; color: white; padding: 6px;")
+        self._start_monitor_btn.setToolTip(
+            "One click: connect everything, drive Y at 100 Hz / 8 Vpp, start the "
+            "lock-in (SR530 direct), and auto-range the sensitivity.")
+        self._start_monitor_btn.clicked.connect(self.start_monitor_requested)
+        macro_row.addWidget(self._start_monitor_btn)
+        macro_row.addStretch()
+        outer.addLayout(macro_row)
+
+        # --- Lock-in sensitivity / auto-range ---
+        ar_grp = QGroupBox("Lock-in sensitivity")
+        arg = QHBoxLayout(ar_grp)
+        arg.addWidget(QLabel("Range:"))
+        self._range_lbl = QLabel("—")
+        self._range_lbl.setStyleSheet("color: gray; font-weight: bold;")
+        arg.addWidget(self._range_lbl)
+        arg.addStretch()
+        self._autorange_now_btn = QPushButton("Auto-range now")
+        self._autorange_now_btn.setToolTip(
+            "Run one auto-range pass: step the sensitivity to the most sensitive "
+            "range that doesn't overload.")
+        self._autorange_now_btn.clicked.connect(self._on_autorange_now)
+        arg.addWidget(self._autorange_now_btn)
+        self._autorange_cb = QCheckBox("Auto-range (continuous)")
+        self._autorange_cb.setToolTip(
+            "When on, re-evaluate the range on every read cycle (off the GUI "
+            "thread) and step it on overload / excess headroom.")
+        self._autorange_cb.toggled.connect(self._on_autorange_toggled)
+        arg.addWidget(self._autorange_cb)
+        outer.addWidget(ar_grp)
+
         # Drive-amplitude normalization readout
         self._norm_lbl = QLabel("drive-amplitude normalization: off")
         self._norm_lbl.setStyleSheet("color: gray; font-size: 11px;")
@@ -1056,11 +1208,41 @@ class AnalysisTab(QWidget):
         this from the actuation thread; the label update is marshalled to the
         GUI thread via a signal.
         """
+        prev = self._meas_drive_amp
         try:
             self._meas_drive_amp = float(amp) if amp and amp > 0 else 0.0
         except (TypeError, ValueError):
             self._meas_drive_amp = 0.0
         self._recompute_drive_scale()
+        # A meaningful drive-amplitude change (e.g. the setback parking/restoring
+        # the drive during a control loop) shifts the lock-in signal level, so
+        # re-range once.  Runs on the poll thread; safe to request from here.
+        if (self._source is not None
+                and abs(self._meas_drive_amp - prev) > 0.01):
+            self._autoranger.request_oneshot()
+
+    # ------------------------------------------------------------------
+    # Auto-range (SR530 sensitivity)
+    # ------------------------------------------------------------------
+
+    def request_autorange(self) -> None:
+        """Trigger a one-shot auto-range (used by the start-charge-monitor
+        macro and on the control clicks via the drive-amplitude change)."""
+        self._autoranger.request_oneshot()
+
+    def _on_autorange_now(self):
+        self._autoranger.request_oneshot()
+        if self._source is None:
+            self._set_status("Auto-range will run once monitoring is started")
+
+    def _on_autorange_toggled(self, on: bool):
+        self._autoranger.set_continuous(on)
+
+    def _on_range_changed(self, idx: int, label: str):
+        self._range_lbl.setText(label)
+
+    def _set_status(self, msg: str):
+        self._status_lbl.setText(msg)
 
     def set_cal_drive_amp(self, amp: float, source_kind: str) -> None:
         """Set the calibration drive amplitude (Vpp) for a source kind and fill
@@ -1247,6 +1429,7 @@ class AnalysisTab(QWidget):
                 volts_per_electron=vpe,
                 poll_hz=poll_hz,
                 controller=shared,
+                autoranger=self._autoranger,
             )
             self._source.start()
             thread = self._source._thread
@@ -1316,6 +1499,9 @@ class AnalysisTab(QWidget):
             # Show SR530-specific extras when available
             if isinstance(self._source, SR530SerialSource):
                 sens = result.get("sr530_sensitivity", "—")
+                # Keep the grayed auto-range readout in sync with the instrument.
+                if sens and sens != "—":
+                    self._range_lbl.setText(sens)
                 theta = result.get("sr530_theta", None)
                 overloaded = result.get("sr530_overloaded", False)
                 unlocked = result.get("sr530_unlocked", False)

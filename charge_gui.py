@@ -669,6 +669,8 @@ class ChargeWidget(QWidget):
         # "Connect to all" (Connections tab) also connects the lock-in and syncs
         # the reference once the WGs are up.
         self._connections_tab.connect_all_clicked.connect(self._on_connect_all_extra)
+        # "Start charge monitor" (Analysis tab) one-click macro.
+        self._analysis_tab.start_monitor_requested.connect(self._on_start_charge_monitor)
 
         # --- Build tab widget ---
         self._tabs = QTabWidget()
@@ -725,6 +727,32 @@ class ChargeWidget(QWidget):
         mirrors the drive as soon as the drive is output."""
         self._sr530_tab.connect_lockin()
         QTimer.singleShot(4000, self._wg_tab.lockin_ref.sync_reference)
+
+    def _on_start_charge_monitor(self):
+        """One-click 'Start charge monitor': connect everything, then (once the
+        async connects are up) drive Y at 100 Hz / 8 Vpp, start the lock-in
+        (SR530 direct, Y axis), and auto-range the sensitivity."""
+        self._connections_tab._on_connect_all()   # WG/NGE + (wired) SR530 + ref sync
+        QTimer.singleShot(5000, self._finish_start_charge_monitor)
+
+    def _finish_start_charge_monitor(self):
+        # Drive the Y electrode at 100 Hz / 8 Vpp.
+        y = getattr(self._wg_tab, "y_drive", None)
+        if y is not None:
+            try:
+                y._freq.setValue(100.0)
+                y._amp.setValue(8.0)
+                y._apply()
+                y._output_on()
+            except Exception:
+                pass
+        # Start the lock-in charge monitor (Y axis, SR530 direct) + auto-range.
+        at = self._analysis_tab
+        at._axis_combo.setCurrentIndex(1)     # Y
+        at._source_combo.setCurrentIndex(2)   # SR530 direct
+        if at._source is None:
+            at._on_start()
+        at.request_autorange()
 
     def _sync_actuators(self):
         """Wire WaveformControlTab actuators into ChargeController and
