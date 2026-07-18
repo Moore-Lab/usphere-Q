@@ -185,11 +185,19 @@ class PulseRampRunner:
         self.history.append(cyc)
         if met:
             self.done = True
-            return {"fire": None, "off": True, "cycle": cyc, "done": True}
-        # not met: step the width up and fire again next poll
+            return {"fire": None, "off": True, "cycle": cyc, "done": True,
+                    "reason": "met"}
+        # Not met: if the width has reached the max, stop (bounded ramp — with
+        # start == max this fires exactly one pulse then turns off).  Otherwise
+        # step the width up and fire again next poll.
+        if self.width >= self.ramp.max_width_ms:
+            self.done = True
+            return {"fire": None, "off": True, "cycle": cyc, "done": True,
+                    "reason": "maxed"}
         self.width = min(self.width + self.ramp.increment_ms, self.ramp.max_width_ms)
         self.phase = "fire"
-        return {"fire": None, "off": off, "cycle": cyc, "done": False}
+        return {"fire": None, "off": off, "cycle": cyc, "done": False,
+                "reason": None}
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +592,14 @@ class ChargeController(QObject):
         if r["done"]:
             self._pulse_runner = None
             self._filament_pulse_off()
-            if abs(charge - self._target_charge) <= self._tolerance:
+            if r.get("reason") == "maxed":
+                # Ramp reached the max width without meeting the target — stop
+                # (bounded ramp; the filament couldn't get there).
+                self.stop(
+                    f"Filament reached max width "
+                    f"{self._filament_ramp.max_width_ms:.3g} ms — target "
+                    f"{self._target_charge:+.1f} e not reached (charge {charge:+.1f} e)")
+            elif abs(charge - self._target_charge) <= self._tolerance:
                 self._reach_target(charge)
             elif self._policy == "filament":
                 # Forced filament overshot below the band — it can't raise back.

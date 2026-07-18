@@ -4359,7 +4359,7 @@ class WaveformControlTab(QWidget):
         )
         self.filament_power = NGEControlGroup(
             "Filament — Power (NGE)", "filament_power", self.nge_map,
-            default_current_a=3.0,
+            default_current_a=3.0, default_voltage_v=5.0,
         )
         self.filament_ramp = FilamentRampWidget(lambda: self.filament)
         fil_v.addWidget(self.filament)

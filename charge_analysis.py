@@ -689,6 +689,7 @@ class AnalysisTab(QWidget):
         axis_row.addWidget(QLabel("Monitor axis:"))
         self._axis_combo = QComboBox()
         self._axis_combo.addItems(["X", "Y", "Z"])
+        self._axis_combo.setCurrentIndex(1)   # default: Y
         self._axis_combo.setMaximumWidth(80)
         self._axis_combo.setToolTip(
             "Which electrode axis is being driven for this charge measurement.\n"
@@ -707,6 +708,7 @@ class AnalysisTab(QWidget):
             "Lock-in (ESP32 analog)",
             "Lock-in (SR530 direct)",
         ])
+        self._source_combo.setCurrentIndex(2)   # default: Lock-in (SR530 direct)
         self._source_combo.currentIndexChanged.connect(self._on_source_type_changed)
         src_row.addWidget(self._source_combo)
         src_row.addStretch()

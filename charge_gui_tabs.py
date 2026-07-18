@@ -341,7 +341,7 @@ class ControlTab(QWidget):
         self._flash_rate = self._spin(0.001, 1e6, 3, 10.0, " Hz")
         fg.addWidget(self._flash_rate, 0, 1)
         fg.addWidget(QLabel("Control voltage:"), 0, 2, Qt.AlignRight)
-        self._flash_ctrl = self._spin(0.0, 32.0, 3, 0.0, " V")
+        self._flash_ctrl = self._spin(0.0, 32.0, 3, 4.0, " V")
         fg.addWidget(self._flash_ctrl, 0, 3)
         fg.addWidget(QLabel("Raise by:"), 1, 0, Qt.AlignRight)
         self._flash_delta = self._spin(0.0, 1000.0, 1, 0.0, " e")
