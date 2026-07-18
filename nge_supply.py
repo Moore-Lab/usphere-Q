@@ -179,6 +179,17 @@ class NGESupplyController:
             self._clamp(current, I_MIN, I_MAX),
         )
 
+    def set_easyramp(self, channel: int, duration_ms: float,
+                     enabled: bool = True) -> bool:
+        """Configure the EasyRamp soft-start (10–10000 ms).  When enabled the
+        output voltage ramps to a new setpoint over this duration."""
+        if not self.is_connected:
+            return False
+        fn = getattr(self._nge, "set_easyramp", None)
+        if fn is None:
+            return False
+        return fn(channel, self._clamp(duration_ms, 10.0, 10000.0), enabled)
+
     def output_on(self, channel: int) -> bool:
         if not self.is_connected:
             return False

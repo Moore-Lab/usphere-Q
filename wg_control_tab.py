@@ -1853,6 +1853,33 @@ class NGEControlGroup(QGroupBox):
         if nge is not None and nge.is_connected:
             nge.set_voltage(ch, v)
 
+    def set_voltage_live(self, v: float):
+        """Set the output voltage on hardware NOW on a background thread (for the
+        filament power ramp — doesn't block the GUI).  Reflects in the UI too."""
+        nge, ch = self._nge_ch()
+        if nge is None or not nge.is_connected:
+            return
+        self._voltage.setValue(v)              # GUI thread
+        cur = self._current.value()
+
+        def _do():
+            ok = nge.set_channel(ch, v, cur)
+            return bool(ok), (f"CH{ch} → {v:.3f} V" if ok else "set failed")
+        self._run(_do)
+
+    def set_easyramp(self, duration_ms: float, enabled: bool = True):
+        """Enable/disable the NGE EasyRamp soft-start (background thread)."""
+        nge, ch = self._nge_ch()
+        if nge is None or not nge.is_connected:
+            return
+
+        def _do():
+            fn = getattr(nge, "set_easyramp", None)
+            ok = fn(ch, duration_ms, enabled) if fn else False
+            return bool(ok), ("EasyRamp " + ("on" if enabled else "off")
+                              if ok else "EasyRamp unavailable")
+        self._run(_do)
+
     def get_voltage(self) -> float:
         return self._voltage.value()
 
@@ -2019,6 +2046,10 @@ class _FilamentPulser(QThread):
     def fire(self, afg, ch, amp, offset, hi_z, width_ms):
         self._q.put(("fire", (afg, ch, amp, offset, hi_z, float(width_ms))))
 
+    def hold(self, afg, ch, amp, offset, hi_z, freq_hz=1000.0, duty=0.99):
+        """Hold the output HIGH (a ~duty pulse) so the SSR stays closed."""
+        self._q.put(("hold", (afg, ch, amp, offset, hi_z, freq_hz, duty)))
+
     def off(self, afg, ch):
         self._q.put(("off", (afg, ch)))
 
@@ -2043,12 +2074,26 @@ class _FilamentPulser(QThread):
             try:
                 if op == "fire":
                     self._fire(*payload)
+                elif op == "hold":
+                    self._hold(*payload)
                 elif op == "off":
                     afg, ch = payload
                     with _afg_lock(afg):
                         afg.output_off(ch)
             except Exception:
                 pass
+
+    def _hold(self, afg, ch, amp, offset, hi_z, freq_hz, duty):
+        """Hold the SSR closed: a ~duty-cycle pulse (near-DC high)."""
+        period = 1.0 / max(freq_hz, 1e-3)
+        width_s = period * max(0.01, min(0.999, duty))
+        with _afg_lock(afg):
+            (afg.set_load_high_z if hi_z else afg.set_load_50_ohm)(ch)
+            afg.setup_pulse(ch, frequency=freq_hz, amplitude=amp,
+                            offset=offset, width=width_s)
+            afg.output_on(ch)
+        self._key = None          # invalidate the single-pulse setup cache
+        self._cur_width = None
 
     def _fire(self, afg, ch, amp, offset, hi_z, width_ms):
         width_s = max(width_ms, 0.0) * 1e-3
@@ -2183,13 +2228,37 @@ class FilamentAdapter:
         return True
 
     def pulse_off(self) -> bool:
-        """Turn the filament trigger output off (ends the single-pulse window).
-        Non-blocking (ordered through the pulser)."""
+        """Turn the filament trigger output off (ends the single-pulse window /
+        opens the SSR).  Non-blocking (ordered through the pulser)."""
         afg, ch = self._trigger._afg_ch()
         if afg is None:
             return False
         if self._pulser is not None:
             self._pulser.off(afg, ch)
+        return True
+
+    # -- power-ramp mode: hold the SSR closed + ramp the NGE voltage ---------
+
+    def hold_ssr_on(self) -> bool:
+        """Hold the filament trigger HIGH (SSR closed) so the NGE power can be
+        ramped continuously.  Non-blocking (background pulser)."""
+        trig = self._trigger
+        afg, ch = trig._afg_ch()
+        if afg is None:
+            return False
+        hi_z = (trig._imp.currentIndex() == 1)
+        self._ensure_pulser().hold(afg, ch, trig._amp.value(),
+                                   trig._get_offset(), hi_z)
+        return True
+
+    def set_power_voltage(self, v: float) -> bool:
+        """Set the filament power-supply (NGE) voltage now (background thread)."""
+        self._power.set_voltage_live(v)
+        return True
+
+    def set_power_easyramp(self, duration_ms: float, enabled: bool = True) -> bool:
+        """Enable the NGE EasyRamp soft-start for smooth voltage steps."""
+        self._power.set_easyramp(duration_ms, enabled)
         return True
 
     def shutdown(self):
@@ -2227,9 +2296,11 @@ class CycleLog(QTextEdit):
         self._lines.clear(); self._render()
 
     def add(self, cyc):
-        """Append a RampCycle (width, Δq, charge, met)."""
+        """Append a RampCycle (ramped value + unit, Δq, charge, met)."""
+        unit = getattr(cyc, "unit", "ms")
+        tag = "V" if unit == "V" else "w"
         self._lines.append(
-            f"w={cyc.width_ms:6.3g} ms   Δq={cyc.delta_q:+6.2f} e   "
+            f"{tag}={cyc.width_ms:6.3g} {unit:<2}  Δq={cyc.delta_q:+6.2f} e   "
             f"q={cyc.charge:+6.1f} e{'   ✓ target' if cyc.met else ''}"
         )
         self._render()
@@ -2258,39 +2329,81 @@ class FilamentRampConfig(QWidget):
         super().__init__(parent)
         self._build()
 
+    _MODES = [("pulse", "Pulse the SSR (pulse-wait-read)"),
+              ("power", "Ramp the power supply (SSR held on)")]
+
     def _build(self):
         g = QGridLayout(self)
         g.setContentsMargins(0, 0, 0, 0)
 
-        self._enable = QCheckBox("Pulse-width ramp (pulse → wait → read → increment)")
+        self._enable = QCheckBox("Filament ramp")
         self._enable.setToolTip(
-            "Fire one filament pulse, wait N read cycles with the filament off\n"
-            "(clean signal), read the charge, and increment the pulse width until\n"
-            "the target is reached.  Off = the loop uses a fixed heat pulse.")
-        g.addWidget(self._enable, 0, 0, 1, 4)
+            "Ramp the filament until the target/Δq is reached.  Pick the method\n"
+            "with the mode selector; off = the loop uses a fixed heat pulse.")
+        g.addWidget(self._enable, 0, 0, 1, 2)
+        g.addWidget(QLabel("Mode:"), 0, 2, Qt.AlignRight)
+        self._mode = QComboBox()
+        for _, label in self._MODES:
+            self._mode.addItem(label)
+        self._mode.setToolTip(
+            "Pulse: fire one SSR pulse, wait N clean (filament-off) reads, read,\n"
+            "increment the pulse width.  Power: hold the SSR closed and ramp the\n"
+            "NGE filament-power voltage — smoother, may not need the wait.")
+        self._mode.currentIndexChanged.connect(self._on_mode)
+        g.addWidget(self._mode, 0, 3)
 
-        g.addWidget(QLabel("Start width:"), 1, 0, Qt.AlignRight)
+        # -- pulse-mode params --
+        self._pl_start = QLabel("Start width:"); g.addWidget(self._pl_start, 1, 0, Qt.AlignRight)
         self._start = self._spin(0.001, 1e5, 3, 5.0, " ms")
         self._start.setToolTip("Width of the first pulse (SSR minimum ~5 ms).")
         g.addWidget(self._start, 1, 1)
-        g.addWidget(QLabel("Increment:"), 1, 2, Qt.AlignRight)
+        self._pl_inc = QLabel("Increment:"); g.addWidget(self._pl_inc, 1, 2, Qt.AlignRight)
         self._inc = self._spin(0.001, 1e5, 3, 5.0, " ms")
-        self._inc.setToolTip("Added to the pulse width after each read that\n"
-                             "hasn't reached the target.")
         g.addWidget(self._inc, 1, 3)
-
-        g.addWidget(QLabel("Max width:"), 2, 0, Qt.AlignRight)
+        self._pl_max = QLabel("Max width:"); g.addWidget(self._pl_max, 2, 0, Qt.AlignRight)
         self._max = self._spin(0.001, 1e5, 3, 200.0, " ms")
         self._max.setToolTip("Pulse width is clamped here (safety ceiling).")
         g.addWidget(self._max, 2, 1)
-        g.addWidget(QLabel("Timeout cycles:"), 2, 2, Qt.AlignRight)
+
+        # -- power-mode params --
+        self._pw_start = QLabel("Start voltage:"); g.addWidget(self._pw_start, 3, 0, Qt.AlignRight)
+        self._start_v = self._spin(0.0, 32.0, 3, 1.0, " V")
+        self._start_v.setToolTip("Filament power-supply voltage at the first step.")
+        g.addWidget(self._start_v, 3, 1)
+        self._pw_inc = QLabel("Increment:"); g.addWidget(self._pw_inc, 3, 2, Qt.AlignRight)
+        self._inc_v = self._spin(0.001, 32.0, 3, 0.5, " V")
+        g.addWidget(self._inc_v, 3, 3)
+        self._pw_max = QLabel("Max voltage:"); g.addWidget(self._pw_max, 4, 0, Qt.AlignRight)
+        self._max_v = self._spin(0.0, 32.0, 3, 5.0, " V")
+        self._max_v.setToolTip("Power voltage is clamped here (safety ceiling).")
+        g.addWidget(self._max_v, 4, 1)
+        self._pw_er = QLabel("EasyRamp:"); g.addWidget(self._pw_er, 4, 2, Qt.AlignRight)
+        self._easyramp = self._spin(0.0, 10000.0, 0, 0.0, " ms")
+        self._easyramp.setToolTip(
+            "NGE EasyRamp soft-start per voltage step (0 = step jumps; e.g. 500 ms\n"
+            "= each step ramps smoothly).")
+        g.addWidget(self._easyramp, 4, 3)
+
+        # -- shared --
+        g.addWidget(QLabel("Timeout cycles:"), 5, 0, Qt.AlignRight)
         self._cycles = QSpinBox(); self._cycles.setRange(1, 1000)
         self._cycles.setValue(6); self._cycles.setMaximumWidth(100)
         self._cycles.setToolTip(
-            "Read cycles to wait (filament off) before reading.  The effective\n"
-            "firing rate follows from this: e.g. 6 cycles at 30 Hz ≈ 200 ms/pulse.")
-        g.addWidget(self._cycles, 2, 3)
+            "Read cycles to wait before reading.  Pulse mode: the filament is off\n"
+            "during the wait (clean read).  Power mode: a smooth ramp may not need\n"
+            "a wait — set 1 to read every step.")
+        g.addWidget(self._cycles, 5, 1)
         g.setColumnStretch(4, 1)
+        self._on_mode()
+
+    def _on_mode(self, *args):
+        power = self._MODES[self._mode.currentIndex()][0] == "power"
+        for w in (self._pl_start, self._start, self._pl_inc, self._inc,
+                  self._pl_max, self._max):
+            w.setVisible(not power)
+        for w in (self._pw_start, self._start_v, self._pw_inc, self._inc_v,
+                  self._pw_max, self._max_v, self._pw_er, self._easyramp):
+            w.setVisible(power)
 
     @staticmethod
     def _spin(lo, hi, dec, val, suffix):
@@ -2302,31 +2415,50 @@ class FilamentRampConfig(QWidget):
         from charge_control import FilamentRamp
         return FilamentRamp(
             enabled=self._enable.isChecked(),
+            mode=self._MODES[self._mode.currentIndex()][0],
             start_width_ms=self._start.value(),
             increment_ms=self._inc.value(),
             max_width_ms=self._max.value(),
+            start_v=self._start_v.value(),
+            increment_v=self._inc_v.value(),
+            max_v=self._max_v.value(),
+            easyramp_ms=self._easyramp.value(),
             timeout_cycles=self._cycles.value(),
         )
 
     def get_config(self) -> dict:
         return {
             "enabled": self._enable.isChecked(),
+            "mode": self._MODES[self._mode.currentIndex()][0],
             "start_width_ms": self._start.value(),
             "increment_ms": self._inc.value(),
             "max_width_ms": self._max.value(),
+            "start_v": self._start_v.value(),
+            "increment_v": self._inc_v.value(),
+            "max_v": self._max_v.value(),
+            "easyramp_ms": self._easyramp.value(),
             "timeout_cycles": self._cycles.value(),
         }
 
     def restore_config(self, cfg: dict):
         if "enabled" in cfg:
             self._enable.setChecked(bool(cfg["enabled"]))
+        mode = cfg.get("mode")
+        keys = [k for k, _ in self._MODES]
+        if mode in keys:
+            self._mode.setCurrentIndex(keys.index(mode))
         for key, spin in (("start_width_ms", self._start),
                           ("increment_ms", self._inc),
-                          ("max_width_ms", self._max)):
+                          ("max_width_ms", self._max),
+                          ("start_v", self._start_v),
+                          ("increment_v", self._inc_v),
+                          ("max_v", self._max_v),
+                          ("easyramp_ms", self._easyramp)):
             if key in cfg:
                 spin.setValue(float(cfg[key]))
         if "timeout_cycles" in cfg:
             self._cycles.setValue(int(cfg["timeout_cycles"]))
+        self._on_mode()
 
 
 class FilamentRampWidget(QGroupBox):
@@ -2389,7 +2521,13 @@ class FilamentRampWidget(QGroupBox):
         from charge_control import PulseRampRunner
         self._ramp = self._cfg.get_ramp()
         if not self._ramp.enabled:
-            self._status.setText("Tick the pulse-width ramp box first")
+            self._status.setText("Tick the filament-ramp box first")
+            self._status.setStyleSheet("color: #C62828;")
+            return
+        if self._ramp.mode == "power":
+            # This manual runner only drives the SSR trigger — it has no NGE
+            # power handle.  Run the power ramp from the Control tab.
+            self._status.setText("Power mode: run it from the Control tab")
             self._status.setStyleSheet("color: #C62828;")
             return
         fil = self._get_filament()
@@ -2832,6 +2970,20 @@ class DriveSetbackAdapter:
         restore, not here — the ramp keeps parking between pulses)."""
         fn = getattr(self._actuator, "pulse_off", None)
         return fn() if fn else False
+
+    def hold_ssr_on(self):
+        """Power ramp: park the drive (idempotent) then hold the SSR closed."""
+        self._park()
+        fn = getattr(self._actuator, "hold_ssr_on", None)
+        return fn() if fn else False
+
+    def set_power_voltage(self, v):
+        fn = getattr(self._actuator, "set_power_voltage", None)
+        return fn(v) if fn else False
+
+    def set_power_easyramp(self, duration_ms, enabled=True):
+        fn = getattr(self._actuator, "set_power_easyramp", None)
+        return fn(duration_ms, enabled) if fn else False
 
     def park(self):
         """Park the drive low if the setback is enabled (for the ChargeController

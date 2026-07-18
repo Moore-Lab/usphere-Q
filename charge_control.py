@@ -103,25 +103,97 @@ class FilamentRamp:
     Only the pulse WIDTH is ramped (the effective firing rate follows from the
     timeout).  The single pulse is fired hardware-timed via a very-low-frequency
     carrier (one pulse per firing; see ChargeSequencerActuators / FilamentAdapter).
+
+    ALTERNATIVE ``mode="power"``: instead of pulsing the SSR, hold the SSR CLOSED
+    (trigger high) and ramp the filament POWER-SUPPLY voltage from ``start_v`` by
+    ``increment_v`` up to ``max_v``, waiting ``timeout_cycles`` reads between
+    steps.  A smooth power ramp may not kick the sphere the way the pulses do, so
+    the wait may not be needed (set timeout_cycles = 1 to read every step).
     """
     enabled: bool = False
+    mode: str = "pulse"            # "pulse" (SSR pulse-wait-read) | "power" (NGE ramp)
     start_width_ms: float = 5.0    # SSR minimum pulse ~5 ms
     increment_ms: float = 5.0
     max_width_ms: float = 200.0
-    timeout_cycles: int = 6        # read cycles to wait (filament off) before reading
+    # power mode (NGE filament-power voltage ramp, SSR held on)
+    start_v: float = 1.0
+    increment_v: float = 0.5
+    max_v: float = 5.0
+    easyramp_ms: float = 0.0       # NGE EasyRamp per-step soft-start (0 = step jumps)
+    timeout_cycles: int = 6        # read cycles to wait before reading
 
 
 @dataclass
 class RampCycle:
-    """One diagnostic record: charge change over one read cycle.  For the
-    filament ramp: a pulse of ``width_ms`` fired, then the charge read after the
-    wait.  For the flash lamp: ``width_ms`` is 0 and ``delta_q`` is the charge
-    removed since the previous logged read."""
+    """One diagnostic record: charge change over one read cycle.  ``width_ms`` is
+    the ramped value at this read — a pulse width (``unit="ms"``), a power-supply
+    voltage (``unit="V"``), or 0 for the flash lamp; ``delta_q`` is the charge
+    change since the previous logged read."""
     width_ms: float
     delta_q: float                 # charge change since the previous read cycle
     charge: float                  # charge at this read
     met: bool                      # did the stop condition trip at this read?
     device: str = "filament"       # "filament" | "flash"
+    unit: str = "ms"               # "ms" (pulse width) | "V" (power voltage)
+
+
+class PowerRampRunner:
+    """
+    Poll-driven state machine for the ALTERNATIVE filament ramp: hold the SSR
+    closed and ramp the filament power-supply VOLTAGE instead of pulsing.
+
+    ``step(charge)`` (called every poll) sets the voltage from ``start_v`` by
+    ``increment_v`` up to ``max_v``, waits ``timeout_cycles`` reads between
+    steps, then reads and evaluates the stop condition.  The filament is heated
+    continuously (no off between steps), so this trades the pulse ramp's clean
+    reads for a gentler, non-kicking ramp — the caller decides which is better.
+
+    Returns {set_voltage: v|None, cycle: RampCycle|None, done: bool, reason}.
+    """
+
+    def __init__(self, ramp: FilamentRamp, condition, now_fn=time.time):
+        self.ramp = ramp
+        self.condition = condition
+        self._now = now_fn
+        self.voltage = ramp.start_v
+        self.phase = "set"         # set | wait | done
+        self.cycle = 0
+        self.last_read = None
+        self.history: "deque[RampCycle]" = deque(maxlen=8)
+        self.done = False
+
+    def step(self, charge: float) -> dict:
+        if self.done:
+            return {"set_voltage": None, "cycle": None, "done": True, "reason": None}
+        if self.last_read is None:
+            self.last_read = charge
+
+        if self.phase == "set":
+            self.cycle = 0
+            self.phase = "wait"
+            return {"set_voltage": self.voltage, "cycle": None, "done": False,
+                    "reason": None}
+
+        # wait phase
+        self.cycle += 1
+        if self.cycle < max(1, self.ramp.timeout_cycles):
+            return {"set_voltage": None, "cycle": None, "done": False, "reason": None}
+
+        # read + evaluate
+        delta = charge - self.last_read
+        self.last_read = charge
+        met = bool(self.condition(charge))
+        cyc = RampCycle(self.voltage, delta, charge, met, device="filament", unit="V")
+        self.history.append(cyc)
+        if met:
+            self.done = True
+            return {"set_voltage": None, "cycle": cyc, "done": True, "reason": "met"}
+        if self.voltage >= self.ramp.max_v:
+            self.done = True
+            return {"set_voltage": None, "cycle": cyc, "done": True, "reason": "maxed"}
+        self.voltage = min(self.voltage + self.ramp.increment_v, self.ramp.max_v)
+        self.phase = "set"
+        return {"set_voltage": None, "cycle": cyc, "done": False, "reason": None}
 
 
 class PulseRampRunner:
@@ -596,61 +668,86 @@ class ChargeController(QObject):
     # Filament (pulse-wait-read ramp)
     # ------------------------------------------------------------------
 
+    def _filament_condition(self):
+        """Stop condition for the filament ramp (shared by both modes)."""
+        if self._mode == "change":
+            return self._goal_met            # |Δq| >= amount, either direction
+        tgt, tol = self._target_charge, self._tolerance
+        return lambda q: q <= tgt + tol      # filament lowers to the target band
+
     def _start_pulse_ramp(self, charge: float):
-        """Begin the pulse-wait-read filament ramp (lower −)."""
+        """Begin the filament ramp — pulse-wait-read (SSR pulses) or the
+        alternative power ramp (SSR held on, NGE voltage ramped)."""
         if self._filament is None or not getattr(self._filament, "is_connected", False):
             self.action_changed.emit("Filament not connected!")
             return
+        ramp = self._filament_ramp
+        cond = self._filament_condition()
+        if ramp.mode == "power":
+            if not hasattr(self._filament, "hold_ssr_on"):
+                self.action_changed.emit("Filament actuator has no power-ramp support")
+                return
+            self._park_setback()
+            try:
+                if ramp.easyramp_ms > 0 and hasattr(self._filament, "set_power_easyramp"):
+                    self._filament.set_power_easyramp(ramp.easyramp_ms, True)
+                self._filament.hold_ssr_on()   # close the SSR (trigger held high)
+            except Exception as e:
+                self.action_changed.emit(f"Filament error: {e}")
+                return
+            self._pulse_runner = PowerRampRunner(ramp, condition=cond)
+            self._current_action = Action.HEAT
+            self.action_changed.emit(
+                f"Ramping filament POWER (SSR on) — start {ramp.start_v:.3g} V, "
+                f"+{ramp.increment_v:.3g} V → {ramp.max_v:.3g} V, "
+                f"{ramp.timeout_cycles} cycles/read")
+            return
+        # Pulse-wait-read mode.
         if not hasattr(self._filament, "fire_pulse"):
             self.action_changed.emit("Filament actuator has no pulse support")
             return
         self._park_setback()
-        if self._mode == "change":
-            # Stop once the charge has moved by the requested amount (either way).
-            self._pulse_runner = PulseRampRunner(
-                self._filament_ramp, condition=self._goal_met)
-        else:
-            tgt, tol = self._target_charge, self._tolerance
-            # Filament lowers the charge; stop once it reaches the target band.
-            self._pulse_runner = PulseRampRunner(
-                self._filament_ramp, condition=lambda q: q <= tgt + tol)
+        self._pulse_runner = PulseRampRunner(ramp, condition=cond)
         self._current_action = Action.HEAT
         self.action_changed.emit(
             f"Ramping filament (lower −) — "
-            f"start {self._filament_ramp.start_width_ms:.3g} ms, "
-            f"{self._filament_ramp.timeout_cycles} cycles/read")
+            f"start {ramp.start_width_ms:.3g} ms, "
+            f"{ramp.timeout_cycles} cycles/read")
 
     def _run_pulse_ramp(self, charge: float):
-        """Advance the active pulse-wait-read runner by one poll and carry out
-        its requested actions (fire a pulse / turn the output off / log a read)."""
+        """Advance the active filament runner (pulse or power) by one poll and
+        carry out its requested actions."""
         runner = self._pulse_runner
         if runner is None:
             return
         r = runner.step(charge)
-        if r["off"]:
+        if r.get("off"):
             self._filament_pulse_off()
-        if r["fire"] is not None:
+        if r.get("fire") is not None:
             self._filament_fire_pulse(r["fire"], charge)
-        cyc = r["cycle"]
+        if r.get("set_voltage") is not None:
+            self._filament_set_power(r["set_voltage"], charge)
+        cyc = r.get("cycle")
         if cyc is not None:
             self._log_event(
                 charge, Action.HEAT,
-                f"read width={cyc.width_ms:.3g} ms  Δq={cyc.delta_q:+.2f} e  "
+                f"read {cyc.width_ms:.3g} {cyc.unit}  Δq={cyc.delta_q:+.2f} e  "
                 f"charge={cyc.charge:+.1f} e",
             )
             self.cycle_logged.emit(cyc)
-        if r["done"]:
+        if r.get("done"):
             self._pulse_runner = None
             self._filament_pulse_off()
             if self._goal_met(charge):
                 self._reach_goal(charge)
             elif r.get("reason") == "maxed":
-                # Ramp reached the max width without meeting the goal — stop
-                # (bounded ramp; the filament couldn't get there).
-                self.stop(
-                    f"Filament reached max width "
-                    f"{self._filament_ramp.max_width_ms:.3g} ms — goal not "
-                    f"reached (charge {charge:+.1f} e)")
+                # Ramp maxed out without meeting the goal — stop (bounded ramp).
+                if self._filament_ramp.mode == "power":
+                    lim = f"max power {self._filament_ramp.max_v:.3g} V"
+                else:
+                    lim = f"max width {self._filament_ramp.max_width_ms:.3g} ms"
+                self.stop(f"Filament reached {lim} — goal not reached "
+                          f"(charge {charge:+.1f} e)")
             elif self._mode == "target" and self._policy == "filament":
                 # Forced filament overshot below the band — it can't raise back.
                 self.stop(f"Overshot: {charge:+.1f} e below target "
@@ -684,13 +781,27 @@ class ChargeController(QObject):
         )
 
     def _filament_pulse_off(self):
-        """Turn the filament pulse output off (idempotent)."""
+        """Turn the filament trigger output off (opens the SSR; idempotent)."""
         off = getattr(self._filament, "pulse_off", None) if self._filament is not None else None
         if off is not None:
             try:
                 off()
             except Exception:
                 pass
+
+    def _filament_set_power(self, voltage: float, charge: float):
+        """Set the filament power-supply voltage (power-ramp mode)."""
+        fn = getattr(self._filament, "set_power_voltage", None) if self._filament is not None else None
+        if fn is None:
+            self.action_changed.emit("Filament actuator has no power support")
+            return
+        try:
+            fn(voltage)
+        except Exception as e:
+            self.action_changed.emit(f"Filament error: {e}")
+            return
+        self.action_changed.emit(
+            f"Filament power {voltage:.3g} V — charge {charge:+.1f} e")
 
     # ------------------------------------------------------------------
     # Target reached / actuator + setback helpers
