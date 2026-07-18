@@ -2609,14 +2609,39 @@ class DriveSetbackAdapter:
         """Ramp support: park the drive (like enable) on the first pulse of a
         heating session, then program the filament pulse.  Reduce is idempotent,
         so subsequent ramp steps only reprogram the pulse."""
+        self._park()
+        fn = getattr(self._actuator, "set_pulse", None)
+        return fn(freq_hz, width_ms) if fn else False
+
+    def fire_pulse(self, width_ms: float):
+        """Pulse-wait-read ramp: park the drive (idempotent) then fire one
+        hardware-timed filament pulse via the wrapped actuator."""
+        self._park()
+        fn = getattr(self._actuator, "fire_pulse", None)
+        return fn(width_ms) if fn else False
+
+    def pulse_off(self):
+        """Turn the filament pulse output off (the drive is restored on disable/
+        restore, not here — the ramp keeps parking between pulses)."""
+        fn = getattr(self._actuator, "pulse_off", None)
+        return fn() if fn else False
+
+    def park(self):
+        """Park the drive low if the setback is enabled (for the ChargeController
+        to call around flash actuation too).  Idempotent."""
+        self._park()
+
+    def restore(self):
+        """Restore the drive to the measurement setpoint.  Idempotent."""
+        self._restore()
+
+    def _park(self):
         try:
             params = self._get_params() or {}
         except Exception:
             params = {}
         if params.get("enabled"):
             self._reduce(float(params.get("charging_vpp", 0.0)))
-        fn = getattr(self._actuator, "set_pulse", None)
-        return fn(freq_hz, width_ms) if fn else False
 
     def effective_amplitude(self):
         """Current actual drive amplitude (Vpp): the charging value while

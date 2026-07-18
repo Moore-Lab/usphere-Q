@@ -24,17 +24,15 @@ Charge state:
                                 push a new charge measurement into the
                                 controller (from external source / lock-in)
 
-Controller:
-    start_control               enable the bang-bang loop
+Controller (direction-based: flash raises +, filament lowers −):
+    start_control               enable the control loop
     stop_control                disable the loop + turn off actuators
-    set_target     charge_e [tolerance]
-    set_timing     [flash_duration_s] [heat_duration_s] [settle_time_s]
+    set_target      charge_e [tolerance]
+    set_policy      policy          auto | flash | filament
+    set_timeout     timeout_s       safety stop if target not reached
+    set_flash_params [rate_hz] [control_v]
     get_config                  → full controller config dict
     get_status                  → controller status dict
-
-Rules:
-    add_rule    lower upper target_charge [tolerance] [name]
-    clear_rules
 
 Actuators (manual / test):
     flash        [duration_s]   fire flash lamp immediately
@@ -207,13 +205,22 @@ class QServer(ModuleServer):
                 )
             return {"status": "ok"}
 
-        if cmd == "set_timing":
-            kwargs = {}
-            for k in ("flash_duration_s", "heat_duration_s", "settle_time_s"):
-                if k in args:
-                    kwargs[k] = float(args[k])
+        if cmd == "set_policy":
             with self._lock:
-                self._controller.set_timing(**kwargs)
+                self._controller.set_policy(str(args.get("policy", "auto")))
+            return {"status": "ok"}
+
+        if cmd == "set_timeout":
+            with self._lock:
+                self._controller.set_timeout(float(args["timeout_s"]))
+            return {"status": "ok"}
+
+        if cmd == "set_flash_params":
+            with self._lock:
+                self._controller.set_flash_params(
+                    rate_hz=float(args["rate_hz"]) if "rate_hz" in args else None,
+                    control_v=float(args["control_v"]) if "control_v" in args else None,
+                )
             return {"status": "ok"}
 
         if cmd == "get_config":
@@ -226,22 +233,9 @@ class QServer(ModuleServer):
                 status = self._controller.get_status()
             return {"status": "ok", "data": status}
 
-        # ---- Threshold rules ----
-        if cmd == "add_rule":
-            with self._lock:
-                rule = self._controller.add_threshold_rule(
-                    lower=float(args["lower"]),
-                    upper=float(args["upper"]),
-                    target_charge=float(args["target_charge"]),
-                    tolerance=float(args.get("tolerance", 0.5)),
-                    name=args.get("name", ""),
-                )
-            return {"status": "ok", "data": {"name": rule.name}}
-
-        if cmd == "clear_rules":
-            with self._lock:
-                self._controller.clear_rules()
-            return {"status": "ok"}
+        # Threshold rules were removed in the direction-based redesign; the
+        # controller now uses set_policy/set_timeout/set_flash_params (above).
+        # 'add_rule'/'clear_rules' fall through to the unknown-command reply.
 
         # ---- Manual actuator commands (for testing) ----
         if cmd == "flash":

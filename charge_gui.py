@@ -588,6 +588,10 @@ class ChargeWidget(QWidget):
             get_params=self._control_tab.get_setback_params,
             on_drive_amp=self._analysis_tab.set_current_drive_amp,
         )
+        # The controller parks the drive for BOTH tools: the filament (wrapped
+        # actuator, below) parks on its own pulses; for the flash the controller
+        # calls this same setback's park()/restore() around actuation.
+        self._charge_ctrl.set_drive_setback(self._drive_setback)
         # Calibrations record the drive amplitude in use (the effective drive
         # amplitude of the monitored axis).
         self._calibration_tab._drive_amp_provider = (

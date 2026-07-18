@@ -38,7 +38,7 @@ from PyQt5.QtWidgets import (
     QFileDialog,
 )
 
-from charge_control import ChargeController, ControlEvent, Action, ThresholdRule
+from charge_control import ChargeController, ControlEvent, Action
 
 
 # ======================================================================
@@ -281,11 +281,19 @@ class WaveformGenTab(QWidget):
 
 class ControlTab(QWidget):
     """
-    GUI for the charge control loop.
+    Charge control loop UI (wraps charge_control.ChargeController).
 
-    Wraps a ChargeController instance.  The controller's actuators come
-    from the Connections tab; the charge measurements come from the
-    Analysis tab's source.
+    Three ways to move the charge, all sharing one controller (one runs at a
+    time):
+      • Flash lamp — raise charge (+); continuous, stops at the target.
+      • Filament   — lower charge (−); pulse-wait-read ramp (reads are clean
+        because the filament is off during the wait).
+      • Go to target — auto-picks flash (below target) or filament (above), to
+        a target ± tolerance, with a safety timeout.
+
+    A drive setback (optional) parks the electrode drive low while either tool
+    runs, so a highly-charged sphere isn't over-driven.  Gray diagnostics show
+    what it's doing and the per-read Δq for each tool.
     """
 
     def __init__(self, controller: ChargeController, parent=None):
@@ -294,354 +302,264 @@ class ControlTab(QWidget):
         self._build_ui()
         self._ctrl.action_changed.connect(self._on_action_changed)
         self._ctrl.event_logged.connect(self._on_event_logged)
-        self._ctrl.target_reached.connect(self._on_target_reached)
+        self._ctrl.cycle_logged.connect(self._on_cycle_logged)
+        self._ctrl.stopped.connect(self._on_stopped)
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _spin(lo, hi, dec, val, suffix):
+        s = QDoubleSpinBox()
+        s.setRange(lo, hi)
+        s.setDecimals(dec)
+        s.setValue(val)
+        s.setSuffix(suffix)
+        s.setMaximumWidth(110)
+        return s
 
     def _build_ui(self):
+        from wg_control_tab import FilamentRampConfig, CycleLog
+
         outer = QVBoxLayout(self)
         outer.setSpacing(8)
         outer.setContentsMargins(6, 6, 6, 6)
 
-        # --- Target ---
-        target_grp = QGroupBox("Target charge state")
-        tg = QGridLayout(target_grp)
-        tg.setColumnStretch(1, 1)
+        intro = QLabel(
+            "Change the sphere's charge with the flash lamp (raises +) or the "
+            "filament (lowers −), or set a target and let it pick the tool. Only "
+            "one runs at a time; Cancel turns the outputs off.")
+        intro.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
 
-        tg.addWidget(QLabel("Target (e):"), 0, 0)
-        self._target_spin = QDoubleSpinBox()
-        self._target_spin.setRange(-100, 100)
-        self._target_spin.setDecimals(1)
-        self._target_spin.setValue(0.0)
-        self._target_spin.setMaximumWidth(100)
+        # --- Flash lamp -----------------------------------------------------
+        flash_grp = QGroupBox("Flash lamp — raise charge (+)")
+        fg = QGridLayout(flash_grp)
+        fg.addWidget(QLabel("Flash rate:"), 0, 0, Qt.AlignRight)
+        self._flash_rate = self._spin(0.001, 1e6, 3, 10.0, " Hz")
+        fg.addWidget(self._flash_rate, 0, 1)
+        fg.addWidget(QLabel("Control voltage:"), 0, 2, Qt.AlignRight)
+        self._flash_ctrl = self._spin(0.0, 32.0, 3, 0.0, " V")
+        fg.addWidget(self._flash_ctrl, 0, 3)
+        fg.addWidget(QLabel("Raise by:"), 1, 0, Qt.AlignRight)
+        self._flash_delta = self._spin(0.0, 1000.0, 1, 0.0, " e")
+        self._flash_delta.setToolTip("Raise the charge by this many e, then stop.\n"
+                                     "0 = flash until you press Cancel (or timeout).")
+        fg.addWidget(self._flash_delta, 1, 1)
+        self._flash_btn = QPushButton("Flash (raise +)")
+        self._flash_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        self._flash_btn.clicked.connect(self._on_flash)
+        fg.addWidget(self._flash_btn, 1, 3)
+        fg.setColumnStretch(4, 1)
+        outer.addWidget(flash_grp)
+
+        # --- Filament -------------------------------------------------------
+        fil_grp = QGroupBox("Filament — lower charge (−)")
+        flg = QVBoxLayout(fil_grp)
+        note = QLabel(
+            "Fires one pulse, waits N read cycles with the filament off (clean "
+            "signal), reads, and increments the pulse width until the target — "
+            "immune to the filament noise.")
+        note.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+        note.setWordWrap(True)
+        flg.addWidget(note)
+        self._ramp_config = FilamentRampConfig()
+        # This panel IS the pulse-wait-read loop, so the enable box is implicit.
+        self._ramp_config._enable.setChecked(True)
+        self._ramp_config._enable.setVisible(False)
+        flg.addWidget(self._ramp_config)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Lower by:"))
+        self._fil_delta = self._spin(0.0, 1000.0, 1, 0.0, " e")
+        self._fil_delta.setToolTip("Lower the charge by this many e, then stop.\n"
+                                   "0 = ramp until you press Cancel (or timeout).")
+        row.addWidget(self._fil_delta)
+        row.addStretch()
+        self._fil_btn = QPushButton("Ramp filament (lower −)")
+        self._fil_btn.setStyleSheet("background-color: #4CAF50; color: white;")
+        self._fil_btn.clicked.connect(self._on_filament)
+        row.addWidget(self._fil_btn)
+        flg.addLayout(row)
+        flg.addWidget(QLabel("Cycle history — pulse width · Δq added since last read:"))
+        self._ramp_log = CycleLog()
+        flg.addWidget(self._ramp_log)
+        outer.addWidget(fil_grp)
+
+        # --- Go to target ---------------------------------------------------
+        tgt_grp = QGroupBox("Go to target (auto — picks flash or filament)")
+        tg = QGridLayout(tgt_grp)
+        tg.addWidget(QLabel("Target:"), 0, 0, Qt.AlignRight)
+        self._target_spin = self._spin(-1000.0, 1000.0, 1, 0.0, " e")
         tg.addWidget(self._target_spin, 0, 1)
-
-        tg.addWidget(QLabel("Tolerance (e):"), 0, 2)
-        self._tol_spin = QDoubleSpinBox()
-        self._tol_spin.setRange(0.1, 10.0)
-        self._tol_spin.setDecimals(1)
-        self._tol_spin.setValue(0.5)
-        self._tol_spin.setMaximumWidth(80)
+        tg.addWidget(QLabel("Tolerance:"), 0, 2, Qt.AlignRight)
+        self._tol_spin = self._spin(0.1, 100.0, 1, 0.5, " e")
         tg.addWidget(self._tol_spin, 0, 3)
+        tg.addWidget(QLabel("Safety timeout:"), 0, 4, Qt.AlignRight)
+        self._timeout_spin = self._spin(0.1, 600.0, 1, 10.0, " min")
+        self._timeout_spin.setToolTip("Stop if the target isn't reached within this long.")
+        tg.addWidget(self._timeout_spin, 0, 5)
+        self._target_btn = QPushButton("Go to target")
+        self._target_btn.setStyleSheet("background-color: #2196F3; color: white;")
+        self._target_btn.clicked.connect(self._on_target)
+        tg.addWidget(self._target_btn, 1, 5)
+        tg.setColumnStretch(6, 1)
+        outer.addWidget(tgt_grp)
 
-        set_target_btn = QPushButton("Set target")
-        set_target_btn.setMaximumWidth(100)
-        set_target_btn.clicked.connect(self._on_set_target)
-        tg.addWidget(set_target_btn, 0, 4)
-        outer.addWidget(target_grp)
-
-        # --- Timing ---
-        timing_grp = QGroupBox("Timing parameters")
-        tmg = QGridLayout(timing_grp)
-
-        tmg.addWidget(QLabel("Flash duration (s):"), 0, 0)
-        self._flash_dur = QDoubleSpinBox()
-        self._flash_dur.setRange(0.1, 30.0)
-        self._flash_dur.setDecimals(1)
-        self._flash_dur.setValue(2.0)
-        self._flash_dur.setMaximumWidth(80)
-        tmg.addWidget(self._flash_dur, 0, 1)
-
-        tmg.addWidget(QLabel("Heat duration (s):"), 0, 2)
-        self._heat_dur = QDoubleSpinBox()
-        self._heat_dur.setRange(0.1, 30.0)
-        self._heat_dur.setDecimals(1)
-        self._heat_dur.setValue(3.0)
-        self._heat_dur.setMaximumWidth(80)
-        tmg.addWidget(self._heat_dur, 0, 3)
-
-        tmg.addWidget(QLabel("Settle time (s):"), 0, 4)
-        self._settle_dur = QDoubleSpinBox()
-        self._settle_dur.setRange(0.5, 30.0)
-        self._settle_dur.setDecimals(1)
-        self._settle_dur.setValue(2.0)
-        self._settle_dur.setMaximumWidth(80)
-        tmg.addWidget(self._settle_dur, 0, 5)
-
-        apply_timing_btn = QPushButton("Apply timing")
-        apply_timing_btn.setMaximumWidth(100)
-        apply_timing_btn.clicked.connect(self._on_apply_timing)
-        tmg.addWidget(apply_timing_btn, 0, 6)
-        outer.addWidget(timing_grp)
-
-        # --- Drive setback while charging ---
-        sb_grp = QGroupBox("Drive setback while charging")
+        # --- Drive setback (applies to both tools) --------------------------
+        sb_grp = QGroupBox("Drive setback while charging (flash or filament)")
         sbg = QGridLayout(sb_grp)
-
-        self._setback_cb = QCheckBox(
-            "Reduce electrode drive while the filament is on"
-        )
+        self._setback_cb = QCheckBox("Reduce the electrode drive while charging")
         self._setback_cb.setToolTip(
-            "Before the filament turns on, the monitored axis' drive tone is\n"
-            "dropped to the charging amplitude (better for a highly charged\n"
-            "sphere); it is restored right after the filament turns off.\n"
-            "The amplitude in the Electrodes tab stays the measurement\n"
-            "setpoint, and charge readings taken while reduced are\n"
-            "renormalized automatically, so the reported charge is unchanged."
-        )
+            "Park the monitored axis' drive low while flashing/heating so a\n"
+            "highly-charged sphere isn't over-driven; restored right after.\n"
+            "Charge readings stay normalized, so the reported charge is unchanged.")
         sbg.addWidget(self._setback_cb, 0, 0, 1, 2)
-
-        sbg.addWidget(QLabel("Charging amplitude (Vpp):"), 1, 0)
-        self._setback_amp = QDoubleSpinBox()
-        self._setback_amp.setRange(0.001, 20.0)
-        self._setback_amp.setDecimals(3)
-        self._setback_amp.setValue(0.100)
-        self._setback_amp.setMaximumWidth(90)
+        sbg.addWidget(QLabel("Charging amplitude:"), 1, 0, Qt.AlignRight)
+        self._setback_amp = self._spin(0.001, 20.0, 3, 0.100, " Vpp")
         sbg.addWidget(self._setback_amp, 1, 1)
         sbg.setColumnStretch(2, 1)
         outer.addWidget(sb_grp)
 
-        # --- Filament ramp (pulse-wait-read heating) ---
-        from wg_control_tab import FilamentRampConfig, CycleLog
-        ramp_grp = QGroupBox("Filament ramp (pulse → wait → read → increment)")
-        rag = QVBoxLayout(ramp_grp)
-        note = QLabel(
-            "The filament runs away and makes the lock-in noisy while it's on, so "
-            "instead of a fixed setting:\nfire ONE pulse, wait N read cycles with "
-            "the filament OFF (clean signal), read the charge, and increment the "
-            "pulse width until the target is reached.")
-        note.setStyleSheet("color: #9E9E9E; font-size: 11px;")
-        rag.addWidget(note)
-        self._ramp_config = FilamentRampConfig()
-        rag.addWidget(self._ramp_config)
-        apply_ramp_btn = QPushButton("Apply ramp")
-        apply_ramp_btn.setMaximumWidth(110)
-        apply_ramp_btn.clicked.connect(self._on_apply_ramp)
-        rag.addWidget(apply_ramp_btn)
-        rag.addWidget(QLabel("Cycle history — pulse width · Δq added since last read:"))
-        self._ramp_log = CycleLog()
-        rag.addWidget(self._ramp_log)
-        self._ctrl.cycle_logged.connect(self._ramp_log.add)
-        outer.addWidget(ramp_grp)
+        # --- Status + Cancel ------------------------------------------------
+        status_row = QHBoxLayout()
+        self._status = QLabel("Idle")
+        self._status.setStyleSheet("color: gray; font-size: 14px; font-weight: bold;")
+        self._status.setWordWrap(True)
+        status_row.addWidget(self._status, 1)
+        self._cancel_btn = QPushButton("Cancel / Stop")
+        self._cancel_btn.setStyleSheet("background-color: #F44336; color: white;")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        status_row.addWidget(self._cancel_btn)
+        outer.addLayout(status_row)
 
-        # --- Flash diagnostics (charge removed per read) ---
-        flash_grp = QGroupBox("Flash — charge removed since last read")
-        flg = QVBoxLayout(flash_grp)
-        fnote = QLabel(
-            "Δq between successive flash actions — same diagnostic as the filament "
-            "ramp: how much the flash removed each cycle.")
-        fnote.setStyleSheet("color: #9E9E9E; font-size: 11px;")
-        flg.addWidget(fnote)
+        # --- Flash diagnostics ----------------------------------------------
+        flash_diag = QGroupBox("Flash — charge added since last read")
+        fdg = QVBoxLayout(flash_diag)
         self._flash_log = CycleLog(empty="(no flashes yet)")
-        flg.addWidget(self._flash_log)
-        self._flash_last_charge = None
-        outer.addWidget(flash_grp)
+        fdg.addWidget(self._flash_log)
+        outer.addWidget(flash_diag)
 
-        # --- Threshold rules ---
-        rules_grp = QGroupBox("Threshold rules")
-        rg = QVBoxLayout(rules_grp)
-
-        # Add-rule row
-        add_row = QHBoxLayout()
-        add_row.addWidget(QLabel("If charge outside ["))
-        self._rule_lower = QDoubleSpinBox()
-        self._rule_lower.setRange(-100, 100)
-        self._rule_lower.setValue(-3.0)
-        self._rule_lower.setMaximumWidth(70)
-        add_row.addWidget(self._rule_lower)
-        add_row.addWidget(QLabel(","))
-        self._rule_upper = QDoubleSpinBox()
-        self._rule_upper.setRange(-100, 100)
-        self._rule_upper.setValue(3.0)
-        self._rule_upper.setMaximumWidth(70)
-        add_row.addWidget(self._rule_upper)
-        add_row.addWidget(QLabel("] → target"))
-        self._rule_target = QDoubleSpinBox()
-        self._rule_target.setRange(-100, 100)
-        self._rule_target.setValue(0.0)
-        self._rule_target.setMaximumWidth(70)
-        add_row.addWidget(self._rule_target)
-        add_row.addWidget(QLabel("± "))
-        self._rule_tol = QDoubleSpinBox()
-        self._rule_tol.setRange(0.1, 10)
-        self._rule_tol.setValue(0.5)
-        self._rule_tol.setMaximumWidth(60)
-        add_row.addWidget(self._rule_tol)
-
-        add_rule_btn = QPushButton("Add rule")
-        add_rule_btn.setMaximumWidth(80)
-        add_rule_btn.clicked.connect(self._on_add_rule)
-        add_row.addWidget(add_rule_btn)
-        add_row.addStretch()
-        rg.addLayout(add_row)
-
-        self._rules_display = QTextEdit()
-        self._rules_display.setReadOnly(True)
-        self._rules_display.setMaximumHeight(80)
-        rg.addWidget(self._rules_display)
-
-        clear_btn = QPushButton("Clear all rules")
-        clear_btn.setMaximumWidth(120)
-        clear_btn.clicked.connect(self._on_clear_rules)
-        rg.addWidget(clear_btn)
-        outer.addWidget(rules_grp)
-
-        # --- Start / Stop ---
-        ctrl_row = QHBoxLayout()
-        self._start_btn = QPushButton("Start control loop")
-        self._start_btn.setMinimumWidth(150)
-        self._start_btn.setStyleSheet("background-color: #4CAF50; color: white;")
-        self._start_btn.clicked.connect(self._on_start)
-        ctrl_row.addWidget(self._start_btn)
-
-        self._stop_btn = QPushButton("Stop")
-        self._stop_btn.setMinimumWidth(80)
-        self._stop_btn.setEnabled(False)
-        self._stop_btn.setStyleSheet("background-color: #F44336; color: white;")
-        self._stop_btn.clicked.connect(self._on_stop)
-        ctrl_row.addWidget(self._stop_btn)
-
-        ctrl_row.addStretch()
-
-        self._action_lbl = QLabel("Idle")
-        self._action_lbl.setStyleSheet(
-            "font-size: 16px; font-weight: bold; color: gray;"
-        )
-        ctrl_row.addWidget(self._action_lbl)
-        outer.addLayout(ctrl_row)
-
-        # --- Event log ---
+        # --- Event log ------------------------------------------------------
         log_grp = QGroupBox("Event log")
         lg = QVBoxLayout(log_grp)
         self._event_log_text = QTextEdit()
         self._event_log_text.setReadOnly(True)
-        self._event_log_text.setMaximumHeight(160)
+        self._event_log_text.setMaximumHeight(120)
         lg.addWidget(self._event_log_text)
         outer.addWidget(log_grp)
 
         outer.addStretch()
 
     # ------------------------------------------------------------------
-    # Actions
+    # Run controls
     # ------------------------------------------------------------------
 
-    def _on_set_target(self):
-        self._ctrl.set_target(
-            self._target_spin.value(),
-            self._tol_spin.value(),
-        )
-        self._action_lbl.setText(
-            f"Target: {self._target_spin.value():+.1f} e "
-            f"(±{self._tol_spin.value():.1f})"
-        )
-        self._action_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: #2196F3;")
+    def _apply_common(self):
+        """Settings applied on every run (safety timeout)."""
+        self._ctrl.set_timeout(self._timeout_spin.value() * 60.0)
 
-    def _on_apply_timing(self):
-        self._ctrl.set_timing(
-            flash_duration_s=self._flash_dur.value(),
-            heat_duration_s=self._heat_dur.value(),
-            settle_time_s=self._settle_dur.value(),
-        )
+    def _on_flash(self):
+        self._apply_common()
+        self._ctrl.set_policy("flash")
+        self._ctrl.set_flash_params(rate_hz=self._flash_rate.value(),
+                                    control_v=self._flash_ctrl.value())
+        delta = self._flash_delta.value()
+        self._ctrl.set_relative_target(delta if delta > 0 else 1e6, tolerance=0.5)
+        self._begin()
 
-    def _on_add_rule(self):
-        self._ctrl.add_threshold_rule(
-            lower=self._rule_lower.value(),
-            upper=self._rule_upper.value(),
-            target_charge=self._rule_target.value(),
-            tolerance=self._rule_tol.value(),
-        )
-        self._refresh_rules()
-
-    def _on_clear_rules(self):
-        self._ctrl.clear_rules()
-        self._refresh_rules()
-
-    def _on_apply_ramp(self):
+    def _on_filament(self):
+        self._apply_common()
+        self._ctrl.set_policy("filament")
         self._ctrl.set_filament_ramp(self._ramp_config.get_ramp())
+        delta = self._fil_delta.value()
+        self._ctrl.set_relative_target(-(delta if delta > 0 else 1e6), tolerance=0.5)
+        self._begin()
 
-    def _refresh_rules(self):
-        rules = self._ctrl.get_rules()
-        if not rules:
-            self._rules_display.setPlainText("No rules defined")
-            return
-        lines = []
-        for i, r in enumerate(rules):
-            lines.append(
-                f"{i+1}. If charge outside [{r.lower:+.1f}, {r.upper:+.1f}] "
-                f"→ go to {r.target_charge:+.1f} ± {r.tolerance:.1f} e"
-                f"  {'[ON]' if r.enabled else '[OFF]'}"
-            )
-        self._rules_display.setPlainText("\n".join(lines))
+    def _on_target(self):
+        self._apply_common()
+        self._ctrl.set_policy("auto")
+        self._ctrl.set_target(self._target_spin.value(), self._tol_spin.value())
+        self._ctrl.set_flash_params(rate_hz=self._flash_rate.value(),
+                                    control_v=self._flash_ctrl.value())
+        self._ctrl.set_filament_ramp(self._ramp_config.get_ramp())
+        self._begin()
 
-    def _on_start(self):
-        self._on_set_target()
-        self._on_apply_timing()
-        self._on_apply_ramp()
+    def _begin(self):
         self._ramp_log.clear()
         self._flash_log.clear()
-        self._flash_last_charge = None
+        for b in (self._flash_btn, self._fil_btn, self._target_btn):
+            b.setEnabled(False)
+        self._cancel_btn.setEnabled(True)
         self._ctrl.start()
-        self._start_btn.setEnabled(False)
-        self._stop_btn.setEnabled(True)
 
-    def _on_stop(self):
-        self._ctrl.stop()
-        self._start_btn.setEnabled(True)
-        self._stop_btn.setEnabled(False)
-        self._action_lbl.setText("Stopped")
-        self._action_lbl.setStyleSheet("font-size: 16px; font-weight: bold; color: gray;")
+    def _on_cancel(self):
+        self._ctrl.cancel()
+
+    def _on_stopped(self, reason: str):
+        for b in (self._flash_btn, self._fil_btn, self._target_btn):
+            b.setEnabled(True)
+        self._cancel_btn.setEnabled(False)
 
     # ------------------------------------------------------------------
     # Signal handlers
     # ------------------------------------------------------------------
 
     def _on_action_changed(self, msg: str):
-        self._action_lbl.setText(msg)
-        if "SAFETY" in msg or "error" in msg.lower():
-            self._action_lbl.setStyleSheet(
-                "font-size: 16px; font-weight: bold; color: red;"
-            )
-        elif "At target" in msg:
-            self._action_lbl.setStyleSheet(
-                "font-size: 16px; font-weight: bold; color: green;"
-            )
-        elif "Flash" in msg or "Heat" in msg:
-            self._action_lbl.setStyleSheet(
-                "font-size: 16px; font-weight: bold; color: #FF9800;"
-            )
+        self._status.setText(msg)
+        low = msg.lower()
+        if any(k in low for k in ("not connected", "error", "can't", "overshot")):
+            color = "#C62828"
+        elif "reached target" in low:
+            color = "#2E7D32"
+        elif any(k in low for k in ("timeout", "cancel", "stopped")):
+            color = "gray"
+        elif "flashing" in low:
+            color = "#EF6C00"
+        elif "filament" in low or "ramping" in low:
+            color = "#6A1B9A"
         else:
-            self._action_lbl.setStyleSheet(
-                "font-size: 16px; font-weight: bold; color: #2196F3;"
-            )
+            color = "#1565C0"
+        self._status.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
 
     def _on_event_logged(self, event: ControlEvent):
         ts = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
-        line = (
-            f"[{ts}] {event.action.value:10s}  "
-            f"charge={event.charge_e:+.1f}  target={event.target_e:+.1f}  "
-            f"{event.detail}"
-        )
-        self._event_log_text.append(line)
+        self._event_log_text.append(
+            f"[{ts}] {event.action.value:9s}  charge={event.charge_e:+.1f}  "
+            f"target={event.target_e:+.1f}  {event.detail}")
 
-        # Flash diagnostics: Δq removed between successive flash actions.
-        if event.action == Action.FLASH:
-            if self._flash_last_charge is not None:
-                dq = event.charge_e - self._flash_last_charge
-                self._flash_log.add_text(
-                    f"flash        Δq={dq:+6.2f} e   q={event.charge_e:+6.1f} e"
-                )
-            self._flash_last_charge = event.charge_e
-
-    def _on_target_reached(self, charge: float):
-        pass  # Could trigger a notification
+    def _on_cycle_logged(self, cyc):
+        if getattr(cyc, "device", "filament") == "flash":
+            self._flash_log.add(cyc)
+        else:
+            self._ramp_log.add(cyc)
 
     # ------------------------------------------------------------------
-    # Config save / restore
+    # Drive-setback params (read by DriveSetbackAdapter)
     # ------------------------------------------------------------------
 
     def get_setback_params(self) -> dict:
-        """Drive-setback settings, read by DriveSetbackAdapter at filament-on."""
+        """Drive-setback settings, read by DriveSetbackAdapter at charging time."""
         return {
             "enabled": self._setback_cb.isChecked(),
             "charging_vpp": self._setback_amp.value(),
         }
 
+    # ------------------------------------------------------------------
+    # Config save / restore
+    # ------------------------------------------------------------------
+
     def get_config(self) -> dict:
         cfg = self._ctrl.get_config()
-        # Also save widget values
+        cfg["_gui_flash_rate"] = self._flash_rate.value()
+        cfg["_gui_flash_ctrl"] = self._flash_ctrl.value()
+        cfg["_gui_flash_delta"] = self._flash_delta.value()
+        cfg["_gui_fil_delta"] = self._fil_delta.value()
         cfg["_gui_target"] = self._target_spin.value()
         cfg["_gui_tolerance"] = self._tol_spin.value()
-        cfg["_gui_flash_dur"] = self._flash_dur.value()
-        cfg["_gui_heat_dur"] = self._heat_dur.value()
-        cfg["_gui_settle_dur"] = self._settle_dur.value()
+        cfg["_gui_timeout_min"] = self._timeout_spin.value()
         cfg["_gui_setback_enabled"] = self._setback_cb.isChecked()
         cfg["_gui_setback_vpp"] = self._setback_amp.value()
         cfg["_gui_filament_ramp"] = self._ramp_config.get_config()
@@ -649,23 +567,24 @@ class ControlTab(QWidget):
 
     def restore_config(self, cfg: dict):
         self._ctrl.restore_config(cfg)
-        if "_gui_target" in cfg:
-            self._target_spin.setValue(float(cfg["_gui_target"]))
-        if "_gui_tolerance" in cfg:
-            self._tol_spin.setValue(float(cfg["_gui_tolerance"]))
-        if "_gui_flash_dur" in cfg:
-            self._flash_dur.setValue(float(cfg["_gui_flash_dur"]))
-        if "_gui_heat_dur" in cfg:
-            self._heat_dur.setValue(float(cfg["_gui_heat_dur"]))
-        if "_gui_settle_dur" in cfg:
-            self._settle_dur.setValue(float(cfg["_gui_settle_dur"]))
+        setters = {
+            "_gui_flash_rate": self._flash_rate,
+            "_gui_flash_ctrl": self._flash_ctrl,
+            "_gui_flash_delta": self._flash_delta,
+            "_gui_fil_delta": self._fil_delta,
+            "_gui_target": self._target_spin,
+            "_gui_tolerance": self._tol_spin,
+            "_gui_timeout_min": self._timeout_spin,
+            "_gui_setback_vpp": self._setback_amp,
+        }
+        for key, spin in setters.items():
+            if key in cfg:
+                spin.setValue(float(cfg[key]))
         if "_gui_setback_enabled" in cfg:
             self._setback_cb.setChecked(bool(cfg["_gui_setback_enabled"]))
-        if "_gui_setback_vpp" in cfg:
-            self._setback_amp.setValue(float(cfg["_gui_setback_vpp"]))
         if "_gui_filament_ramp" in cfg:
             self._ramp_config.restore_config(cfg["_gui_filament_ramp"])
-        self._refresh_rules()
+            self._ramp_config._enable.setChecked(True)
 
 
 # ======================================================================

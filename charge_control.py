@@ -4,12 +4,17 @@ charge_control.py
 Charge state control engine for usphere-charge.
 
 GUI-independent: all logic lives here.  The GUI (or a headless script)
-creates a ChargeController, wires up a ChargeStateSource, and calls
-set_target() / add_threshold_rule().
+creates a ChargeController, wires up a ChargeStateSource, sets a target (and
+policy), and calls start().
+
+Two tools move the charge in opposite directions:
+    flash lamp  → removes electrons → charge more POSITIVE (raise +)
+    filament    → adds electrons    → charge more NEGATIVE (lower −)
 
 Classes:
-    ChargeController    — bang-bang controller that commands charge state
-    ThresholdRule       — "if charge crosses X, go to target Y"
+    ChargeController    — direction-based controller (flash to raise, filament
+                          to lower) with a device policy + safety timeout
+    PulseRampRunner     — pulse-wait-read filament ramp state machine
     ControlEvent        — timestamped record of every action taken
 
 Typical usage (headless)::
@@ -20,15 +25,12 @@ Typical usage (headless)::
     source = SR530SerialSource("COM5", volts_per_electron=0.003)
     source.start()
 
-    ctrl = ChargeController(
-        source=source,
-        flashlamp=flashlamp_controller,
-        filament=filament_controller,
-    )
-    ctrl.set_target(charge_e=0, tolerance=0.5)
-    ctrl.add_threshold_rule(lower=-3, upper=3, target_charge=0, tolerance=0.5)
+    ctrl = ChargeController(flashlamp=flash, filament=filament)
+    ctrl.set_target(charge_e=-5, tolerance=0.5)     # go to −5 e
+    ctrl.set_policy("auto")                          # pick tool by direction
+    ctrl.set_timeout(600)                            # 10-min safety stop
     ctrl.start()
-    # ... ctrl.stop() when done
+    # ... ctrl.stop() / ctrl.cancel() when done
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +75,9 @@ class ThresholdRule:
     """
     If the measured charge crosses outside [lower, upper],
     command the controller to go to target_charge ± tolerance.
+
+    Kept for backward compatibility (older configs / imports); the current
+    Control tab does not use rules.
     """
     lower: float              # lower bound (electrons)
     upper: float              # upper bound (electrons)
@@ -108,12 +113,15 @@ class FilamentRamp:
 
 @dataclass
 class RampCycle:
-    """One diagnostic record: a pulse fired, then the charge measured after the
-    wait, and how much charge changed since the previous read."""
+    """One diagnostic record: charge change over one read cycle.  For the
+    filament ramp: a pulse of ``width_ms`` fired, then the charge read after the
+    wait.  For the flash lamp: ``width_ms`` is 0 and ``delta_q`` is the charge
+    removed since the previous logged read."""
     width_ms: float
     delta_q: float                 # charge change since the previous read cycle
     charge: float                  # charge at this read
     met: bool                      # did the stop condition trip at this read?
+    device: str = "filament"       # "filament" | "flash"
 
 
 class PulseRampRunner:
@@ -190,30 +198,43 @@ class PulseRampRunner:
 
 class ChargeController(QObject):
     """
-    Bang-bang controller for microsphere charge state.
+    Direction-based charge controller with a device policy.
 
-    Strategy:
-        charge too positive  → flash lamp (UV removes electrons → charge → 0)
-        charge too negative  → also flash lamp (UV photoionises → charge → 0)
-        charge near zero but target is nonzero
-                             → filament adds negative charge
-                                (overshoot past target → flash to come back)
-        at target ± tolerance → do nothing
+    Two tools move the charge in opposite directions:
+        flash lamp  → removes electrons → charge more POSITIVE (raise +)
+        filament    → adds electrons    → charge more NEGATIVE (lower −)
 
-    The controller does NOT directly read the source — it receives
-    charge updates via ``on_charge_update(result_dict)``.  The GUI or
-    script wires the source's signal to this method.
+    To reach a target charge (± tolerance) the controller picks the tool by
+    direction: charge below target → flash to raise it; charge above target →
+    filament to lower it.  The policy can force one tool ("flash"/"filament")
+    for a manual "change charge by this much" run, or "auto" to pick by
+    direction for a "go to target" run.
+
+    Flash is continuous (on until the target is reached, evaluated every read).
+    Filament uses the pulse-wait-read ramp (PulseRampRunner) so reads are taken
+    with the filament off.  A safety timeout stops the loop if the target isn't
+    reached in time.  While actuating, an optional drive setback parks the
+    electrode drive low (protects a highly-charged sphere) for BOTH tools.
+
+    The controller receives charge updates via ``on_charge_update(result)``;
+    the GUI/script wires the source's signal to it.
 
     Actuator protocol:
-        flashlamp.enable()  / flashlamp.disable()
-        filament.enable()   / filament.disable()
+        flashlamp: enable()/disable(), is_connected, arm()/disarm(),
+                   set_flash_rate(hz), set_electrode_voltage(v)
+        filament:  fire_pulse(width_ms)/pulse_off(), is_connected,
+                   arm()/disarm()
+        setback (optional): park()/restore()
     """
 
     # Signals for GUI
-    action_changed = pyqtSignal(str)        # human-readable status
+    action_changed = pyqtSignal(str)        # gray status line
     event_logged = pyqtSignal(object)       # ControlEvent
-    target_reached = pyqtSignal(float)      # charge when target is reached
-    cycle_logged = pyqtSignal(object)       # RampCycle (pulse-ramp diagnostics)
+    target_reached = pyqtSignal(float)      # charge when the target is reached
+    cycle_logged = pyqtSignal(object)       # RampCycle (device-tagged diagnostics)
+    stopped = pyqtSignal(str)               # loop stopped (reason)
+
+    POLICIES = ("auto", "flash", "filament")
 
     def __init__(
         self,
@@ -224,63 +245,79 @@ class ChargeController(QObject):
         super().__init__(parent)
         self._flashlamp = flashlamp
         self._filament = filament
+        self._setback = None                       # optional drive-setback
 
-        # Target
+        # Target / policy
         self._target_charge: float = 0.0
         self._tolerance: float = 0.5
+        self._policy: str = "auto"                 # auto | flash | filament
+        self._timeout_s: float = 600.0             # safety stop (10 min)
+        self._pending_delta: float | None = None   # relative "change by" target
         self._enabled: bool = False
-
-        # Threshold rules
-        self._rules: list[ThresholdRule] = []
 
         # State
         self._current_action = Action.NONE
         self._last_charge: float | None = None
         self._event_log: list[ControlEvent] = []
+        self._start_time: float = 0.0
 
-        # Timing
-        self._flash_duration_s: float = 2.0    # how long to keep flash lamp on
-        self._heat_duration_s: float = 3.0     # how long to keep filament on
-        self._settle_time_s: float = 2.0       # wait after actuation
-        self._action_start: float = 0.0
-        self._settling: bool = False
-        self._settle_start: float = 0.0
+        # Flash lamp (continuous) settings + diagnostics
+        self._flash_rate_hz: float = 10.0
+        self._flash_ctrl_v: float = 0.0
+        self._flash_on: bool = False
+        self._flash_ref_charge: float | None = None   # last logged flash charge
 
-        # Safety: max consecutive actions before pausing
-        self._max_consecutive: int = 20
-        self._consecutive_count: int = 0
-
-        # Filament pulse-wait-read ramp (gentle heating toward a target)
+        # Filament pulse-wait-read ramp
         self._filament_ramp = FilamentRamp()
         self._pulse_runner: PulseRampRunner | None = None
+
+        # Independent safety watchdog: enforces the timeout even if charge
+        # updates stall (e.g. the lock-in source thread dies mid-run), so a
+        # continuous flash / parked drive can't be left on forever.
+        self._watchdog = QTimer(self)
+        self._watchdog.setInterval(1000)
+        self._watchdog.timeout.connect(self._check_timeout)
 
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
 
     def set_target(self, charge_e: float, tolerance: float = 0.5) -> None:
-        """Set the target charge state (in units of electron charges)."""
+        """Set an absolute target charge (electrons) and tolerance."""
         self._target_charge = charge_e
         self._tolerance = tolerance
-        self._consecutive_count = 0
+        self._pending_delta = None
         log.info("Target set: %+.1f e  (±%.1f)", charge_e, tolerance)
+
+    def set_relative_target(self, delta_e: float, tolerance: float = 0.5) -> None:
+        """Target = (charge at start) + delta_e, resolved on the first reading.
+        Used for a manual 'change charge by this much' run."""
+        self._pending_delta = delta_e
+        self._tolerance = tolerance
 
     def get_target(self) -> tuple[float, float]:
         """Return (target_charge, tolerance)."""
         return self._target_charge, self._tolerance
 
-    def set_timing(
-        self,
-        flash_duration_s: float | None = None,
-        heat_duration_s: float | None = None,
-        settle_time_s: float | None = None,
-    ) -> None:
-        if flash_duration_s is not None:
-            self._flash_duration_s = flash_duration_s
-        if heat_duration_s is not None:
-            self._heat_duration_s = heat_duration_s
-        if settle_time_s is not None:
-            self._settle_time_s = settle_time_s
+    def set_policy(self, policy: str) -> None:
+        """'auto' picks flash/filament by direction; 'flash' or 'filament'
+        forces one tool (manual mode)."""
+        self._policy = policy if policy in self.POLICIES else "auto"
+
+    def get_policy(self) -> str:
+        return self._policy
+
+    def set_timeout(self, timeout_s: float) -> None:
+        """Safety timeout: stop if the target isn't reached within this long."""
+        self._timeout_s = max(1.0, float(timeout_s))
+
+    def set_flash_params(self, rate_hz: float | None = None,
+                         control_v: float | None = None) -> None:
+        """Flash-lamp device settings applied when the flash turns on."""
+        if rate_hz is not None:
+            self._flash_rate_hz = float(rate_hz)
+        if control_v is not None:
+            self._flash_ctrl_v = float(control_v)
 
     def set_actuators(self, flashlamp=None, filament=None) -> None:
         """Attach or replace actuator controllers."""
@@ -288,6 +325,11 @@ class ChargeController(QObject):
             self._flashlamp = flashlamp
         if filament is not None:
             self._filament = filament
+
+    def set_drive_setback(self, setback) -> None:
+        """Attach a drive-setback object (park()/restore()) applied around both
+        flash and filament actuation."""
+        self._setback = setback
 
     def set_filament_ramp(self, ramp: FilamentRamp) -> None:
         """Configure the filament pulse-wait-read ramp (see FilamentRamp)."""
@@ -300,63 +342,55 @@ class ChargeController(QObject):
         return self._filament_ramp
 
     # ------------------------------------------------------------------
-    # Threshold rules
-    # ------------------------------------------------------------------
-
-    def add_threshold_rule(
-        self,
-        lower: float,
-        upper: float,
-        target_charge: float,
-        tolerance: float = 0.5,
-        name: str = "",
-    ) -> ThresholdRule:
-        """Add a threshold rule.  Returns the rule for later reference."""
-        rule = ThresholdRule(
-            lower=lower, upper=upper,
-            target_charge=target_charge, tolerance=tolerance,
-            name=name or f"rule_{len(self._rules)}",
-        )
-        self._rules.append(rule)
-        return rule
-
-    def remove_rule(self, rule: ThresholdRule) -> None:
-        if rule in self._rules:
-            self._rules.remove(rule)
-
-    def clear_rules(self) -> None:
-        self._rules.clear()
-
-    def get_rules(self) -> list[ThresholdRule]:
-        return list(self._rules)
-
-    # ------------------------------------------------------------------
     # Enable / Disable
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Enable the control loop.
+        """Enable the control loop and arm both actuators for the session.
 
-        Arms both actuators for the session (turns the NGE flash-control and
-        filament-power DC outputs on at their setpoints) so the trigger pulses
-        actually flash/heat; the pulses gate the actuation, the DC stays on.
+        Arming turns the NGE flash-control and filament-power DC outputs on at
+        their setpoints so the trigger pulses actually flash/heat; the pulses
+        gate the actuation, the DC stays on.
         """
         self._enabled = True
-        self._consecutive_count = 0
-        self._settling = False
+        self._start_time = time.time()
+        self._pulse_runner = None
+        self._flash_on = False
+        self._flash_ref_charge = None
+        self._current_action = Action.NONE
         self._arm_actuators(True)
-        log.info("Control loop started — target %+.1f e", self._target_charge)
-        self.action_changed.emit(f"Started — target {self._target_charge:+.1f} e")
+        self._watchdog.start()
+        if self._pending_delta is not None:
+            if abs(self._pending_delta) >= 1e5:
+                msg = f"Started — {self._policy} until cancel"
+            else:
+                msg = (f"Started — change charge by {self._pending_delta:+.1f} e "
+                       f"({self._policy})")
+        else:
+            msg = (f"Started — target {self._target_charge:+.1f} e "
+                   f"± {self._tolerance:.1f} ({self._policy})")
+        log.info(msg)
+        self.action_changed.emit(msg)
 
-    def stop(self) -> None:
-        """Disable the control loop, stop pulsing, and disarm (NGE DC off)."""
+    def stop(self, reason: str = "Stopped") -> None:
+        """Disable the loop, stop actuating, restore the drive, and disarm."""
+        was_enabled = self._enabled
         self._enabled = False
+        self._watchdog.stop()
         self._stop_all_actuators()
-        self._reset_ramp()
+        self._pulse_runner = None
+        self._flash_on = False
+        self._restore_setback()
         self._arm_actuators(False)
         self._current_action = Action.NONE
-        log.info("Control loop stopped")
-        self.action_changed.emit("Stopped")
+        log.info("Control loop stopped: %s", reason)
+        self.action_changed.emit(reason)
+        if was_enabled:
+            self.stopped.emit(reason)
+
+    def cancel(self) -> None:
+        """User cancel — stop and turn the outputs off."""
+        self.stop("Cancelled — outputs off")
 
     def _arm_actuators(self, on: bool) -> None:
         """Arm/disarm the session DC outputs on both actuators (if supported)."""
@@ -378,215 +412,155 @@ class ChargeController(QObject):
     # ------------------------------------------------------------------
 
     def on_charge_update(self, result: dict) -> None:
-        """
-        Called on every new charge measurement.  This is the main entry
-        point — connect the source's charge_updated signal here.
-        """
+        """Main entry — called on every new charge measurement."""
         if not self._enabled:
             return
-
         charge = result.get("charge_e")
         if charge is None:
             return
-
         self._last_charge = charge
 
-        # --- Pulse ramp owns the loop while it runs ---
-        # It fires one filament pulse, waits N clean (filament-off) cycles, then
-        # reads and evaluates the stop condition.  Threshold rules / the normal
-        # at-target check are suspended while it runs because the charge is only
-        # trustworthy at the runner's clean reads (heating makes it noisy).
+        # Resolve a relative "change by Δ" target on the first reading.
+        if self._pending_delta is not None:
+            self._target_charge = charge + self._pending_delta
+            self._pending_delta = None
+            self.action_changed.emit(
+                f"Target {self._target_charge:+.1f} e  (start {charge:+.1f} e)")
+
+        # The pulse ramp owns the loop while it runs (reads only when the
+        # filament is off); only the safety timeout can interrupt it.
         if self._pulse_runner is not None:
+            if time.time() - self._start_time >= self._timeout_s:
+                self.stop(self._timeout_msg())
+                return
             self._run_pulse_ramp(charge)
             return
 
-        # --- Check threshold rules first ---
-        for rule in self._rules:
-            if not rule.enabled:
-                continue
-            if charge < rule.lower or charge > rule.upper:
-                log.info(
-                    "Threshold '%s' triggered: charge %.1f outside [%.1f, %.1f] "
-                    "→ target %+.1f",
-                    rule.name, charge, rule.lower, rule.upper, rule.target_charge,
-                )
-                self._target_charge = rule.target_charge
-                self._tolerance = rule.tolerance
-                self._consecutive_count = 0
-                self._settling = False
-                self._stop_all_actuators()
-                self.action_changed.emit(
-                    f"Rule '{rule.name}' triggered → target {rule.target_charge:+.1f} e"
-                )
-                break
-
-        # --- Are we settling after an actuation? ---
-        if self._settling:
-            if time.time() - self._settle_start < self._settle_time_s:
-                return  # still settling
-            self._settling = False
-
-        # --- Check if we're at target ---
-        error = charge - self._target_charge
-        if abs(error) <= self._tolerance:
-            if self._current_action != Action.AT_TARGET:
-                # Reached target — stop actuating (the ramp has no scheduled
-                # stop, so this is what turns the filament off when caught).
-                self._stop_all_actuators()
-                self._reset_ramp()
-                self._current_action = Action.AT_TARGET
-                self._consecutive_count = 0
-                self._log_event(charge, Action.AT_TARGET, "At target")
-                self.action_changed.emit(
-                    f"At target: {charge:+.1f} e  (target {self._target_charge:+.1f})"
-                )
-                self.target_reached.emit(charge)
+        # Safety timeout.
+        if time.time() - self._start_time >= self._timeout_s:
+            self.stop(self._timeout_msg())
             return
 
-        # --- Safety check ---
-        if self._consecutive_count >= self._max_consecutive:
-            self._stop_all_actuators()
-            self._current_action = Action.NONE
-            self.action_changed.emit(
-                f"SAFETY: {self._max_consecutive} consecutive actions — paused"
-            )
-            log.warning("Safety limit reached — pausing control loop")
+        # At target?
+        if abs(charge - self._target_charge) <= self._tolerance:
+            self._reach_target(charge)
             return
 
-        # --- Decide action ---
-        action = self._decide_action(charge, error)
-        self._execute_action(action, charge, error)
+        # Decide which tool moves the charge toward the target.
+        dev = self._decide(charge)
+        if dev == "flash":
+            self._do_flash(charge)
+        elif dev == "filament":
+            if self._flash_on:
+                self._flash_stop()
+            self._start_pulse_ramp(charge)
+        else:
+            # Forced policy can't correct in the needed direction (overshoot).
+            self.stop(
+                f"Overshot: {charge:+.1f} e vs target "
+                f"{self._target_charge:+.1f} e — {self._policy} can't reverse it")
+
+    def _check_timeout(self):
+        """Watchdog slot — stop on timeout even if charge updates have stalled."""
+        if self._enabled and time.time() - self._start_time >= self._timeout_s:
+            self.stop(self._timeout_msg())
+
+    def _timeout_msg(self) -> str:
+        t = self._timeout_s
+        span = f"{t / 60.0:.1f} min" if t >= 60 else f"{t:.0f} s"
+        return (f"Safety timeout — target {self._target_charge:+.1f} e not "
+                f"reached in {span}")
 
     # ------------------------------------------------------------------
     # Decision logic
     # ------------------------------------------------------------------
 
-    def _decide_action(self, charge: float, error: float) -> Action:
-        """
-        Decide what to do based on current charge and error.
-
-        Strategy:
-            - If target is 0 (neutral):
-                charge != 0 → flash to neutralise
-            - If target > 0 (positive):
-                charge < target → flash (remove negative / photoionise)
-                charge > target → flash (remove excess positive)
-                Note: filament adds negative charge, so it moves away
-                      from positive targets. Use flash only.
-            - If target < 0 (negative):
-                charge > target (less negative) → heat filament (add negative)
-                charge < target (more negative) → flash (remove)
-            - If target is 0 and charge is 0:
-                AT_TARGET (handled above)
-        """
-        target = self._target_charge
-
-        if target >= 0:
-            # Positive or zero target — flash lamp in all cases
-            # (flash removes charge toward neutral; if target > 0 there's
-            #  no way to add positive charge except photoionisation which
-            #  is stochastic — flash is the only tool)
-            return Action.FLASH
-        else:
-            # Negative target
-            if error > 0:
-                # charge is above target (less negative or more positive)
-                # → filament adds negative charge to bring charge down
-                return Action.HEAT
-            else:
-                # charge is below target (more negative)
-                # → flash removes some charge to bring toward 0/target
-                return Action.FLASH
+    def _decide(self, charge: float) -> str | None:
+        """Return the tool to use: 'flash' (raise +), 'filament' (lower −), or
+        None if the policy can't move in the needed direction."""
+        err = charge - self._target_charge   # >0: too high → lower; <0: too low → raise
+        if self._policy == "flash":
+            return "flash" if err < 0 else None
+        if self._policy == "filament":
+            return "filament" if err > 0 else None
+        # auto
+        if err < 0:
+            return "flash"
+        if err > 0:
+            return "filament"
+        return None
 
     # ------------------------------------------------------------------
-    # Actuation
+    # Flash lamp (continuous)
     # ------------------------------------------------------------------
 
-    def _execute_action(self, action: Action, charge: float, error: float):
-        """Fire the appropriate actuator."""
-        now = time.time()
-
-        # Ramped heating hands off to the pulse-wait-read runner, which then
-        # owns the loop (see on_charge_update) until the target is reached.
-        if action == Action.HEAT and self._filament_ramp.enabled:
-            self._start_pulse_ramp(charge)
+    def _do_flash(self, charge: float):
+        """Continuous flash to raise the charge; evaluated every read."""
+        if self._flashlamp is None or not getattr(self._flashlamp, "is_connected", False):
+            self.action_changed.emit("Flash lamp not connected!")
             return
-
-        # A non-ramp action ends any ramp in progress.
-        self._reset_ramp()
-
-        # If we're already doing this action and it hasn't timed out, skip
-        if self._current_action == action and now - self._action_start < self._get_duration(action):
-            return
-
-        # Stop the other actuator
-        self._stop_all_actuators()
-
-        if action == Action.FLASH:
-            if self._flashlamp is None or not self._flashlamp.is_connected:
-                self.action_changed.emit("Flash lamp not connected!")
-                return
+        if not self._flash_on:
+            self._park_setback()
+            # Program the device settings, then turn on.
+            for name, arg in (("set_flash_rate", self._flash_rate_hz),
+                              ("set_electrode_voltage", self._flash_ctrl_v)):
+                fn = getattr(self._flashlamp, name, None)
+                if fn is not None:
+                    try:
+                        fn(arg)
+                    except Exception:
+                        pass
             try:
                 self._flashlamp.enable()
             except Exception as e:
                 self.action_changed.emit(f"Flash lamp error: {e}")
+                self._restore_setback()
                 return
+            self._flash_on = True
+            self._flash_ref_charge = charge
             self._current_action = Action.FLASH
-            self._action_start = now
-            self._consecutive_count += 1
-            detail = f"charge={charge:+.1f}, error={error:+.1f}, flashing"
-            self._log_event(charge, Action.FLASH, detail)
-            self.action_changed.emit(f"Flashing — charge {charge:+.1f} e")
+            self._log_event(charge, Action.FLASH, "flash on")
+        else:
+            # Continuing — log a flash read once the charge has moved enough.
+            ref = self._flash_ref_charge if self._flash_ref_charge is not None else charge
+            if abs(charge - ref) >= 0.5:
+                cyc = RampCycle(0.0, charge - ref, charge, False, device="flash")
+                self._flash_ref_charge = charge
+                self.cycle_logged.emit(cyc)
+        self.action_changed.emit(f"Flashing (raise +) — charge {charge:+.1f} e")
 
-            # Schedule stop after duration
-            self._schedule_stop(Action.FLASH, self._flash_duration_s)
-
-        elif action == Action.HEAT:
-            if self._filament is None or not self._filament.is_connected:
-                self.action_changed.emit("Filament not connected!")
-                return
+    def _flash_stop(self):
+        """Turn the flash lamp off (leave the loop running)."""
+        if self._flash_on:
             try:
-                self._filament.enable()
-            except Exception as e:
-                self.action_changed.emit(f"Filament error: {e}")
-                return
-            self._current_action = Action.HEAT
-            self._action_start = now
-            self._consecutive_count += 1
-            detail = f"charge={charge:+.1f}, error={error:+.1f}, heating"
-            self._log_event(charge, Action.HEAT, detail)
-            self.action_changed.emit(f"Heating filament — charge {charge:+.1f} e")
+                if self._flashlamp is not None and getattr(self._flashlamp, "is_connected", False):
+                    self._flashlamp.disable()
+            except Exception:
+                pass
+            self._flash_on = False
 
-            # Schedule stop after duration
-            self._schedule_stop(Action.HEAT, self._heat_duration_s)
+    # ------------------------------------------------------------------
+    # Filament (pulse-wait-read ramp)
+    # ------------------------------------------------------------------
 
     def _start_pulse_ramp(self, charge: float):
-        """Begin the pulse-wait-read filament ramp toward the (negative) target.
-
-        Heating adds negative charge, so the stop condition is "charge has
-        reached the target band from above" (charge <= target + tolerance).
-        The runner then drives fire/wait/read on every poll via _run_pulse_ramp.
-        """
+        """Begin the pulse-wait-read filament ramp toward the target (lower −)."""
         if self._filament is None or not getattr(self._filament, "is_connected", False):
             self.action_changed.emit("Filament not connected!")
             return
         if not hasattr(self._filament, "fire_pulse"):
             self.action_changed.emit("Filament actuator has no pulse support")
             return
-        self._stop_all_actuators()
+        self._park_setback()
         tgt, tol = self._target_charge, self._tolerance
+        # Filament lowers the charge; stop once it reaches the target band.
         self._pulse_runner = PulseRampRunner(
-            self._filament_ramp,
-            condition=lambda q: q <= tgt + tol,
-        )
+            self._filament_ramp, condition=lambda q: q <= tgt + tol)
         self._current_action = Action.HEAT
-        self._action_start = time.time()
-        self._consecutive_count = 0
         self.action_changed.emit(
-            f"Filament pulse ramp — target {tgt:+.1f} e, "
+            f"Ramping filament (lower −) — target {tgt:+.1f} e, "
             f"start {self._filament_ramp.start_width_ms:.3g} ms, "
-            f"{self._filament_ramp.timeout_cycles} cycles/read"
-        )
+            f"{self._filament_ramp.timeout_cycles} cycles/read")
 
     def _run_pulse_ramp(self, charge: float):
         """Advance the active pulse-wait-read runner by one poll and carry out
@@ -608,14 +582,20 @@ class ChargeController(QObject):
             )
             self.cycle_logged.emit(cyc)
         if r["done"]:
-            self._stop_all_actuators()
             self._pulse_runner = None
-            self._current_action = Action.AT_TARGET
-            self._consecutive_count = 0
-            self.action_changed.emit(
-                f"At target: {charge:+.1f} e  (target {self._target_charge:+.1f})"
-            )
-            self.target_reached.emit(charge)
+            self._filament_pulse_off()
+            if abs(charge - self._target_charge) <= self._tolerance:
+                self._reach_target(charge)
+            elif self._policy == "filament":
+                # Forced filament overshot below the band — it can't raise back.
+                self.stop(f"Overshot: {charge:+.1f} e below target "
+                          f"{self._target_charge:+.1f} e — filament can't raise it")
+            else:
+                # Auto: overshot below the band; the next poll re-decides and
+                # flashes the charge back up toward the target.
+                self._current_action = Action.NONE
+                self.action_changed.emit(
+                    f"Filament overshot to {charge:+.1f} e — correcting with flash")
 
     def _filament_fire_pulse(self, width_ms: float, charge: float):
         """Fire a single filament pulse of the given width (see FilamentAdapter
@@ -632,7 +612,6 @@ class ChargeController(QObject):
         except Exception as e:
             self.action_changed.emit(f"Filament error: {e}")
             return
-        self._consecutive_count += 1
         self.action_changed.emit(
             f"Filament pulse {width_ms:.3g} ms — charge {charge:+.1f} e"
         )
@@ -646,29 +625,30 @@ class ChargeController(QObject):
             except Exception:
                 pass
 
-    def _reset_ramp(self):
-        """Clear pulse-ramp state (call when the ramp ends: at target, on FLASH,
-        stop).  Turns the filament output off so no pulse is left armed."""
-        if self._pulse_runner is not None:
-            self._pulse_runner = None
-            self._filament_pulse_off()
+    # ------------------------------------------------------------------
+    # Target reached / actuator + setback helpers
+    # ------------------------------------------------------------------
 
-    def _schedule_stop(self, action: Action, duration_s: float):
-        """
-        After actuating for duration_s, disable the actuator and enter
-        settle mode.  Uses a background thread to avoid blocking.
-        """
-        def _stop_after_delay():
-            time.sleep(duration_s)
-            self._stop_all_actuators()
-            self._settling = True
-            self._settle_start = time.time()
-            self._current_action = Action.WAIT
-            self.action_changed.emit("Settling…")
+    def _reach_target(self, charge: float):
+        """Target reached — record it and stop (outputs off)."""
+        self._log_event(charge, Action.AT_TARGET, "at target")
+        self.target_reached.emit(charge)
+        self.stop(f"Reached target: {charge:+.1f} e "
+                  f"(target {self._target_charge:+.1f})")
 
-        import threading
-        t = threading.Thread(target=_stop_after_delay, daemon=True)
-        t.start()
+    def _park_setback(self):
+        if self._setback is not None:
+            try:
+                self._setback.park()
+            except Exception:
+                pass
+
+    def _restore_setback(self):
+        if self._setback is not None:
+            try:
+                self._setback.restore()
+            except Exception:
+                pass
 
     def _stop_all_actuators(self):
         """Disable both actuators (safe to call even if not active)."""
@@ -684,13 +664,6 @@ class ChargeController(QObject):
                     self._filament.disable()
             except Exception:
                 pass
-
-    def _get_duration(self, action: Action) -> float:
-        if action == Action.FLASH:
-            return self._flash_duration_s
-        elif action == Action.HEAT:
-            return self._heat_duration_s
-        return 0.0
 
     # ------------------------------------------------------------------
     # Event log
@@ -724,11 +697,12 @@ class ChargeController(QObject):
             "enabled": self._enabled,
             "target_charge": self._target_charge,
             "tolerance": self._tolerance,
+            "policy": self._policy,
+            "timeout_s": self._timeout_s,
             "current_action": self._current_action.value,
             "last_charge": self._last_charge,
-            "consecutive_actions": self._consecutive_count,
-            "settling": self._settling,
-            "n_rules": len(self._rules),
+            "flash_on": self._flash_on,
+            "ramping": self._pulse_runner is not None,
             "n_events": len(self._event_log),
         }
 
@@ -740,21 +714,10 @@ class ChargeController(QObject):
         return {
             "target_charge": self._target_charge,
             "tolerance": self._tolerance,
-            "flash_duration_s": self._flash_duration_s,
-            "heat_duration_s": self._heat_duration_s,
-            "settle_time_s": self._settle_time_s,
-            "max_consecutive": self._max_consecutive,
-            "rules": [
-                {
-                    "lower": r.lower,
-                    "upper": r.upper,
-                    "target_charge": r.target_charge,
-                    "tolerance": r.tolerance,
-                    "enabled": r.enabled,
-                    "name": r.name,
-                }
-                for r in self._rules
-            ],
+            "policy": self._policy,
+            "timeout_s": self._timeout_s,
+            "flash_rate_hz": self._flash_rate_hz,
+            "flash_ctrl_v": self._flash_ctrl_v,
         }
 
     def restore_config(self, cfg: dict) -> None:
@@ -762,15 +725,11 @@ class ChargeController(QObject):
             self._target_charge = float(cfg["target_charge"])
         if "tolerance" in cfg:
             self._tolerance = float(cfg["tolerance"])
-        if "flash_duration_s" in cfg:
-            self._flash_duration_s = float(cfg["flash_duration_s"])
-        if "heat_duration_s" in cfg:
-            self._heat_duration_s = float(cfg["heat_duration_s"])
-        if "settle_time_s" in cfg:
-            self._settle_time_s = float(cfg["settle_time_s"])
-        if "max_consecutive" in cfg:
-            self._max_consecutive = int(cfg["max_consecutive"])
-        if "rules" in cfg:
-            self._rules.clear()
-            for rd in cfg["rules"]:
-                self._rules.append(ThresholdRule(**rd))
+        if cfg.get("policy") in self.POLICIES:
+            self._policy = cfg["policy"]
+        if "timeout_s" in cfg:
+            self._timeout_s = max(1.0, float(cfg["timeout_s"]))
+        if "flash_rate_hz" in cfg:
+            self._flash_rate_hz = float(cfg["flash_rate_hz"])
+        if "flash_ctrl_v" in cfg:
+            self._flash_ctrl_v = float(cfg["flash_ctrl_v"])

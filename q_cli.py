@@ -8,13 +8,13 @@ One-shot usage::
     python q_cli.py ping
     python q_cli.py get_charge
     python q_cli.py set_target 0 0.5
+    python q_cli.py set_policy auto
+    python q_cli.py set_timeout 600
     python q_cli.py start_control
     python q_cli.py stop_control
     python q_cli.py flash 2.0
     python q_cli.py heat 3.0
     python q_cli.py stop_actuators
-    python q_cli.py add_rule -5 5 0 0.5
-    python q_cli.py clear_rules
     python q_cli.py connect_flashlamp GPIB::2
     python q_cli.py connect_filament  GPIB::3
     python q_cli.py get_status
@@ -124,20 +124,34 @@ def _run_one(client: ModuleClient, tokens: list[str]) -> bool:
         _print_reply(client.send("set_target", **kwargs))
         return True
 
-    if cmd == "set_timing":
-        # set_timing flash=N heat=M settle=K
+    if cmd == "set_policy":
+        # set_policy auto|flash|filament
+        if len(tokens) < 2:
+            print("Usage: set_policy auto|flash|filament")
+            return True
+        _print_reply(client.send("set_policy", policy=tokens[1]))
+        return True
+
+    if cmd == "set_timeout":
+        # set_timeout <seconds>
+        if len(tokens) < 2:
+            print("Usage: set_timeout <seconds>")
+            return True
+        _print_reply(client.send("set_timeout", timeout_s=float(tokens[1])))
+        return True
+
+    if cmd == "set_flash_params":
+        # set_flash_params rate=N control=V
         kwargs = {}
         for tok in tokens[1:]:
-            if tok.startswith("flash="):
-                kwargs["flash_duration_s"] = float(tok.split("=")[1])
-            elif tok.startswith("heat="):
-                kwargs["heat_duration_s"] = float(tok.split("=")[1])
-            elif tok.startswith("settle="):
-                kwargs["settle_time_s"] = float(tok.split("=")[1])
+            if tok.startswith("rate="):
+                kwargs["rate_hz"] = float(tok.split("=")[1])
+            elif tok.startswith("control="):
+                kwargs["control_v"] = float(tok.split("=")[1])
         if not kwargs:
-            print("Usage: set_timing flash=<s> heat=<s> settle=<s>")
+            print("Usage: set_flash_params rate=<hz> control=<v>")
             return True
-        _print_reply(client.send("set_timing", **kwargs))
+        _print_reply(client.send("set_flash_params", **kwargs))
         return True
 
     if cmd == "start_control":
@@ -162,26 +176,6 @@ def _run_one(client: ModuleClient, tokens: list[str]) -> bool:
         _print_reply(client.send("stop_actuators"))
         return True
 
-    if cmd == "add_rule":
-        # add_rule <lower> <upper> <target_charge> [tolerance] [name]
-        if len(tokens) < 4:
-            print("Usage: add_rule <lower> <upper> <target_charge> [tolerance] [name]")
-            return True
-        kwargs = {
-            "lower":         float(tokens[1]),
-            "upper":         float(tokens[2]),
-            "target_charge": float(tokens[3]),
-        }
-        if len(tokens) >= 5:
-            kwargs["tolerance"] = float(tokens[4])
-        if len(tokens) >= 6:
-            kwargs["name"] = tokens[5]
-        _print_reply(client.send("add_rule", **kwargs))
-        return True
-
-    if cmd == "clear_rules":
-        _print_reply(client.send("clear_rules"))
-        return True
 
     if cmd == "connect_flashlamp":
         port = tokens[1] if len(tokens) >= 2 else "GPIB::2"
