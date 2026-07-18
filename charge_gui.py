@@ -685,6 +685,11 @@ class ChargeWidget(QWidget):
             self._photon_exp.abort()
         if self._sequencer.is_running:
             self._sequencer.stop()
+        # Stop the filament pulser background thread (if it was started).
+        try:
+            self._filament_actuator.shutdown()
+        except Exception:
+            pass
         configs = self._connections_tab.get_all_configs()
         configs["Analysis"]      = self._analysis_tab.get_config()
         configs["Control"]       = self._control_tab.get_config()

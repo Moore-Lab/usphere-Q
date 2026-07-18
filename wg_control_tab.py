@@ -29,6 +29,7 @@ Public attributes on WaveformControlTab (for control-loop wiring):
 from __future__ import annotations
 
 import math
+import queue
 import threading as _threading
 import time
 from collections import deque
@@ -1919,7 +1920,7 @@ class FlashLampAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Single-pulse firing (pulse-wait-read ramp)
+# Single-pulse firing (pulse-wait-read ramp) — background thread
 # ---------------------------------------------------------------------------
 
 # Very-low-frequency carrier for single-pulse firing.  At this rate the period
@@ -1931,36 +1932,96 @@ class FlashLampAdapter:
 FILAMENT_PULSE_CARRIER_HZ = 0.001
 
 
-def fire_single_pulse(trig: PulseGroup, width_ms: float,
-                      carrier_hz: float = FILAMENT_PULSE_CARRIER_HZ) -> bool:
-    """Fire ONE hardware-timed pulse of ``width_ms`` on a trigger PulseGroup.
+class _FilamentPulser(QThread):
+    """Background thread that owns the filament trigger AFG's serial I/O.
 
-    Programs the trigger as a pulse at ``carrier_hz`` (period ~1000 s) with the
-    requested width and enables the output, so the AFG times the pulse WIDTH in
-    hardware while the next pulse stays ~1000 s away.  Call ``pulse_output_off``
-    on a later poll to end the single-pulse window.  Runs in the GUI thread
-    (touches the trigger widget)."""
-    afg, ch = trig._afg_ch()
-    if afg is None:
-        return False
-    width_s = max(float(width_ms), 0.0) * 1e-3
-    v_high = trig._amp.value()
-    offset = trig._get_offset()
-    with _afg_lock(afg):
-        afg.output_off(ch)                 # start from a clean off edge
-        trig._set_impedance(afg, ch)
-        afg.setup_pulse(ch, frequency=carrier_hz,
-                        amplitude=v_high, offset=offset, width=width_s)
-        return afg.output_on(ch)           # fires one pulse of width_s
+    Each AFG write blocks ~80 ms (a *synced* apply is ~230 ms).  Firing the
+    pulse-wait-read ramp on the GUI thread — reprogramming the whole waveform
+    (setup_pulse) every step — meant ~0.6 s of blocking I/O per step on the GUI
+    thread, which froze/crashed the UI.  This thread fixes that two ways:
 
+      1. It runs OFF the GUI thread, so the control loop never blocks; fire()/
+         off() just enqueue a request and return immediately.
+      2. It sets the pulse up ONCE per channel, then per fire only changes the
+         WIDTH when it actually changes (one cheap ``SOUR:PULS:WIDT`` write) and
+         toggles the output — no per-step full reprogram.
 
-def pulse_output_off(trig: PulseGroup) -> bool:
-    """Turn a trigger PulseGroup output off (ends a single-pulse window)."""
-    afg, ch = trig._afg_ch()
-    if afg is None:
-        return False
-    with _afg_lock(afg):
-        return afg.output_off(ch)
+    Requests are executed under the shared per-AFG lock.  Under backlog it skips
+    to the most recent request (the ramp has advanced), so it can't lag the loop.
+    """
+
+    def __init__(self, carrier_hz: float = FILAMENT_PULSE_CARRIER_HZ):
+        super().__init__()
+        self._carrier = carrier_hz
+        self._q: "queue.Queue" = queue.Queue()
+        self._key = None            # (id(afg), ch) the pulse is set up for
+        self._cur_width = None      # width_ms last programmed
+        self.setObjectName("FilamentPulser")
+
+    # -- GUI thread: capture handles + enqueue (non-blocking) ----------------
+
+    def fire(self, afg, ch, amp, offset, hi_z, width_ms):
+        self._q.put(("fire", (afg, ch, amp, offset, hi_z, float(width_ms))))
+
+    def off(self, afg, ch):
+        self._q.put(("off", (afg, ch)))
+
+    def shutdown(self):
+        self._q.put(("quit", None))
+
+    # -- worker thread -------------------------------------------------------
+
+    def run(self):
+        while True:
+            op, payload = self._q.get()
+            # Coalesce a backlog to the most recent request so the pulser never
+            # lags the control loop (a newer fire = ramp advanced; an off/quit
+            # supersedes pending fires).
+            while True:
+                try:
+                    op, payload = self._q.get_nowait()
+                except queue.Empty:
+                    break
+            if op == "quit":
+                break
+            try:
+                if op == "fire":
+                    self._fire(*payload)
+                elif op == "off":
+                    afg, ch = payload
+                    with _afg_lock(afg):
+                        afg.output_off(ch)
+            except Exception:
+                pass
+
+    def _fire(self, afg, ch, amp, offset, hi_z, width_ms):
+        width_s = max(width_ms, 0.0) * 1e-3
+        with _afg_lock(afg):
+            key = (id(afg), ch)
+            if key != self._key or self._cur_width is None:
+                # First fire on this channel: one-time full setup.
+                (afg.set_load_high_z if hi_z else afg.set_load_50_ohm)(ch)
+                afg.setup_pulse(ch, frequency=self._carrier, amplitude=amp,
+                                offset=offset, width=width_s)
+                self._key = key
+                self._cur_width = width_ms
+            elif width_ms != self._cur_width:
+                # Only the width changed: one cheap write, no full reprogram.
+                wf = getattr(afg, "waveform", None)
+                if wf is not None:
+                    wf.set_pulse_width(ch, width_s)
+                else:
+                    afg.setup_pulse(ch, frequency=self._carrier, amplitude=amp,
+                                    offset=offset, width=width_s)
+                self._cur_width = width_ms
+            afg.output_off(ch)   # reset so output_on restarts the pulse at phase 0
+            afg.output_on(ch)    # fires one pulse of width_ms
+
+    def reset(self):
+        """Forget the cached setup so the next fire re-programs (e.g. after the
+        channel/amplitude changed)."""
+        self._key = None
+        self._cur_width = None
 
 
 # ---------------------------------------------------------------------------
@@ -1972,19 +2033,40 @@ def pulse_output_off(trig: PulseGroup) -> bool:
 # ---------------------------------------------------------------------------
 
 class FilamentAdapter:
-    """Combines the filament trigger PulseGroup and its NGE power group."""
+    """Combines the filament trigger PulseGroup and its NGE power group.
+
+    Pulse-wait-read fires go through a background _FilamentPulser so the control
+    loop never blocks on the AFG serial port (see _FilamentPulser)."""
 
     PULSE_CARRIER_HZ = FILAMENT_PULSE_CARRIER_HZ
 
     def __init__(self, trigger: PulseGroup, power: NGEControlGroup):
         self._trigger = trigger
         self._power = power
+        self._pulser: "_FilamentPulser | None" = None
+
+    def _ensure_pulser(self) -> "_FilamentPulser":
+        if self._pulser is None:
+            self._pulser = _FilamentPulser(self.PULSE_CARRIER_HZ)
+        if not self._pulser.isRunning():
+            self._pulser.start()
+        return self._pulser
 
     def enable(self) -> bool:
         return self._trigger.enable()
 
     def disable(self) -> bool:
-        return self._trigger.disable()
+        """Turn the trigger output off.  Routed through the pulser (when one is
+        running) so it is ordered AFTER any pending fires — otherwise a queued
+        fire could re-enable the output right after a stop."""
+        afg, ch = self._trigger._afg_ch()
+        if afg is None:
+            return False
+        if self._pulser is not None and self._pulser.isRunning():
+            self._pulser.off(afg, ch)
+            return True
+        with _afg_lock(afg):
+            return afg.output_off(ch)
 
     @property
     def is_connected(self) -> bool:
@@ -2007,12 +2089,33 @@ class FilamentAdapter:
 
     def fire_pulse(self, width_ms: float) -> bool:
         """Fire ONE filament pulse of the given width (pulse-wait-read ramp).
-        See fire_single_pulse.  Call from the GUI thread."""
-        return fire_single_pulse(self._trigger, width_ms, self.PULSE_CARRIER_HZ)
+        Non-blocking: captures the AFG handle on the GUI thread and hands the
+        serial I/O to the background pulser."""
+        trig = self._trigger
+        afg, ch = trig._afg_ch()
+        if afg is None:
+            return False
+        hi_z = (trig._imp.currentIndex() == 1)
+        self._ensure_pulser().fire(afg, ch, trig._amp.value(),
+                                   trig._get_offset(), hi_z, width_ms)
+        return True
 
     def pulse_off(self) -> bool:
-        """Turn the filament trigger output off (ends the single-pulse window)."""
-        return pulse_output_off(self._trigger)
+        """Turn the filament trigger output off (ends the single-pulse window).
+        Non-blocking (ordered through the pulser)."""
+        afg, ch = self._trigger._afg_ch()
+        if afg is None:
+            return False
+        if self._pulser is not None:
+            self._pulser.off(afg, ch)
+        return True
+
+    def shutdown(self):
+        """Stop the background pulser (call on GUI close)."""
+        if self._pulser is not None:
+            self._pulser.shutdown()
+            self._pulser.wait(2000)
+            self._pulser = None
 
 
 # ---------------------------------------------------------------------------
@@ -2161,9 +2264,27 @@ class FilamentRampWidget(QGroupBox):
         self._get_filament = get_filament     # -> PulseGroup
         self._runner = None
         self._ramp = None
+        self._pulser = None                   # background _FilamentPulser
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._build()
+
+    def _fire(self, fil, width_ms):
+        """Dispatch one pulse to the background pulser (non-blocking)."""
+        afg, ch = fil._afg_ch()
+        if afg is None:
+            return
+        if self._pulser is None:
+            self._pulser = _FilamentPulser()
+        if not self._pulser.isRunning():
+            self._pulser.start()
+        hi_z = (fil._imp.currentIndex() == 1)
+        self._pulser.fire(afg, ch, fil._amp.value(), fil._get_offset(), hi_z, width_ms)
+
+    def _off(self, fil):
+        afg, ch = fil._afg_ch()
+        if afg is not None and self._pulser is not None:
+            self._pulser.off(afg, ch)
 
     def _build(self):
         v = QVBoxLayout(self)
@@ -2208,9 +2329,9 @@ class FilamentRampWidget(QGroupBox):
         r = runner.step(0.0)
         try:
             if r["off"]:
-                pulse_output_off(fil)
+                self._off(fil)
             if r["fire"] is not None:
-                fire_single_pulse(fil, r["fire"])
+                self._fire(fil, r["fire"])
                 self._status.setText(f"pulse {r['fire']:.4g} ms")
                 self._status.setStyleSheet("color: #1565C0;")
         except Exception as e:
@@ -2229,9 +2350,13 @@ class FilamentRampWidget(QGroupBox):
         fil = self._get_filament()
         if fil is not None:
             try:
-                pulse_output_off(fil)
+                self._off(fil)
             except Exception:
                 pass
+        if self._pulser is not None:
+            self._pulser.shutdown()
+            self._pulser.wait(2000)
+            self._pulser = None
         self._start_btn.setEnabled(True); self._stop_btn.setEnabled(False)
         if not keep_status:
             self._status.setText("Stopped"); self._status.setStyleSheet("color: gray;")
