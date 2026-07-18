@@ -185,20 +185,36 @@ class SequencerTab(QWidget):
         return w
 
     def _build_recharge_page(self):
-        w = QWidget(); g = QGridLayout(w); g.setColumnStretch(5, 1)
-        g.addWidget(QLabel("Filament freq:"), 0, 0)
-        self._r_freq = QDoubleSpinBox(); self._r_freq.setRange(0.001, 1e6)
-        self._r_freq.setDecimals(3); self._r_freq.setValue(10.0); self._r_freq.setSuffix(" Hz")
-        self._r_freq.setMaximumWidth(110); g.addWidget(self._r_freq, 0, 1)
-        g.addWidget(QLabel("Pulse width:"), 0, 2)
-        self._r_width = QDoubleSpinBox(); self._r_width.setRange(0.001, 1e6)
-        self._r_width.setDecimals(3); self._r_width.setValue(100.0); self._r_width.setSuffix(" ms")
-        self._r_width.setMaximumWidth(110); g.addWidget(self._r_width, 0, 3)
-        g.addWidget(QLabel("Power (0 = keep):"), 0, 4)
+        w = QWidget(); g = QGridLayout(w); g.setColumnStretch(6, 1)
+        g.addWidget(QLabel("Start width:"), 0, 0)
+        self._r_start = QDoubleSpinBox(); self._r_start.setRange(0.001, 1e5)
+        self._r_start.setDecimals(3); self._r_start.setValue(5.0); self._r_start.setSuffix(" ms")
+        self._r_start.setMaximumWidth(100); g.addWidget(self._r_start, 0, 1)
+        g.addWidget(QLabel("Increment:"), 0, 2)
+        self._r_inc = QDoubleSpinBox(); self._r_inc.setRange(0.001, 1e5)
+        self._r_inc.setDecimals(3); self._r_inc.setValue(5.0); self._r_inc.setSuffix(" ms")
+        self._r_inc.setMaximumWidth(100); g.addWidget(self._r_inc, 0, 3)
+        g.addWidget(QLabel("Max width:"), 0, 4)
+        self._r_max = QDoubleSpinBox(); self._r_max.setRange(0.001, 1e5)
+        self._r_max.setDecimals(3); self._r_max.setValue(200.0); self._r_max.setSuffix(" ms")
+        self._r_max.setMaximumWidth(100); g.addWidget(self._r_max, 0, 5)
+        g.addWidget(QLabel("Timeout cycles:"), 1, 0)
+        self._r_cycles = QSpinBox(); self._r_cycles.setRange(1, 1000)
+        self._r_cycles.setValue(6); self._r_cycles.setMaximumWidth(100)
+        self._r_cycles.setToolTip("Read cycles to wait (filament off) before reading.\n"
+                                  "Here one cycle = one sequencer poll interval.")
+        g.addWidget(self._r_cycles, 1, 1)
+        g.addWidget(QLabel("Power (0 = keep):"), 1, 2)
         self._r_power = QDoubleSpinBox(); self._r_power.setRange(0.0, 32.0)
         self._r_power.setDecimals(3); self._r_power.setValue(0.0); self._r_power.setSuffix(" V")
-        self._r_power.setMaximumWidth(110); g.addWidget(self._r_power, 0, 5)
-        self._r_cmp, self._r_thr, self._r_to = self._stop_cond_row(g, 1)
+        self._r_power.setMaximumWidth(100); g.addWidget(self._r_power, 1, 3)
+        hint = QLabel(
+            "Fires one pulse, waits N cycles with the filament off (clean read), "
+            "reads,\nand increments the pulse width until the stop condition — "
+            "immune to filament noise.")
+        hint.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+        g.addWidget(hint, 2, 0, 1, 6)
+        self._r_cmp, self._r_thr, self._r_to = self._stop_cond_row(g, 3)
         return w
 
     def _build_setelec_page(self):
@@ -246,8 +262,10 @@ class SequencerTab(QWidget):
                            timeout_s=self._d_to.value())
         if action == "recharge":
             return SeqStep(action="recharge",
-                           fil_freq_hz=self._r_freq.value(),
-                           fil_width_ms=self._r_width.value(),
+                           fil_start_width_ms=self._r_start.value(),
+                           fil_increment_ms=self._r_inc.value(),
+                           fil_max_width_ms=self._r_max.value(),
+                           fil_timeout_cycles=self._r_cycles.value(),
                            fil_power_v=self._r_power.value(),
                            compare=self._r_cmp.currentData(),
                            threshold_e=self._r_thr.value(),
@@ -266,7 +284,10 @@ class SequencerTab(QWidget):
             self._d_cmp.setCurrentIndex(max(0, self._d_cmp.findData(s.compare)))
             self._d_thr.setValue(s.threshold_e); self._d_to.setValue(s.timeout_s)
         elif s.action == "recharge":
-            self._r_freq.setValue(s.fil_freq_hz); self._r_width.setValue(s.fil_width_ms)
+            self._r_start.setValue(s.fil_start_width_ms)
+            self._r_inc.setValue(s.fil_increment_ms)
+            self._r_max.setValue(s.fil_max_width_ms)
+            self._r_cycles.setValue(int(s.fil_timeout_cycles))
             self._r_power.setValue(s.fil_power_v)
             self._r_cmp.setCurrentIndex(max(0, self._r_cmp.findData(s.compare)))
             self._r_thr.setValue(s.threshold_e); self._r_to.setValue(s.timeout_s)

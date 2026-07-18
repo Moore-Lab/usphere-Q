@@ -389,14 +389,15 @@ class ControlTab(QWidget):
         sbg.setColumnStretch(2, 1)
         outer.addWidget(sb_grp)
 
-        # --- Filament ramp (gentle heating) ---
-        from wg_control_tab import FilamentRampConfig
-        ramp_grp = QGroupBox("Filament ramp (gentle heating toward target)")
+        # --- Filament ramp (pulse-wait-read heating) ---
+        from wg_control_tab import FilamentRampConfig, CycleLog
+        ramp_grp = QGroupBox("Filament ramp (pulse → wait → read → increment)")
         rag = QVBoxLayout(ramp_grp)
         note = QLabel(
-            "Instead of a fixed filament setting (which runs away — hard to get a "
-            "small charge),\nramp one parameter up gently each poll until the "
-            "charge reaches the target, then stop.")
+            "The filament runs away and makes the lock-in noisy while it's on, so "
+            "instead of a fixed setting:\nfire ONE pulse, wait N read cycles with "
+            "the filament OFF (clean signal), read the charge, and increment the "
+            "pulse width until the target is reached.")
         note.setStyleSheet("color: #9E9E9E; font-size: 11px;")
         rag.addWidget(note)
         self._ramp_config = FilamentRampConfig()
@@ -405,7 +406,24 @@ class ControlTab(QWidget):
         apply_ramp_btn.setMaximumWidth(110)
         apply_ramp_btn.clicked.connect(self._on_apply_ramp)
         rag.addWidget(apply_ramp_btn)
+        rag.addWidget(QLabel("Cycle history — pulse width · Δq added since last read:"))
+        self._ramp_log = CycleLog()
+        rag.addWidget(self._ramp_log)
+        self._ctrl.cycle_logged.connect(self._ramp_log.add)
         outer.addWidget(ramp_grp)
+
+        # --- Flash diagnostics (charge removed per read) ---
+        flash_grp = QGroupBox("Flash — charge removed since last read")
+        flg = QVBoxLayout(flash_grp)
+        fnote = QLabel(
+            "Δq between successive flash actions — same diagnostic as the filament "
+            "ramp: how much the flash removed each cycle.")
+        fnote.setStyleSheet("color: #9E9E9E; font-size: 11px;")
+        flg.addWidget(fnote)
+        self._flash_log = CycleLog(empty="(no flashes yet)")
+        flg.addWidget(self._flash_log)
+        self._flash_last_charge = None
+        outer.addWidget(flash_grp)
 
         # --- Threshold rules ---
         rules_grp = QGroupBox("Threshold rules")
@@ -547,6 +565,9 @@ class ControlTab(QWidget):
         self._on_set_target()
         self._on_apply_timing()
         self._on_apply_ramp()
+        self._ramp_log.clear()
+        self._flash_log.clear()
+        self._flash_last_charge = None
         self._ctrl.start()
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -589,6 +610,15 @@ class ControlTab(QWidget):
             f"{event.detail}"
         )
         self._event_log_text.append(line)
+
+        # Flash diagnostics: Δq removed between successive flash actions.
+        if event.action == Action.FLASH:
+            if self._flash_last_charge is not None:
+                dq = event.charge_e - self._flash_last_charge
+                self._flash_log.add_text(
+                    f"flash        Δq={dq:+6.2f} e   q={event.charge_e:+6.1f} e"
+                )
+            self._flash_last_charge = event.charge_e
 
     def _on_target_reached(self, charge: float):
         pass  # Could trigger a notification

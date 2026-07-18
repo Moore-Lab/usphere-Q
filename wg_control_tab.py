@@ -31,10 +31,12 @@ from __future__ import annotations
 import math
 import threading as _threading
 import time
+from collections import deque
 
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -46,7 +48,6 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
-    QStackedWidget,
     QSpinBox,
     QTabWidget,
     QTextEdit,
@@ -1918,6 +1919,51 @@ class FlashLampAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Single-pulse firing (pulse-wait-read ramp)
+# ---------------------------------------------------------------------------
+
+# Very-low-frequency carrier for single-pulse firing.  At this rate the period
+# is ~1000 s, so the *next* pulse is ~1000 s away: enabling the output fires
+# exactly ONE hardware-timed pulse of the requested width, and the caller turns
+# the output off shortly after — long before any second pulse could arrive.
+# This gives an accurate pulse WIDTH (AFG-timed) with no burst/single-shot mode
+# in the driver.  (User's "belt and suspenders" 1 mHz design.)
+FILAMENT_PULSE_CARRIER_HZ = 0.001
+
+
+def fire_single_pulse(trig: PulseGroup, width_ms: float,
+                      carrier_hz: float = FILAMENT_PULSE_CARRIER_HZ) -> bool:
+    """Fire ONE hardware-timed pulse of ``width_ms`` on a trigger PulseGroup.
+
+    Programs the trigger as a pulse at ``carrier_hz`` (period ~1000 s) with the
+    requested width and enables the output, so the AFG times the pulse WIDTH in
+    hardware while the next pulse stays ~1000 s away.  Call ``pulse_output_off``
+    on a later poll to end the single-pulse window.  Runs in the GUI thread
+    (touches the trigger widget)."""
+    afg, ch = trig._afg_ch()
+    if afg is None:
+        return False
+    width_s = max(float(width_ms), 0.0) * 1e-3
+    v_high = trig._amp.value()
+    offset = trig._get_offset()
+    with _afg_lock(afg):
+        afg.output_off(ch)                 # start from a clean off edge
+        trig._set_impedance(afg, ch)
+        afg.setup_pulse(ch, frequency=carrier_hz,
+                        amplitude=v_high, offset=offset, width=width_s)
+        return afg.output_on(ch)           # fires one pulse of width_s
+
+
+def pulse_output_off(trig: PulseGroup) -> bool:
+    """Turn a trigger PulseGroup output off (ends a single-pulse window)."""
+    afg, ch = trig._afg_ch()
+    if afg is None:
+        return False
+    with _afg_lock(afg):
+        return afg.output_off(ch)
+
+
+# ---------------------------------------------------------------------------
 # FilamentAdapter
 # Wraps the filament trigger (PulseGroup, WG3-CH2) + the filament power
 # (NGEControlGroup) into a single actuator matching the enable/disable +
@@ -1927,6 +1973,8 @@ class FlashLampAdapter:
 
 class FilamentAdapter:
     """Combines the filament trigger PulseGroup and its NGE power group."""
+
+    PULSE_CARRIER_HZ = FILAMENT_PULSE_CARRIER_HZ
 
     def __init__(self, trigger: PulseGroup, power: NGEControlGroup):
         self._trigger = trigger
@@ -1952,25 +2000,74 @@ class FilamentAdapter:
 
     def set_pulse(self, freq_hz: float, width_ms: float) -> bool:
         """Program the filament trigger pulse (freq + width) and keep it running.
-        Used by the ChargeController's filament ramp; call from the GUI thread."""
+        Kept for manual/continuous use; call from the GUI thread."""
         self._trigger._freq.setValue(freq_hz)
         self._trigger._width_ms.setValue(width_ms)
         return self._trigger.enable()   # re-programs at the new freq/width, output on
+
+    def fire_pulse(self, width_ms: float) -> bool:
+        """Fire ONE filament pulse of the given width (pulse-wait-read ramp).
+        See fire_single_pulse.  Call from the GUI thread."""
+        return fire_single_pulse(self._trigger, width_ms, self.PULSE_CARRIER_HZ)
+
+    def pulse_off(self) -> bool:
+        """Turn the filament trigger output off (ends the single-pulse window)."""
+        return pulse_output_off(self._trigger)
 
 
 # ---------------------------------------------------------------------------
 # Filament ramp — reusable config editor + manual (out-of-loop) runner
 # ---------------------------------------------------------------------------
 
+class CycleLog(QTextEdit):
+    """Grayed-out, read-only diagnostic log of the last few pulse-ramp read
+    cycles: pulse width and Δcharge added since the previous read.
+
+    The filament tends to charge all at once, so this history is how you tune the
+    ramp: a Δq in the *wrong* direction means "waited too few cycles" (read before
+    the charge moved), and Δq ≈ 0 up to some width means "charging doesn't start
+    until ~that width" (so start there next time to cut deadtime).  Reused for the
+    flash lamp (charge removed per read) too."""
+
+    def __init__(self, maxlines: int = 5, empty: str = "(no cycles yet)", parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setMaximumHeight(24 + 15 * maxlines)
+        self.setStyleSheet("color: gray; font-family: monospace; font-size: 11px;")
+        self._empty = empty
+        self._lines: "deque[str]" = deque(maxlen=maxlines)
+        self._render()
+
+    def clear(self):
+        self._lines.clear(); self._render()
+
+    def add(self, cyc):
+        """Append a RampCycle (width, Δq, charge, met)."""
+        self._lines.append(
+            f"w={cyc.width_ms:6.3g} ms   Δq={cyc.delta_q:+6.2f} e   "
+            f"q={cyc.charge:+6.1f} e{'   ✓ target' if cyc.met else ''}"
+        )
+        self._render()
+
+    def add_text(self, line: str):
+        self._lines.append(line); self._render()
+
+    def _render(self):
+        self.setPlainText("\n".join(self._lines) if self._lines else self._empty)
+
+
 class FilamentRampConfig(QWidget):
     """
-    Reusable editor for a FilamentRamp (mode + parameters).  Used both by the
-    Control tab (drives the ChargeController's in-loop ramp) and by the Filament
-    tab's manual runner (out-of-loop play).
-    """
+    Reusable editor for a pulse-wait-read FilamentRamp.  Used both by the Control
+    tab (drives the ChargeController's in-loop ramp) and by the Filament tab's
+    manual runner (out-of-loop play).
 
-    _MODES = [("off", "Off (fixed)"), ("freq", "Frequency ramp"),
-              ("width", "Pulse-width ramp")]
+    The ramp fires ONE pulse of the current width, waits ``timeout_cycles`` read
+    cycles with the filament OFF so the lock-in settles, reads the charge and
+    evaluates the stop condition, then (if not met) increments the pulse width
+    and fires again.  The read is clean because the filament is off — immune to
+    the heating noise.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1979,28 +2076,36 @@ class FilamentRampConfig(QWidget):
     def _build(self):
         g = QGridLayout(self)
         g.setContentsMargins(0, 0, 0, 0)
-        g.addWidget(QLabel("Ramp:"), 0, 0, Qt.AlignRight)
-        self._mode = QComboBox()
-        for _, label in self._MODES:
-            self._mode.addItem(label)
-        self._mode.currentIndexChanged.connect(self._on_mode)
-        self._mode.setMaximumWidth(150)
-        g.addWidget(self._mode, 0, 1)
 
-        self._stack = QStackedWidget()
-        self._stack.addWidget(self._off_page())
-        self._stack.addWidget(self._freq_page())
-        self._stack.addWidget(self._width_page())
-        g.addWidget(self._stack, 1, 0, 1, 4)
+        self._enable = QCheckBox("Pulse-width ramp (pulse → wait → read → increment)")
+        self._enable.setToolTip(
+            "Fire one filament pulse, wait N read cycles with the filament off\n"
+            "(clean signal), read the charge, and increment the pulse width until\n"
+            "the target is reached.  Off = the loop uses a fixed heat pulse.")
+        g.addWidget(self._enable, 0, 0, 1, 4)
 
-        g.addWidget(QLabel("Step interval (s):"), 2, 0, Qt.AlignRight)
-        self._step = QDoubleSpinBox(); self._step.setRange(0.0, 100.0)
-        self._step.setDecimals(2); self._step.setValue(0.0); self._step.setMaximumWidth(80)
-        self._step.setToolTip("Minimum seconds between ramp increments.\n"
-                              "0 = advance every lock-in poll. The charge is checked\n"
-                              "every poll regardless, so the onset is caught fast.")
-        g.addWidget(self._step, 2, 1)
-        g.setColumnStretch(3, 1)
+        g.addWidget(QLabel("Start width:"), 1, 0, Qt.AlignRight)
+        self._start = self._spin(0.001, 1e5, 3, 5.0, " ms")
+        self._start.setToolTip("Width of the first pulse (SSR minimum ~5 ms).")
+        g.addWidget(self._start, 1, 1)
+        g.addWidget(QLabel("Increment:"), 1, 2, Qt.AlignRight)
+        self._inc = self._spin(0.001, 1e5, 3, 5.0, " ms")
+        self._inc.setToolTip("Added to the pulse width after each read that\n"
+                             "hasn't reached the target.")
+        g.addWidget(self._inc, 1, 3)
+
+        g.addWidget(QLabel("Max width:"), 2, 0, Qt.AlignRight)
+        self._max = self._spin(0.001, 1e5, 3, 200.0, " ms")
+        self._max.setToolTip("Pulse width is clamped here (safety ceiling).")
+        g.addWidget(self._max, 2, 1)
+        g.addWidget(QLabel("Timeout cycles:"), 2, 2, Qt.AlignRight)
+        self._cycles = QSpinBox(); self._cycles.setRange(1, 1000)
+        self._cycles.setValue(6); self._cycles.setMaximumWidth(100)
+        self._cycles.setToolTip(
+            "Read cycles to wait (filament off) before reading.  The effective\n"
+            "firing rate follows from this: e.g. 6 cycles at 30 Hz ≈ 200 ms/pulse.")
+        g.addWidget(self._cycles, 2, 3)
+        g.setColumnStretch(4, 1)
 
     @staticmethod
     def _spin(lo, hi, dec, val, suffix):
@@ -2008,89 +2113,53 @@ class FilamentRampConfig(QWidget):
         s.setValue(val); s.setSuffix(suffix); s.setMaximumWidth(100)
         return s
 
-    def _off_page(self):
-        w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(0, 0, 0, 0)
-        lbl = QLabel("No ramp — fixed filament pulse (uses the Filament tab settings).")
-        lbl.setStyleSheet(_HINT); v.addWidget(lbl)
-        return w
-
-    def _freq_page(self):
-        w = QWidget(); g = QGridLayout(w); g.setContentsMargins(0, 0, 0, 0)
-        g.addWidget(QLabel("Fixed pulse width:"), 0, 0, Qt.AlignRight)
-        self._f_fixed_w = self._spin(0.001, 1e5, 3, 5.0, " ms"); g.addWidget(self._f_fixed_w, 0, 1)
-        g.addWidget(QLabel("Start freq:"), 0, 2, Qt.AlignRight)
-        self._f_start = self._spin(0.001, 1e6, 3, 10.0, " Hz"); g.addWidget(self._f_start, 0, 3)
-        g.addWidget(QLabel("Increment:"), 1, 0, Qt.AlignRight)
-        self._f_inc = self._spin(0.001, 1e6, 3, 2.0, " Hz"); g.addWidget(self._f_inc, 1, 1)
-        g.addWidget(QLabel("Max freq:"), 1, 2, Qt.AlignRight)
-        self._f_max = self._spin(0.001, 1e6, 3, 200.0, " Hz"); g.addWidget(self._f_max, 1, 3)
-        g.setColumnStretch(4, 1)
-        return w
-
-    def _width_page(self):
-        w = QWidget(); g = QGridLayout(w); g.setContentsMargins(0, 0, 0, 0)
-        g.addWidget(QLabel("Fixed freq:"), 0, 0, Qt.AlignRight)
-        self._w_fixed_f = self._spin(0.001, 1e6, 3, 70.0, " Hz"); g.addWidget(self._w_fixed_f, 0, 1)
-        g.addWidget(QLabel("Start width:"), 0, 2, Qt.AlignRight)
-        self._w_start = self._spin(0.001, 1e5, 3, 5.0, " ms"); g.addWidget(self._w_start, 0, 3)
-        g.addWidget(QLabel("Increment:"), 1, 0, Qt.AlignRight)
-        self._w_inc = self._spin(0.001, 1e5, 3, 1.0, " ms"); g.addWidget(self._w_inc, 1, 1)
-        g.addWidget(QLabel("Max width:"), 1, 2, Qt.AlignRight)
-        self._w_max = self._spin(0.001, 1e5, 3, 100.0, " ms"); g.addWidget(self._w_max, 1, 3)
-        g.setColumnStretch(4, 1)
-        return w
-
-    def _on_mode(self, idx):
-        self._stack.setCurrentIndex(idx)
-
     def get_ramp(self):
         from charge_control import FilamentRamp
-        mode = self._MODES[self._mode.currentIndex()][0]
-        if mode == "freq":
-            return FilamentRamp(mode="freq", fixed_width_ms=self._f_fixed_w.value(),
-                                start=self._f_start.value(), increment=self._f_inc.value(),
-                                maximum=self._f_max.value(), step_interval_s=self._step.value())
-        if mode == "width":
-            return FilamentRamp(mode="width", fixed_hz=self._w_fixed_f.value(),
-                                start=self._w_start.value(), increment=self._w_inc.value(),
-                                maximum=self._w_max.value(), step_interval_s=self._step.value())
-        return FilamentRamp(mode="off")
+        return FilamentRamp(
+            enabled=self._enable.isChecked(),
+            start_width_ms=self._start.value(),
+            increment_ms=self._inc.value(),
+            max_width_ms=self._max.value(),
+            timeout_cycles=self._cycles.value(),
+        )
 
     def get_config(self) -> dict:
         return {
-            "mode": self._MODES[self._mode.currentIndex()][0],
-            "step_s": self._step.value(),
-            "f_fixed_w": self._f_fixed_w.value(), "f_start": self._f_start.value(),
-            "f_inc": self._f_inc.value(), "f_max": self._f_max.value(),
-            "w_fixed_f": self._w_fixed_f.value(), "w_start": self._w_start.value(),
-            "w_inc": self._w_inc.value(), "w_max": self._w_max.value(),
+            "enabled": self._enable.isChecked(),
+            "start_width_ms": self._start.value(),
+            "increment_ms": self._inc.value(),
+            "max_width_ms": self._max.value(),
+            "timeout_cycles": self._cycles.value(),
         }
 
     def restore_config(self, cfg: dict):
-        keys = [k for k, _ in self._MODES]
-        if cfg.get("mode") in keys:
-            self._mode.setCurrentIndex(keys.index(cfg["mode"]))
-        for key, spin in (("step_s", self._step),
-                          ("f_fixed_w", self._f_fixed_w), ("f_start", self._f_start),
-                          ("f_inc", self._f_inc), ("f_max", self._f_max),
-                          ("w_fixed_f", self._w_fixed_f), ("w_start", self._w_start),
-                          ("w_inc", self._w_inc), ("w_max", self._w_max)):
+        if "enabled" in cfg:
+            self._enable.setChecked(bool(cfg["enabled"]))
+        for key, spin in (("start_width_ms", self._start),
+                          ("increment_ms", self._inc),
+                          ("max_width_ms", self._max)):
             if key in cfg:
                 spin.setValue(float(cfg[key]))
+        if "timeout_cycles" in cfg:
+            self._cycles.setValue(int(cfg["timeout_cycles"]))
 
 
 class FilamentRampWidget(QGroupBox):
     """
-    Manual (out-of-loop) filament ramp runner for the Filament tab: play with a
-    ramp without the charge loop.  Ramps the given filament PulseGroup on a
-    timer (freq or width) from start toward max, so you can watch the filament
-    behaviour and find good settings.
+    Manual (out-of-loop) pulse-wait-read filament ramp runner for the Filament
+    tab: play with the ramp without the charge loop.  A timer stands in for the
+    lock-in read cycle and drives the same pulse → wait N cycles → increment
+    sequence the control loop uses, so you can watch the filament and find good
+    settings.  With no charge feedback it just walks the width from start to max
+    (then stops).
     """
+
+    _TICK_MS = 33   # nominal read-cycle period for the manual clock (~30 Hz)
 
     def __init__(self, get_filament, parent=None):
         super().__init__("Filament ramp (manual)", parent)
         self._get_filament = get_filament     # -> PulseGroup
-        self._value = 0.0
+        self._runner = None
         self._ramp = None
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -2110,11 +2179,14 @@ class FilamentRampWidget(QGroupBox):
         self._status = QLabel("—"); self._status.setStyleSheet("color: gray;")
         row.addWidget(self._status); row.addStretch()
         v.addLayout(row)
+        self._log = CycleLog()
+        v.addWidget(self._log)
 
     def _start(self):
+        from charge_control import PulseRampRunner
         self._ramp = self._cfg.get_ramp()
         if not self._ramp.enabled:
-            self._status.setText("Pick a ramp mode (frequency or pulse-width)")
+            self._status.setText("Tick the pulse-width ramp box first")
             self._status.setStyleSheet("color: #C62828;")
             return
         fil = self._get_filament()
@@ -2122,43 +2194,47 @@ class FilamentRampWidget(QGroupBox):
             self._status.setText("Filament WG not connected")
             self._status.setStyleSheet("color: #C62828;")
             return
-        self._value = self._ramp.start
-        self._apply()
+        # No charge feedback in manual mode: never "met", just walk to max.
+        self._runner = PulseRampRunner(self._ramp, condition=lambda q: False)
+        self._log.clear()
         self._start_btn.setEnabled(False); self._stop_btn.setEnabled(True)
-        interval_ms = max(20, int(self._ramp.step_interval_s * 1000) or 200)
-        self._timer.start(interval_ms)
+        self._timer.start(self._TICK_MS)
 
     def _tick(self):
-        if self._value >= self._ramp.maximum:
-            self._status.setText(f"At max ({self._value:.4g} {self._ramp.unit}) — "
-                                 f"still pulsing; Stop when done")
-            return
-        self._value = min(self._value + self._ramp.increment, self._ramp.maximum)
-        self._apply()
-
-    def _apply(self):
+        runner = self._runner
         fil = self._get_filament()
-        if fil is None:
+        if runner is None or fil is None:
             self._stop(); return
-        freq, width = self._ramp.freq_width(self._value)
+        r = runner.step(0.0)
         try:
-            fil._freq.setValue(freq); fil._width_ms.setValue(width); fil.enable()
+            if r["off"]:
+                pulse_output_off(fil)
+            if r["fire"] is not None:
+                fire_single_pulse(fil, r["fire"])
+                self._status.setText(f"pulse {r['fire']:.4g} ms")
+                self._status.setStyleSheet("color: #1565C0;")
         except Exception as e:
             self._status.setText(f"Error: {e}"); self._stop(); return
-        self._status.setText(f"Ramping {self._ramp.mode} = {self._value:.4g} "
-                             f"{self._ramp.unit}  (f={freq:.4g} Hz, w={width:.4g} ms)")
-        self._status.setStyleSheet("color: #1565C0;")
+        cyc = r["cycle"]
+        if cyc is not None:
+            self._log.add(cyc)
+            if cyc.width_ms >= self._ramp.max_width_ms:
+                self._status.setText(f"Reached max width ({cyc.width_ms:.4g} ms) — stopped")
+                self._status.setStyleSheet("color: gray;")
+                self._stop(keep_status=True)
 
-    def _stop(self):
+    def _stop(self, keep_status: bool = False):
         self._timer.stop()
+        self._runner = None
         fil = self._get_filament()
         if fil is not None:
             try:
-                fil.disable()
+                pulse_output_off(fil)
             except Exception:
                 pass
         self._start_btn.setEnabled(True); self._stop_btn.setEnabled(False)
-        self._status.setText("Stopped"); self._status.setStyleSheet("color: gray;")
+        if not keep_status:
+            self._status.setText("Stopped"); self._status.setStyleSheet("color: gray;")
 
     def get_config(self) -> dict:
         return self._cfg.get_config()
@@ -2669,6 +2745,40 @@ class ChargeSequencerActuators:
             afg.setup_pulse(ach, frequency=fil_freq_hz, amplitude=h["fl_vhigh"],
                             offset=h["fl_off"], width=fil_width_ms * 1e-3)
             afg.output_on(ach)
+
+    def set_filament_power(self, power_v: float):
+        """Turn the filament-power NGE on at power_v (session DC for the ramp)."""
+        h = self._h
+        nge, ch = h.get("fp_nge"), h.get("fp_ch")
+        if power_v > 0 and nge is not None and nge.is_connected:
+            nge.set_channel(ch, power_v, h["fp_ilim"])
+            nge.output_on(ch)
+
+    def fire_filament_pulse(self, width_ms: float):
+        """Fire ONE hardware-timed filament pulse of the given width (pulse-wait-
+        read recharge).  Uses the very-low-freq carrier so the next pulse is
+        ~1000 s away; call filament_pulse_off() before then.  Worker thread."""
+        h = self._h
+        afg, ach = h.get("fl_afg"), h.get("fl_ch")
+        if afg is None:
+            raise RuntimeError("filament trigger WG not connected")
+        with _afg_lock(afg):
+            afg.output_off(ach)                # clean off edge
+            afg.setup_pulse(ach, frequency=FILAMENT_PULSE_CARRIER_HZ,
+                            amplitude=h["fl_vhigh"], offset=h["fl_off"],
+                            width=max(float(width_ms), 0.0) * 1e-3)
+            afg.output_on(ach)                 # fires one pulse of width_ms
+
+    def filament_pulse_off(self):
+        """Turn the filament trigger output off (ends a single-pulse window)."""
+        h = self._h
+        afg, ach = h.get("fl_afg"), h.get("fl_ch")
+        if afg is not None:
+            try:
+                with _afg_lock(afg):
+                    afg.output_off(ach)
+            except Exception:
+                pass
 
     def stop_all(self):
         """Stop actuation (both triggers off — gating stops all flashing/heating)."""

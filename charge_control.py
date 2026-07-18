@@ -36,6 +36,7 @@ from __future__ import annotations
 import enum
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -84,48 +85,103 @@ class ThresholdRule:
 @dataclass
 class FilamentRamp:
     """
-    Ramp definition for gentle filament heating.
+    Pulse-then-wait-then-read filament heating ramp.
 
-    The filament (a WG pulse triggering an SSR into the filament) tends to run
-    away — hard to get a *small* charge because once it's hot it dumps a lot, and
-    the threshold shifts day to day.  Instead of a fixed setting, ramp one
-    parameter up from a gentle start so the onset of charging is gradual and the
-    control loop can catch it within a poll or two.
+    The filament (a WG pulse triggering an SSR) runs away and makes the lock-in
+    noisy while it's on, so a fixed setting is hard to control and the threshold
+    drifts day to day.  Instead: fire ONE pulse of the current width, then wait
+    ``timeout_cycles`` read cycles with the filament OFF (clean signal), read the
+    charge, evaluate the stop condition, and if not met increment the pulse
+    width and fire again.  Because the read is taken with the filament off, the
+    loop is immune to the heating noise.
 
-    mode:
-        "off"   — no ramp (fixed freq/width, timed heat pulses).
-        "freq"  — ramp the trigger frequency from ``start`` by ``increment`` up
-                  to ``maximum`` (Hz); pulse width fixed at ``fixed_width_ms``.
-        "width" — ramp the pulse width from ``start`` by ``increment`` up to
-                  ``maximum`` (ms); frequency fixed at ``fixed_hz``.
-
-    step_interval_s throttles how often the ramp advances (0 = every poll); the
-    charge is still *checked* every poll so the onset is caught fast.
+    Only the pulse WIDTH is ramped (the effective firing rate follows from the
+    timeout).  The single pulse is fired hardware-timed via a very-low-frequency
+    carrier (one pulse per firing; see ChargeSequencerActuators / FilamentAdapter).
     """
-    mode: str = "off"              # off | freq | width
-    fixed_hz: float = 70.0         # frequency when ramping width
-    fixed_width_ms: float = 5.0    # pulse width when ramping freq (SSR min ~5 ms)
-    start: float = 5.0             # starting value of the ramped parameter
-    increment: float = 1.0         # per-step increment
-    maximum: float = 200.0         # ceiling of the ramped parameter
-    step_interval_s: float = 0.0   # min seconds between increments (0 = every poll)
+    enabled: bool = False
+    start_width_ms: float = 5.0    # SSR minimum pulse ~5 ms
+    increment_ms: float = 5.0
+    max_width_ms: float = 200.0
+    timeout_cycles: int = 6        # read cycles to wait (filament off) before reading
 
-    def freq_width(self, value: float) -> tuple[float, float]:
-        """(frequency_hz, width_ms) for a given ramp value."""
-        v = min(value, self.maximum)
-        if self.mode == "freq":
-            return (max(0.001, v), self.fixed_width_ms)
-        if self.mode == "width":
-            return (self.fixed_hz, max(0.001, v))
-        return (self.fixed_hz, self.fixed_width_ms)
 
-    @property
-    def enabled(self) -> bool:
-        return self.mode in ("freq", "width")
+@dataclass
+class RampCycle:
+    """One diagnostic record: a pulse fired, then the charge measured after the
+    wait, and how much charge changed since the previous read."""
+    width_ms: float
+    delta_q: float                 # charge change since the previous read cycle
+    charge: float                  # charge at this read
+    met: bool                      # did the stop condition trip at this read?
 
-    @property
-    def unit(self) -> str:
-        return "Hz" if self.mode == "freq" else "ms"
+
+class PulseRampRunner:
+    """
+    Poll-driven state machine for the pulse-wait-read ramp.  ``step(charge)`` is
+    called on every lock-in poll and returns what the caller should do this
+    poll: fire a pulse, turn the filament output off, and/or a completed
+    RampCycle to log, plus whether the stop condition is met.
+
+    The stop condition is a callable ``condition(charge) -> bool`` evaluated only
+    at the clean read (never mid-pulse), so noise during heating can't trip it.
+    """
+
+    def __init__(self, ramp: FilamentRamp, condition, now_fn=time.time):
+        self.ramp = ramp
+        self.condition = condition
+        self._now = now_fn
+        self.width = ramp.start_width_ms
+        self.phase = "fire"        # fire | wait | done
+        self.cycle = 0
+        self.fire_time = 0.0
+        self.turned_off = True
+        self.last_read = None
+        self.history: "deque[RampCycle]" = deque(maxlen=8)
+        self.done = False
+
+    def step(self, charge: float) -> dict:
+        """Return {fire: width|None, off: bool, cycle: RampCycle|None, done: bool}."""
+        if self.done:
+            return {"fire": None, "off": False, "cycle": None, "done": True}
+        if self.last_read is None:
+            self.last_read = charge
+
+        if self.phase == "fire":
+            self.fire_time = self._now()
+            self.cycle = 0
+            self.turned_off = False
+            self.phase = "wait"
+            return {"fire": self.width, "off": False, "cycle": None, "done": False}
+
+        # wait phase
+        self.cycle += 1
+        off = False
+        # Turn the output off once the hardware-timed pulse has elapsed (so we
+        # never truncate it and no second pulse can arrive).
+        if not self.turned_off and (self._now() - self.fire_time) >= self.width / 1000.0:
+            self.turned_off = True
+            off = True
+
+        if self.cycle < self.ramp.timeout_cycles:
+            return {"fire": None, "off": off, "cycle": None, "done": False}
+
+        # timeout reached: read + evaluate (filament is off -> clean)
+        if not self.turned_off:
+            self.turned_off = True
+            off = True
+        delta = charge - self.last_read
+        self.last_read = charge
+        met = bool(self.condition(charge))
+        cyc = RampCycle(self.width, delta, charge, met)
+        self.history.append(cyc)
+        if met:
+            self.done = True
+            return {"fire": None, "off": True, "cycle": cyc, "done": True}
+        # not met: step the width up and fire again next poll
+        self.width = min(self.width + self.ramp.increment_ms, self.ramp.max_width_ms)
+        self.phase = "fire"
+        return {"fire": None, "off": off, "cycle": cyc, "done": False}
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +213,7 @@ class ChargeController(QObject):
     action_changed = pyqtSignal(str)        # human-readable status
     event_logged = pyqtSignal(object)       # ControlEvent
     target_reached = pyqtSignal(float)      # charge when target is reached
+    cycle_logged = pyqtSignal(object)       # RampCycle (pulse-ramp diagnostics)
 
     def __init__(
         self,
@@ -193,11 +250,9 @@ class ChargeController(QObject):
         self._max_consecutive: int = 20
         self._consecutive_count: int = 0
 
-        # Filament ramp (gentle heating toward a target)
+        # Filament pulse-wait-read ramp (gentle heating toward a target)
         self._filament_ramp = FilamentRamp()
-        self._ramping: bool = False
-        self._ramp_value: float = 0.0
-        self._ramp_last_step: float = 0.0
+        self._pulse_runner: PulseRampRunner | None = None
 
     # ------------------------------------------------------------------
     # Configuration
@@ -235,10 +290,11 @@ class ChargeController(QObject):
             self._filament = filament
 
     def set_filament_ramp(self, ramp: FilamentRamp) -> None:
-        """Configure the filament heating ramp (see FilamentRamp)."""
+        """Configure the filament pulse-wait-read ramp (see FilamentRamp)."""
         self._filament_ramp = ramp
-        log.info("Filament ramp: mode=%s start=%.3g inc=%.3g max=%.3g",
-                 ramp.mode, ramp.start, ramp.increment, ramp.maximum)
+        log.info("Filament ramp: enabled=%s start=%.3g inc=%.3g max=%.3g cycles=%d",
+                 ramp.enabled, ramp.start_width_ms, ramp.increment_ms,
+                 ramp.max_width_ms, ramp.timeout_cycles)
 
     def get_filament_ramp(self) -> FilamentRamp:
         return self._filament_ramp
@@ -334,6 +390,15 @@ class ChargeController(QObject):
             return
 
         self._last_charge = charge
+
+        # --- Pulse ramp owns the loop while it runs ---
+        # It fires one filament pulse, waits N clean (filament-off) cycles, then
+        # reads and evaluates the stop condition.  Threshold rules / the normal
+        # at-target check are suspended while it runs because the charge is only
+        # trustworthy at the runner's clean reads (heating makes it noisy).
+        if self._pulse_runner is not None:
+            self._run_pulse_ramp(charge)
+            return
 
         # --- Check threshold rules first ---
         for rule in self._rules:
@@ -441,10 +506,10 @@ class ChargeController(QObject):
         """Fire the appropriate actuator."""
         now = time.time()
 
-        # Ramped heating is evaluated every poll (to advance the ramp), so it
-        # bypasses the "already doing this action" skip below.
+        # Ramped heating hands off to the pulse-wait-read runner, which then
+        # owns the loop (see on_charge_update) until the target is reached.
         if action == Action.HEAT and self._filament_ramp.enabled:
-            self._execute_heat_ramp(charge, error, now)
+            self._start_pulse_ramp(charge)
             return
 
         # A non-ramp action ends any ramp in progress.
@@ -495,52 +560,98 @@ class ChargeController(QObject):
             # Schedule stop after duration
             self._schedule_stop(Action.HEAT, self._heat_duration_s)
 
-    def _execute_heat_ramp(self, charge: float, error: float, now: float):
-        """Gentle ramped heating: advance one parameter (freq or width) up from
-        a low start, keeping the filament on, until the target is reached (the
-        at-target check stops it).  Called every poll; the ramp only advances
-        every step_interval_s so the charge is checked faster than it ramps."""
-        ramp = self._filament_ramp
-        if self._filament is None or not self._filament.is_connected:
+    def _start_pulse_ramp(self, charge: float):
+        """Begin the pulse-wait-read filament ramp toward the (negative) target.
+
+        Heating adds negative charge, so the stop condition is "charge has
+        reached the target band from above" (charge <= target + tolerance).
+        The runner then drives fire/wait/read on every poll via _run_pulse_ramp.
+        """
+        if self._filament is None or not getattr(self._filament, "is_connected", False):
             self.action_changed.emit("Filament not connected!")
             return
-        if not hasattr(self._filament, "set_pulse"):
-            self.action_changed.emit("Filament actuator has no ramp support")
+        if not hasattr(self._filament, "fire_pulse"):
+            self.action_changed.emit("Filament actuator has no pulse support")
             return
+        self._stop_all_actuators()
+        tgt, tol = self._target_charge, self._tolerance
+        self._pulse_runner = PulseRampRunner(
+            self._filament_ramp,
+            condition=lambda q: q <= tgt + tol,
+        )
+        self._current_action = Action.HEAT
+        self._action_start = time.time()
+        self._consecutive_count = 0
+        self.action_changed.emit(
+            f"Filament pulse ramp — target {tgt:+.1f} e, "
+            f"start {self._filament_ramp.start_width_ms:.3g} ms, "
+            f"{self._filament_ramp.timeout_cycles} cycles/read"
+        )
 
-        if self._current_action != Action.HEAT or not self._ramping:
-            # (Re)start the ramp from the gentle starting value.
+    def _run_pulse_ramp(self, charge: float):
+        """Advance the active pulse-wait-read runner by one poll and carry out
+        its requested actions (fire a pulse / turn the output off / log a read)."""
+        runner = self._pulse_runner
+        if runner is None:
+            return
+        r = runner.step(charge)
+        if r["off"]:
+            self._filament_pulse_off()
+        if r["fire"] is not None:
+            self._filament_fire_pulse(r["fire"], charge)
+        cyc = r["cycle"]
+        if cyc is not None:
+            self._log_event(
+                charge, Action.HEAT,
+                f"read width={cyc.width_ms:.3g} ms  Δq={cyc.delta_q:+.2f} e  "
+                f"charge={cyc.charge:+.1f} e",
+            )
+            self.cycle_logged.emit(cyc)
+        if r["done"]:
             self._stop_all_actuators()
-            self._ramp_value = ramp.start
-            self._ramp_last_step = now
-            self._ramping = True
-            self._current_action = Action.HEAT
-            self._action_start = now
-        elif (now - self._ramp_last_step >= ramp.step_interval_s
-              and self._ramp_value < ramp.maximum):
-            # Advance the ramp.
-            self._ramp_value = min(self._ramp_value + ramp.increment, ramp.maximum)
-            self._ramp_last_step = now
+            self._pulse_runner = None
+            self._current_action = Action.AT_TARGET
+            self._consecutive_count = 0
+            self.action_changed.emit(
+                f"At target: {charge:+.1f} e  (target {self._target_charge:+.1f})"
+            )
+            self.target_reached.emit(charge)
 
-        freq, width = ramp.freq_width(self._ramp_value)
+    def _filament_fire_pulse(self, width_ms: float, charge: float):
+        """Fire a single filament pulse of the given width (see FilamentAdapter
+        .fire_pulse — one hardware-timed pulse via a very-low-freq carrier)."""
+        if self._filament is None or not getattr(self._filament, "is_connected", False):
+            self.action_changed.emit("Filament not connected!")
+            return
+        fire = getattr(self._filament, "fire_pulse", None)
+        if fire is None:
+            self.action_changed.emit("Filament actuator has no pulse support")
+            return
         try:
-            self._filament.set_pulse(freq, width)
+            fire(width_ms)
         except Exception as e:
             self.action_changed.emit(f"Filament error: {e}")
             return
-
-        at_max = self._ramp_value >= ramp.maximum
-        detail = f"ramp {ramp.mode}={self._ramp_value:.4g} {ramp.unit}"
-        self._log_event(charge, Action.HEAT, detail)
+        self._consecutive_count += 1
         self.action_changed.emit(
-            f"Heating (ramp {ramp.mode} {self._ramp_value:.4g} {ramp.unit}"
-            f"{' — at max' if at_max else ''}) — charge {charge:+.1f} e"
+            f"Filament pulse {width_ms:.3g} ms — charge {charge:+.1f} e"
         )
 
+    def _filament_pulse_off(self):
+        """Turn the filament pulse output off (idempotent)."""
+        off = getattr(self._filament, "pulse_off", None) if self._filament is not None else None
+        if off is not None:
+            try:
+                off()
+            except Exception:
+                pass
+
     def _reset_ramp(self):
-        """Clear ramp state (call when the ramp ends: at target, on FLASH, stop)."""
-        self._ramping = False
-        self._ramp_value = 0.0
+        """Clear pulse-ramp state (call when the ramp ends: at target, on FLASH,
+        stop).  Turns the filament output off so no pulse is left armed."""
+        if self._pulse_runner is not None:
+            self._pulse_runner = None
+            self._filament_pulse_off()
 
     def _schedule_stop(self, action: Action, duration_s: float):
         """

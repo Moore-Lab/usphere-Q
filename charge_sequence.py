@@ -54,10 +54,17 @@ class SeqStep:
     flash_rate_hz: float = 10.0
     flash_ctrl_v: float = 0.0          # NGE flash-control voltage
 
-    # recharge (filament)
+    # recharge (filament) — pulse-wait-read ramp (fire one pulse, wait N clean
+    # read cycles, read, increment the pulse width until the threshold is met)
+    fil_start_width_ms: float = 5.0    # first pulse width (SSR min ~5 ms)
+    fil_increment_ms: float = 5.0      # width added after each read not yet met
+    fil_max_width_ms: float = 200.0    # width ceiling (safety)
+    fil_timeout_cycles: int = 6        # read cycles to wait (filament off) per read
+    fil_power_v: float = 0.0           # NGE filament power; 0 = leave unchanged
+    # legacy fixed-pulse fields (kept for old-config compatibility; unused by the
+    # pulse-wait-read recharge)
     fil_freq_hz: float = 10.0
     fil_width_ms: float = 100.0
-    fil_power_v: float = 0.0           # NGE filament power; 0 = leave unchanged
 
     # stop condition (actuator steps only)
     compare: str = "abs_le"            # key into COMPARES
@@ -97,9 +104,10 @@ class SeqStep:
                     f"  [≤{self.timeout_s:g}s]")
         if self.action == "recharge":
             p = f", power {self.fil_power_v:g} V" if self.fil_power_v > 0 else ""
-            return (f"Recharge (filament {self.fil_freq_hz:g} Hz, "
-                    f"{self.fil_width_ms:g} ms{p}) until {cmp} {self.threshold_e:g} e"
-                    f"  [≤{self.timeout_s:g}s]")
+            return (f"Recharge (filament pulse ramp {self.fil_start_width_ms:g}"
+                    f"→{self.fil_max_width_ms:g} ms +{self.fil_increment_ms:g}, "
+                    f"{self.fil_timeout_cycles:g} cyc/read{p}) "
+                    f"until {cmp} {self.threshold_e:g} e  [≤{self.timeout_s:g}s]")
         return f"{self.action}?"
 
     def to_dict(self) -> dict:
@@ -283,23 +291,20 @@ class ChargeSequencer(QObject):
             self._sleep(step.electrode_settle_s)
             return
 
-        # Start the actuator
+        if step.action == "discharge":
+            self._run_discharge(step)
+        elif step.action == "recharge":
+            self._run_recharge(step)
+        else:
+            self.log_msg.emit(f"Unknown action '{step.action}' — skipped")
+
+    def _run_discharge(self, step: SeqStep):
+        """Continuous flash-lamp discharge until the stop condition is met."""
         try:
-            if step.action == "discharge":
-                self._act.start_discharge(step.flash_rate_hz, step.flash_ctrl_v)
-                self.log_msg.emit(
-                    f"Discharge: flash {step.flash_rate_hz:g} Hz, "
-                    f"ctrl {step.flash_ctrl_v:g} V")
-            elif step.action == "recharge":
-                self._act.start_recharge(step.fil_freq_hz, step.fil_width_ms,
-                                         step.fil_power_v)
-                self.log_msg.emit(
-                    f"Recharge: filament {step.fil_freq_hz:g} Hz, "
-                    f"{step.fil_width_ms:g} ms"
-                    + (f", power {step.fil_power_v:g} V" if step.fil_power_v > 0 else ""))
-            else:
-                self.log_msg.emit(f"Unknown action '{step.action}' — skipped")
-                return
+            self._act.start_discharge(step.flash_rate_hz, step.flash_ctrl_v)
+            self.log_msg.emit(
+                f"Discharge: flash {step.flash_rate_hz:g} Hz, "
+                f"ctrl {step.flash_ctrl_v:g} V")
         except Exception as e:
             self.log_msg.emit(f"Actuator error: {type(e).__name__}: {e}")
             return
@@ -321,7 +326,78 @@ class ChargeSequencer(QObject):
                 break
             time.sleep(self._poll_s)
 
-        # Stop this actuator before moving on
+        self._act.stop_all()
+        q = self._current_charge
+        self.log_msg.emit(
+            f"  → stopped ({reason}) at charge={q:+.2f} e"
+            f", {time.time() - t0:.1f}s")
+
+    def _run_recharge(self, step: SeqStep):
+        """Pulse-wait-read filament recharge — the same PulseRampRunner the
+        Control tab uses: fire ONE pulse, wait N clean (filament-off) read
+        cycles, read the charge, and increment the pulse width until the step's
+        stop condition is met.  Reads are clean because the filament is off, so
+        the heating noise can't trip the condition early.  Here one loop
+        iteration (poll interval) is one read cycle."""
+        from charge_control import FilamentRamp, PulseRampRunner
+
+        if not hasattr(self._act, "fire_filament_pulse"):
+            self.log_msg.emit("Actuator has no single-pulse support — recharge skipped")
+            return
+        if step.fil_power_v > 0 and hasattr(self._act, "set_filament_power"):
+            try:
+                self._act.set_filament_power(step.fil_power_v)
+            except Exception as e:
+                self.log_msg.emit(f"Actuator error: {type(e).__name__}: {e}")
+                return
+
+        ramp = FilamentRamp(
+            enabled=True,
+            start_width_ms=step.fil_start_width_ms,
+            increment_ms=step.fil_increment_ms,
+            max_width_ms=step.fil_max_width_ms,
+            timeout_cycles=max(1, int(step.fil_timeout_cycles)),
+        )
+        runner = PulseRampRunner(ramp, condition=step.satisfied)
+        self.log_msg.emit(
+            f"Recharge (pulse ramp: start {ramp.start_width_ms:g} ms, "
+            f"+{ramp.increment_ms:g} ms → {ramp.max_width_ms:g} ms, "
+            f"{ramp.timeout_cycles} cyc/read"
+            + (f", power {step.fil_power_v:g} V" if step.fil_power_v > 0 else "") + ")")
+
+        cmp = COMPARES.get(step.compare, step.compare)
+        t0 = time.time()
+        reason = "timeout"
+        while self._state == SeqState.RUNNING:
+            if time.time() - t0 >= step.timeout_s:
+                reason = "timeout"
+                break
+            q = self._current_charge
+            if self._have_charge and abs(q) >= self._charge_limit:
+                reason = f"SAFETY charge limit {self._charge_limit:g} e"
+                break
+            if not self._have_charge:
+                time.sleep(self._poll_s)
+                continue
+            try:
+                r = runner.step(q)
+                if r["off"]:
+                    self._act.filament_pulse_off()
+                if r["fire"] is not None:
+                    self._act.fire_filament_pulse(r["fire"])
+            except Exception as e:
+                self.log_msg.emit(f"Actuator error: {type(e).__name__}: {e}")
+                break
+            c = r["cycle"]
+            if c is not None:
+                self.log_msg.emit(
+                    f"  read width={c.width_ms:g} ms  Δq={c.delta_q:+.2f} e  "
+                    f"q={c.charge:+.2f} e")
+            if r["done"]:
+                reason = f"reached {cmp} {step.threshold_e:g} e"
+                break
+            time.sleep(self._poll_s)
+
         self._act.stop_all()
         q = self._current_charge
         self.log_msg.emit(
