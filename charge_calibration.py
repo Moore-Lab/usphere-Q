@@ -126,6 +126,16 @@ class CalibrationStore:
         cals.append(cal)
         self._write()
 
+    def most_recent_lockin_cal(self) -> Optional[dict]:
+        """Return the most recent lock-in calibration overall (by date, then by
+        insertion order), or None if there are none."""
+        cals = self._data.get("lockin_calibrations", [])
+        if not cals:
+            return None
+        # Stable sort by date ascending, then take the last → newest date, and
+        # among same-date entries the one saved last.
+        return sorted(cals, key=lambda x: x.get("calibration_date", ""))[-1]
+
     def make_lockin_cal(
         self,
         sphere_diameter_um: float,
@@ -134,6 +144,7 @@ class CalibrationStore:
         drive_amplitude_vpp: float = 0.0,
         sr530_sensitivity_idx: int = -1,
         sr530_phase: float = 0.0,
+        known_charge: float = 0.0,
         notes: str = "",
     ) -> dict:
         """Create a lock-in calibration dict.
@@ -151,6 +162,7 @@ class CalibrationStore:
             "drive_amplitude_vpp": drive_amplitude_vpp,
             "sr530_sensitivity_idx": sr530_sensitivity_idx,
             "sr530_phase": sr530_phase,
+            "known_charge": known_charge,
             "calibration_date": str(date.today()),
             "notes": notes,
         }
@@ -280,6 +292,7 @@ def calibrate_lockin_from_voltage(
         drive_amplitude_vpp=drive_amplitude_vpp,
         sr530_sensitivity_idx=sr530_sensitivity_idx,
         sr530_phase=sr530_phase,
+        known_charge=float(known_charge),
         notes=f"Calibrated at {known_charge}e, V={measured_voltage:.6f}V{amp_note}",
     )
     store.save_lockin_cal(cal)

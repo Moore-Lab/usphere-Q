@@ -811,10 +811,26 @@ class CalibrationTab(QWidget):
         self._cal_list_text.setReadOnly(True)
         self._cal_list_text.setMaximumHeight(120)
         listg.addWidget(self._cal_list_text)
-        refresh_btn = QPushButton("Refresh list")
-        refresh_btn.setMaximumWidth(100)
+
+        # Select a lock-in calibration + load it into Analysis (V/e + cal drive
+        # amp) and back into the charge inputs (known charge).
+        load_row = QHBoxLayout()
+        self._cal_select = QComboBox()
+        self._cal_select.setMinimumWidth(320)
+        load_row.addWidget(self._cal_select, 1)
+        load_btn = QPushButton("Load calibration")
+        load_btn.setMaximumWidth(140)
+        load_btn.clicked.connect(self._load_selected_lockin)
+        load_row.addWidget(load_btn)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setMaximumWidth(90)
         refresh_btn.clicked.connect(self._refresh_cal_list)
-        listg.addWidget(refresh_btn)
+        load_row.addWidget(refresh_btn)
+        listg.addLayout(load_row)
+        self._load_status = QLabel("—")
+        self._load_status.setStyleSheet("color: gray;")
+        self._load_status.setWordWrap(True)
+        listg.addWidget(self._load_status)
         outer.addWidget(list_grp)
 
         outer.addStretch()
@@ -1085,6 +1101,8 @@ class CalibrationTab(QWidget):
     # ------------------------------------------------------------------
 
     def _refresh_cal_list(self):
+        self._lockin_cals = []
+        self._cal_select.clear()
         try:
             from charge_calibration import CalibrationStore
             store = CalibrationStore(self._cal_file_edit.text().strip())
@@ -1103,11 +1121,72 @@ class CalibrationTab(QWidget):
                     f"V/e={c['volts_per_electron']:.6f}  "
                     f"date={c.get('calibration_date', '?')}"
                 )
+                self._lockin_cals.append(c)
+                self._cal_select.addItem(self._lockin_cal_label(c))
             self._cal_list_text.setPlainText(
                 "\n".join(lines) if lines else "No calibrations found"
             )
         except Exception as e:
             self._cal_list_text.setPlainText(f"Error: {e}")
+
+    @staticmethod
+    def _lockin_cal_label(c: dict) -> str:
+        amp = c.get("drive_amplitude_vpp", 0.0)
+        return (f"{c.get('sphere_diameter_um', '?')}µm @ "
+                f"{c.get('drive_frequency_hz', 0):.1f} Hz  |  "
+                f"V/e={c.get('volts_per_electron', 0):.6f}  "
+                f"drive={amp:g} Vpp  ({c.get('calibration_date', '?')})")
+
+    def _apply_lockin_cal(self, cal: dict) -> bool:
+        """Push a stored lock-in calibration into the Analysis tab (V/e + cal
+        drive amp, via lockin_cal_saved) and back into the charge inputs (known
+        charge + polarity).  Returns True on success."""
+        if not cal:
+            self._load_status.setText("No lock-in calibration to load")
+            self._load_status.setStyleSheet("color: #C62828;")
+            return False
+        vpe = float(cal.get("volts_per_electron", 1.0))
+        drive_amp = float(cal.get("drive_amplitude_vpp", 0.0))
+        self.lockin_cal_saved.emit(vpe, drive_amp, "sr530")   # -> Analysis
+        kq = cal.get("known_charge", 0.0) or 0.0
+        note = ""
+        if kq:
+            self._auto_charge_spin.setValue(int(round(abs(float(kq)))))
+            self._auto_polarity_combo.setCurrentText(
+                "positive" if float(kq) >= 0 else "negative")
+            note = f", charge={float(kq):+g} e"
+        self._load_status.setText(
+            f"Loaded: {self._lockin_cal_label(cal)} -> Analysis (V/e + cal drive){note}")
+        self._load_status.setStyleSheet("color: #2E7D32;")
+        return True
+
+    def _load_selected_lockin(self):
+        cals = getattr(self, "_lockin_cals", [])
+        i = self._cal_select.currentIndex()
+        if 0 <= i < len(cals):
+            self._apply_lockin_cal(cals[i])
+        else:
+            self._load_status.setText("Select a lock-in calibration first")
+            self._load_status.setStyleSheet("color: #C62828;")
+
+    def load_most_recent_lockin(self) -> bool:
+        """Load the most recent lock-in calibration into Analysis (used on
+        lock-in connect).  Also refreshes the dropdown."""
+        self._refresh_cal_list()
+        try:
+            from charge_calibration import CalibrationStore
+            store = CalibrationStore(self._cal_file_edit.text().strip())
+            cal = store.most_recent_lockin_cal()
+        except Exception:
+            cal = None
+        if cal is None:
+            return False
+        # Select it in the dropdown too.
+        for idx, c in enumerate(getattr(self, "_lockin_cals", [])):
+            if c is cal or c == cal:
+                self._cal_select.setCurrentIndex(idx)
+                break
+        return self._apply_lockin_cal(cal)
 
     # ------------------------------------------------------------------
     # Config

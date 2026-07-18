@@ -137,9 +137,12 @@ class SR530Tab(QWidget):
     not installed.
     """
 
+    connected = pyqtSignal(object)   # re-emits the live SR530Controller on connect
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._controller = None   # live SR530Controller when connected (shared)
+        self._conn_tab = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -179,6 +182,15 @@ class SR530Tab(QWidget):
         self._monitor_tab.set_controller(ctrl)
         self._tabs.setTabEnabled(1, True)
         self._tabs.setTabEnabled(2, True)
+        self.connected.emit(ctrl)
+
+    def connect_lockin(self) -> None:
+        """Trigger the embedded SR530 connection (used by 'Connect to all')."""
+        if self._conn_tab is not None and not self.controller():
+            try:
+                self._conn_tab._on_connect()
+            except Exception:
+                pass
 
     def _on_disconnected(self) -> None:
         self._controller = None
@@ -437,6 +449,8 @@ class ConnectionsTab(QWidget):
     """
 
     launch_clicked = pyqtSignal()
+    connect_all_clicked = pyqtSignal()   # WG/NGE connected here; wired to also
+                                         # connect the lock-in + sync the reference
 
     def __init__(self, saved_configs: dict, parent=None):
         super().__init__(parent)
@@ -461,6 +475,23 @@ class ConnectionsTab(QWidget):
 
         outer.addSpacing(12)
 
+        connect_all_row = QHBoxLayout()
+        connect_all_btn = QPushButton("Connect to all")
+        connect_all_btn.setMinimumWidth(200)
+        connect_all_btn.setStyleSheet(
+            "font-size: 14px; font-weight: bold;"
+            "background-color: #2E7D32; color: white;"
+            "padding: 8px 16px; border-radius: 4px;"
+        )
+        connect_all_btn.setToolTip(
+            "Connect every instrument at once: WG1/WG2/WG3, the NGE power "
+            "supply, and the SR530 lock-in (then sync the lock-in reference).")
+        connect_all_btn.clicked.connect(self._on_connect_all)
+        connect_all_row.addStretch()
+        connect_all_row.addWidget(connect_all_btn)
+        connect_all_row.addStretch()
+        outer.addLayout(connect_all_row)
+
         launch_row = QHBoxLayout()
         launch_btn = QPushButton("Launch Electrode Control ▶")
         launch_btn.setMinimumWidth(200)
@@ -484,6 +515,21 @@ class ConnectionsTab(QWidget):
         outer.addLayout(save_row)
 
         outer.addStretch()
+
+    def _on_connect_all(self):
+        """Connect every configured instrument at once (each panel's connect is
+        async), then let the app connect the lock-in + sync the reference."""
+        for panel in self._panels.values():
+            try:
+                panel._on_connect()
+            except Exception:
+                pass
+        if self._nge_panel is not None:
+            try:
+                self._nge_panel._on_connect()
+            except Exception:
+                pass
+        self.connect_all_clicked.emit()
 
     def _on_save(self):
         _append_log(self.get_all_configs())
@@ -617,6 +663,12 @@ class ChargeWidget(QWidget):
         # The Analysis tab's SR530 source reuses this tab's connection (a serial
         # port can't be opened twice), so you connect the SR530 only once.
         self._analysis_tab.set_sr530_provider(self._sr530_tab.controller)
+        # Load the most recent lock-in calibration into Analysis when the SR530
+        # connects (V/e + cal drive amp).
+        self._sr530_tab.connected.connect(self._on_lockin_connected)
+        # "Connect to all" (Connections tab) also connects the lock-in and syncs
+        # the reference once the WGs are up.
+        self._connections_tab.connect_all_clicked.connect(self._on_connect_all_extra)
 
         # --- Build tab widget ---
         self._tabs = QTabWidget()
@@ -659,6 +711,21 @@ class ChargeWidget(QWidget):
         self._analysis_tab.set_volts_per_electron(vpe, kind)
         self._analysis_tab.set_cal_drive_amp(drive_amp, kind)
 
+    def _on_lockin_connected(self, ctrl):
+        """SR530 connected — auto-load the most recent lock-in calibration
+        (V/e + cal drive amp) into the Analysis tab."""
+        try:
+            self._calibration_tab.load_most_recent_lockin()
+        except Exception:
+            pass
+
+    def _on_connect_all_extra(self):
+        """'Connect to all' has fired the WG/NGE connects — also connect the
+        lock-in, and sync the reference once the (async) WG connects are up so it
+        mirrors the drive as soon as the drive is output."""
+        self._sr530_tab.connect_lockin()
+        QTimer.singleShot(4000, self._wg_tab.lockin_ref.sync_reference)
+
     def _sync_actuators(self):
         """Wire WaveformControlTab actuators into ChargeController and
         PhotonOrderExperiment, and keep the Analysis tab's drive-amplitude
@@ -685,9 +752,13 @@ class ChargeWidget(QWidget):
             self._photon_exp.abort()
         if self._sequencer.is_running:
             self._sequencer.stop()
-        # Stop the filament pulser background thread (if it was started).
+        # Stop the filament + flash background threads (if they were started).
         try:
             self._filament_actuator.shutdown()
+        except Exception:
+            pass
+        try:
+            self._wg_tab.flashlamp.shutdown()
         except Exception:
             pass
         configs = self._connections_tab.get_all_configs()

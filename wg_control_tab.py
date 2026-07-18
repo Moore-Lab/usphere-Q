@@ -545,7 +545,7 @@ class ChannelControlWidget(QWidget):
         self._amp = QDoubleSpinBox()
         self._amp.setRange(0.001, 20.0)
         self._amp.setDecimals(3)
-        self._amp.setValue(1.0)
+        self._amp.setValue(8.0)
         self._amp.setSuffix(" Vpp")
         self._amp.setMinimumWidth(110)
         g.addWidget(self._amp, row, 1, 1, 2)
@@ -1662,11 +1662,13 @@ class NGEControlGroup(QGroupBox):
     _meas_ready = pyqtSignal(object)   # dict | None
 
     def __init__(self, title: str, role: str, nge_map: NGEChannelMap,
-                 default_current_a: float = 0.1, parent=None):
+                 default_current_a: float = 0.1, default_voltage_v: float = 0.0,
+                 parent=None):
         super().__init__(title, parent)
         self._role = role
         self._map = nge_map
         self._default_current = default_current_a
+        self._default_voltage = default_voltage_v
         self._busy = False   # guard: at most one in-flight serial op per group
         self._build()
         self._status_ready.connect(self._on_status)
@@ -1691,6 +1693,7 @@ class NGEControlGroup(QGroupBox):
         self._voltage = QDoubleSpinBox()
         self._voltage.setRange(0.0, 32.0)
         self._voltage.setDecimals(3)
+        self._voltage.setValue(self._default_voltage)
         self._voltage.setSuffix(" V")
         self._voltage.setMinimumWidth(110)
         g.addWidget(self._voltage, row, 1)
@@ -1880,17 +1883,62 @@ class NGEControlGroup(QGroupBox):
 
 class FlashLampAdapter:
     """Combines a trigger PulseGroup and an NGEControlGroup into a
-    FlashLampController-compatible object."""
+    FlashLampController-compatible object.
+
+    The flash trigger AFG serial I/O (enable = setup_pulse + output_on, disable =
+    output_off) runs on a background _AfgActionQueue so the control loop never
+    blocks on it — the same off-GUI-thread treatment as the filament."""
 
     def __init__(self, trigger: PulseGroup, control: NGEControlGroup):
         self._trigger = trigger
         self._control = control
+        self._worker: "_AfgActionQueue | None" = None
+
+    def _wk(self) -> "_AfgActionQueue":
+        if self._worker is None:
+            self._worker = _AfgActionQueue()
+        if not self._worker.isRunning():
+            self._worker.start()
+        return self._worker
 
     def enable(self) -> bool:
-        return self._trigger.enable()
+        """Program the flash pulse (rate/width) + turn the output on, on the
+        background worker.  Captures the settings on the calling thread and
+        returns immediately."""
+        trig = self._trigger
+        afg, ch = trig._afg_ch()
+        if afg is None:
+            return False
+        freq = trig._freq.value()
+        width_s = trig._width_ms.value() * 1e-3
+        amp = trig._amp.value()
+        offset = trig._get_offset()
+        hi_z = (trig._imp.currentIndex() == 1)
+
+        def op():
+            with _afg_lock(afg):
+                (afg.set_load_high_z if hi_z else afg.set_load_50_ohm)(ch)
+                afg.setup_pulse(ch, frequency=freq, amplitude=amp,
+                                offset=offset, width=width_s)
+                afg.output_on(ch)
+        self._wk().submit(op)
+        return True
 
     def disable(self) -> bool:
-        return self._trigger.disable()
+        """Turn the flash output off (ordered through the worker so it can't
+        race a pending enable)."""
+        afg, ch = self._trigger._afg_ch()
+        if afg is None:
+            return False
+
+        def op():
+            with _afg_lock(afg):
+                afg.output_off(ch)
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.submit(op)
+        else:
+            op()
+        return True
 
     @property
     def is_connected(self) -> bool:
@@ -1906,8 +1954,9 @@ class FlashLampAdapter:
         self._control._output_off()
 
     def set_flash_rate(self, rate_hz: float):
+        """Set the flash rate.  Applied on the next enable() (no immediate serial
+        I/O), so it doesn't block; callers always enable() afterwards."""
         self._trigger._freq.setValue(rate_hz)
-        self._trigger._apply()
 
     def set_electrode_voltage(self, voltage_v: float):
         self._control.set_voltage(voltage_v)
@@ -1917,6 +1966,13 @@ class FlashLampAdapter:
 
     def get_electrode_voltage(self) -> float:
         return self._control.get_voltage()
+
+    def shutdown(self):
+        """Stop the background worker (call on GUI close)."""
+        if self._worker is not None:
+            self._worker.shutdown()
+            self._worker.wait(2000)
+            self._worker = None
 
 
 # ---------------------------------------------------------------------------
@@ -2022,6 +2078,32 @@ class _FilamentPulser(QThread):
         channel/amplitude changed)."""
         self._key = None
         self._cur_width = None
+
+
+class _AfgActionQueue(QThread):
+    """Runs submitted callables (each does AFG serial I/O) on a worker thread so
+    the caller never blocks on the ~80 ms-per-write serial port.  Used by the
+    flash lamp (continuous enable/disable) — see FlashLampAdapter."""
+
+    def __init__(self):
+        super().__init__()
+        self._q: "queue.Queue" = queue.Queue()
+
+    def submit(self, fn):
+        self._q.put(fn)
+
+    def shutdown(self):
+        self._q.put(None)
+
+    def run(self):
+        while True:
+            fn = self._q.get()
+            if fn is None:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -2436,7 +2518,7 @@ class LockInReferenceGroup(QGroupBox):
 
         g.addWidget(QLabel("Amplitude:"), row, 0, Qt.AlignRight)
         self._amp = QDoubleSpinBox(); self._amp.setRange(0.001, 10.0)
-        self._amp.setDecimals(3); self._amp.setValue(1.0); self._amp.setSuffix(" Vpp")
+        self._amp.setDecimals(3); self._amp.setValue(8.0); self._amp.setSuffix(" Vpp")
         self._amp.setMinimumWidth(110)
         g.addWidget(self._amp, row, 1, 1, 2)
         row += 1
@@ -4292,9 +4374,12 @@ class WaveformControlTab(QWidget):
         self.flash_trigger = PulseGroup(
             "Flash Lamp — Trigger (pulse)", self._get_afg, "WG3", "CH1"
         )
+        # Flash-lamp defaults: 200 Hz rate, 4 ms pulse.
+        self.flash_trigger._freq.setValue(200.0)
+        self.flash_trigger._width_ms.setValue(4.0)
         self.flash_control = NGEControlGroup(
             "Flash Lamp — Control (NGE)", "flash_control", self.nge_map,
-            default_current_a=0.1,
+            default_current_a=0.1, default_voltage_v=4.0,
         )
         flash_v.addWidget(self.flash_trigger)
         flash_v.addWidget(self.flash_control)
