@@ -732,20 +732,25 @@ class ChargeWidget(QWidget):
         self._sr530_tab.connect_lockin()
         QTimer.singleShot(4000, self._wg_tab.lockin_ref.sync_reference)
 
+    #: Drive amplitude the "Start charge monitor" macro brings the field up at.
+    #: Deliberately low — a highly-charged sphere must not be over-driven before
+    #: you know its charge; raise it manually once the readout is sane.
+    START_MONITOR_DRIVE_VPP = 0.1
+
     def _on_start_charge_monitor(self):
         """One-click 'Start charge monitor': connect everything, then (once the
-        async connects are up) drive Y at 100 Hz / 8 Vpp, start the lock-in
+        async connects are up) drive Y at 100 Hz / 0.1 Vpp, start the lock-in
         (SR530 direct, Y axis), and auto-range the sensitivity."""
         self._connections_tab._on_connect_all()   # WG/NGE + (wired) SR530 + ref sync
         QTimer.singleShot(5000, self._finish_start_charge_monitor)
 
     def _finish_start_charge_monitor(self):
-        # Drive the Y electrode at 100 Hz / 8 Vpp.
+        # Drive the Y electrode at 100 Hz, starting LOW (see the constant).
         y = getattr(self._wg_tab, "y_drive", None)
         if y is not None:
             try:
                 y._freq.setValue(100.0)
-                y._amp.setValue(8.0)
+                y._amp.setValue(self.START_MONITOR_DRIVE_VPP)
                 y._apply()
                 y._output_on()
             except Exception:
@@ -754,6 +759,9 @@ class ChargeWidget(QWidget):
         at = self._analysis_tab
         at._axis_combo.setCurrentIndex(1)     # Y
         at._source_combo.setCurrentIndex(2)   # SR530 direct
+        # Push the drive amplitude now so the charge readout normalizes by the
+        # low drive immediately, instead of waiting for the 2 s actuator poll.
+        at.set_current_drive_amp(self.START_MONITOR_DRIVE_VPP)
         if at._source is None:
             at._on_start()
         at.request_autorange()
