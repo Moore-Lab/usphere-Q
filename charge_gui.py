@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
 
 from charge_analysis import AnalysisTab
 from charge_control import ChargeController
-from charge_gui_tabs import ControlTab, CalibrationTab, ExperimentTab
+from charge_gui_tabs import ControlTab, CalibrationTab, PowerSweepTab
 from photon_order_experiment import PhotonOrderExperiment
 from charge_sequence import ChargeSequencer
 from sequencer_tab import SequencerTab
@@ -598,12 +598,16 @@ class ChargeWidget(QWidget):
         if "Calibration" in saved:
             self._calibration_tab.restore_config(saved["Calibration"])
 
-        # --- Experiment tab (Photon Order) ---
-        self._experiment_tab = ExperimentTab()
+        # --- Power-sweep tab (photon-order measurement) ---
+        self._experiment_tab = PowerSweepTab()
         if "Experiment" in saved:
             self._experiment_tab.restore_config(saved["Experiment"])
         self._photon_exp = PhotonOrderExperiment()
         self._experiment_tab.set_experiment(self._photon_exp)
+        # The sweep applies the nominal drive on the GUI thread before starting
+        # (so the setback reduces from it); reuse the sequencer's set-electrode
+        # handler (sets the drive amplitude + re-mirrors the reference).
+        self._experiment_tab.apply_drive_requested.connect(self._on_seq_set_electrode)
 
         # --- Command sequencer (charge/discharge cycles) ---
         self._seq_actuators = ChargeSequencerActuators(self._wg_tab)
@@ -681,9 +685,9 @@ class ChargeWidget(QWidget):
         self._tabs.addTab(self._control_tab,     "Control")
         self._tabs.addTab(self._calibration_tab, "Calibration")
 
-        # Experiment tab holds the photon-order scan and the command sequencer.
+        # Experiment tab holds the power sweep and the command sequencer.
         self._experiment_container = QTabWidget()
-        self._experiment_container.addTab(self._experiment_tab, "Photon Order")
+        self._experiment_container.addTab(self._experiment_tab, "Power sweep")
         self._experiment_container.addTab(self._sequencer_tab, "Command Sequence")
         self._tabs.addTab(self._experiment_container, "Experiment")
 

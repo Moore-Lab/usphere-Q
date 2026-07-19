@@ -625,7 +625,7 @@ class ChargeController(QObject):
             self.action_changed.emit("Flash lamp not connected!")
             return
         if not self._flash_on:
-            self._park_setback()
+            self._park_setback("flash")
             # Program the device settings, then turn on.
             for name, arg in (("set_flash_rate", self._flash_rate_hz),
                               ("set_electrode_voltage", self._flash_ctrl_v)):
@@ -818,10 +818,10 @@ class ChargeController(QObject):
             self.stop(f"Reached target: {charge:+.1f} e "
                       f"(target {self._target_charge:+.1f})")
 
-    def _park_setback(self):
+    def _park_setback(self, tool: str = "filament"):
         if self._setback is not None:
             try:
-                self._setback.park()
+                self._setback.park(tool)
             except Exception:
                 pass
 

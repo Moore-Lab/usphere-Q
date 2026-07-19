@@ -276,6 +276,65 @@ class WaveformGenTab(QWidget):
 
 
 # ======================================================================
+# DriveSetbackConfig — reusable "reduce the drive while charging" editor
+# ======================================================================
+
+class DriveSetbackConfig(QGroupBox):
+    """Reusable 'reduce the electrode drive while charging' editor: a checkbox,
+    a charging amplitude, and which tool(s) it applies to (flash / filament /
+    both).  Used by the Control tab and the Power-sweep tab; feeds
+    DriveSetbackAdapter via get_params()."""
+
+    _TOOLS = [("both", "Both"), ("flash", "Flash only"), ("filament", "Filament only")]
+
+    def __init__(self, parent=None):
+        super().__init__("Drive setback while charging", parent)
+        g = QGridLayout(self)
+        self._cb = QCheckBox("Reduce the electrode drive while charging")
+        self._cb.setToolTip(
+            "Park the monitored axis' drive low while the selected tool is on so a\n"
+            "highly-charged sphere isn't over-driven; restored right after. Charge\n"
+            "readings stay normalized, so the reported charge is unchanged.")
+        g.addWidget(self._cb, 0, 0, 1, 3)
+        g.addWidget(QLabel("Charging amplitude:"), 1, 0, Qt.AlignRight)
+        self._amp = QDoubleSpinBox()
+        self._amp.setRange(0.001, 20.0); self._amp.setDecimals(3)
+        self._amp.setValue(0.100); self._amp.setSuffix(" Vpp"); self._amp.setMaximumWidth(110)
+        g.addWidget(self._amp, 1, 1)
+        g.addWidget(QLabel("Apply to:"), 2, 0, Qt.AlignRight)
+        self._tool = QComboBox()
+        for _, label in self._TOOLS:
+            self._tool.addItem(label)
+        self._tool.setToolTip("Which charging tool the drive setback applies to.")
+        g.addWidget(self._tool, 2, 1)
+        g.setColumnStretch(2, 1)
+
+    def get_params(self) -> dict:
+        """Consumed by DriveSetbackAdapter.get_params."""
+        tool = self._TOOLS[self._tool.currentIndex()][0]
+        return {
+            "enabled": self._cb.isChecked(),
+            "charging_vpp": self._amp.value(),
+            "apply_flash": tool in ("both", "flash"),
+            "apply_filament": tool in ("both", "filament"),
+        }
+
+    def get_config(self) -> dict:
+        return {"enabled": self._cb.isChecked(),
+                "charging_vpp": self._amp.value(),
+                "apply_to": self._TOOLS[self._tool.currentIndex()][0]}
+
+    def restore_config(self, cfg: dict):
+        if "enabled" in cfg:
+            self._cb.setChecked(bool(cfg["enabled"]))
+        if "charging_vpp" in cfg:
+            self._amp.setValue(float(cfg["charging_vpp"]))
+        keys = [k for k, _ in self._TOOLS]
+        if cfg.get("apply_to") in keys:
+            self._tool.setCurrentIndex(keys.index(cfg["apply_to"]))
+
+
+# ======================================================================
 # ControlTab — closed-loop charge control
 # ======================================================================
 
@@ -407,20 +466,9 @@ class ControlTab(QWidget):
         tg.setColumnStretch(6, 1)
         outer.addWidget(tgt_grp)
 
-        # --- Drive setback (applies to both tools) --------------------------
-        sb_grp = QGroupBox("Drive setback while charging (flash or filament)")
-        sbg = QGridLayout(sb_grp)
-        self._setback_cb = QCheckBox("Reduce the electrode drive while charging")
-        self._setback_cb.setToolTip(
-            "Park the monitored axis' drive low while flashing/heating so a\n"
-            "highly-charged sphere isn't over-driven; restored right after.\n"
-            "Charge readings stay normalized, so the reported charge is unchanged.")
-        sbg.addWidget(self._setback_cb, 0, 0, 1, 2)
-        sbg.addWidget(QLabel("Charging amplitude:"), 1, 0, Qt.AlignRight)
-        self._setback_amp = self._spin(0.001, 20.0, 3, 0.100, " Vpp")
-        sbg.addWidget(self._setback_amp, 1, 1)
-        sbg.setColumnStretch(2, 1)
-        outer.addWidget(sb_grp)
+        # --- Drive setback (per-tool: flash / filament / both) --------------
+        self._setback = DriveSetbackConfig()
+        outer.addWidget(self._setback)
 
         # --- Safety ---------------------------------------------------------
         self._overload_cb = QCheckBox("Stop on lock-in overload")
@@ -549,10 +597,7 @@ class ControlTab(QWidget):
 
     def get_setback_params(self) -> dict:
         """Drive-setback settings, read by DriveSetbackAdapter at charging time."""
-        return {
-            "enabled": self._setback_cb.isChecked(),
-            "charging_vpp": self._setback_amp.value(),
-        }
+        return self._setback.get_params()
 
     # ------------------------------------------------------------------
     # Config save / restore
@@ -567,8 +612,7 @@ class ControlTab(QWidget):
         cfg["_gui_target"] = self._target_spin.value()
         cfg["_gui_tolerance"] = self._tol_spin.value()
         cfg["_gui_timeout_min"] = self._timeout_spin.value()
-        cfg["_gui_setback_enabled"] = self._setback_cb.isChecked()
-        cfg["_gui_setback_vpp"] = self._setback_amp.value()
+        cfg["_gui_setback"] = self._setback.get_config()
         cfg["_gui_stop_on_overload"] = self._overload_cb.isChecked()
         cfg["_gui_filament_ramp"] = self._ramp_config.get_config()
         return cfg
@@ -583,13 +627,12 @@ class ControlTab(QWidget):
             "_gui_target": self._target_spin,
             "_gui_tolerance": self._tol_spin,
             "_gui_timeout_min": self._timeout_spin,
-            "_gui_setback_vpp": self._setback_amp,
         }
         for key, spin in setters.items():
             if key in cfg:
                 spin.setValue(float(cfg[key]))
-        if "_gui_setback_enabled" in cfg:
-            self._setback_cb.setChecked(bool(cfg["_gui_setback_enabled"]))
+        if "_gui_setback" in cfg:
+            self._setback.restore_config(cfg["_gui_setback"])
         if "_gui_stop_on_overload" in cfg:
             self._overload_cb.setChecked(bool(cfg["_gui_stop_on_overload"]))
         if "_gui_filament_ramp" in cfg:
@@ -1250,160 +1293,281 @@ class CalibrationTab(QWidget):
 
 
 # ======================================================================
-# ExperimentTab — photon order experiment
+# PowerSweepTab — flash power/frequency sweep (photon-order measurement)
 # ======================================================================
 
-class ExperimentTab(QWidget):
+class PowerSweepTab(QWidget):
     """
-    GUI for the photon-order experiment.
+    GUI for the flash-lamp power sweep (photon-order measurement).
 
-    Wraps a PhotonOrderExperiment instance.  The experiment's actuators
-    come from the Connections tab; charge measurements come from the
-    Analysis tab's source.
+    Sweeps the flash control voltage × flash rate as a 2-D grid.  Each grid
+    point:  reset the charge to a set point with the filament ramp, park the
+    electrode drive for the flash (per-tool setback), start a fresh DAQ run,
+    flash + count charge-change events until N are seen, then stop.
 
-    Displays a live 2-D heatmap of mean_changes_per_flash(rate, voltage).
+    Mirrors the Control tab's charging controls (filament ramp + per-tool drive
+    setback + stop-on-overload) and embeds a DAQ acquire panel so a recording
+    run starts/stops with each sweep step.  Wraps a PhotonOrderExperiment.
+
+    Emits apply_drive_requested(vpp) once at start so the GUI applies the
+    nominal monitored-axis drive on the GUI thread (the setback reduces from
+    it); wire it to the same handler the sequencer's set-electrode uses.
     """
+
+    apply_drive_requested = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._experiment = None
-        self._heatmap_data = None       # 2-D numpy array (or list-of-lists)
-        self._plot_widget = None        # pyqtgraph ImageItem
+        self._heatmap_data = None
+        self._rates: list[float] = []
+        self._voltages: list[float] = []
         self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
         outer.setSpacing(8)
         outer.setContentsMargins(6, 6, 6, 6)
 
-        # --- Scan parameters ---
-        scan_grp = QGroupBox("Scan parameters")
-        sg = QGridLayout(scan_grp)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        col = QVBoxLayout(inner)
+        col.setSpacing(8)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
 
-        sg.addWidget(QLabel("Flash rates (Hz), comma-separated:"), 0, 0)
+        # --- Flash sweep grid (control voltage × frequency) -----------------
+        sweep_grp = QGroupBox("Flash sweep — control voltage × frequency grid")
+        sg = QGridLayout(sweep_grp)
+
+        sg.addWidget(QLabel("Control voltages (V):"), 0, 0, Qt.AlignRight)
+        self._voltages_edit = QLineEdit("2, 3, 4, 5")
+        self._voltages_edit.setToolTip("Comma-separated flash-lamp control voltages.")
+        sg.addWidget(self._voltages_edit, 0, 1, 1, 4)
+        self._v_start = self._spin(0.0, 32.0, 3, 2.0, " V")
+        self._v_stop = self._spin(0.0, 32.0, 3, 5.0, " V")
+        self._v_step = self._spin(0.001, 32.0, 3, 1.0, " V")
+        v_btn = QPushButton("→ List")
+        v_btn.setMaximumWidth(60)
+        v_btn.setToolTip("Fill the list from np.arange(start, stop, step) — stop excluded.")
+        v_btn.clicked.connect(lambda: self._range_to_list(
+            self._voltages_edit, self._v_start, self._v_stop, self._v_step))
+        sg.addWidget(QLabel("arange:"), 1, 0, Qt.AlignRight)
+        sg.addWidget(self._v_start, 1, 1)
+        sg.addWidget(self._v_stop, 1, 2)
+        sg.addWidget(self._v_step, 1, 3)
+        sg.addWidget(v_btn, 1, 4)
+
+        sg.addWidget(QLabel("Flash rates (Hz):"), 2, 0, Qt.AlignRight)
         self._rates_edit = QLineEdit("1, 2, 5, 10, 20, 50")
-        sg.addWidget(self._rates_edit, 0, 1)
-
-        sg.addWidget(QLabel("Electrode voltages (V), comma-separated:"), 1, 0)
-        self._voltages_edit = QLineEdit("50, 100, 150, 200, 250")
-        sg.addWidget(self._voltages_edit, 1, 1)
-
+        self._rates_edit.setToolTip("Comma-separated flash trigger frequencies.")
+        sg.addWidget(self._rates_edit, 2, 1, 1, 4)
+        self._f_start = self._spin(0.001, 1e6, 3, 1.0, " Hz")
+        self._f_stop = self._spin(0.001, 1e6, 3, 50.0, " Hz")
+        self._f_step = self._spin(0.001, 1e6, 3, 5.0, " Hz")
+        f_btn = QPushButton("→ List")
+        f_btn.setMaximumWidth(60)
+        f_btn.setToolTip("Fill the list from np.arange(start, stop, step) — stop excluded.")
+        f_btn.clicked.connect(lambda: self._range_to_list(
+            self._rates_edit, self._f_start, self._f_stop, self._f_step))
+        sg.addWidget(QLabel("arange:"), 3, 0, Qt.AlignRight)
+        sg.addWidget(self._f_start, 3, 1)
+        sg.addWidget(self._f_stop, 3, 2)
+        sg.addWidget(self._f_step, 3, 3)
+        sg.addWidget(f_btn, 3, 4)
         sg.setColumnStretch(1, 1)
-        outer.addWidget(scan_grp)
+        col.addWidget(sweep_grp)
 
-        # --- Collection parameters ---
-        collect_grp = QGroupBox("Collection parameters")
+        # --- Collection (N events per step) ---------------------------------
+        collect_grp = QGroupBox("Collection — N discharge events per step")
         cg = QGridLayout(collect_grp)
-
-        cg.addWidget(QLabel("Min events per point:"), 0, 0)
+        cg.addWidget(QLabel("Min events per point (N):"), 0, 0, Qt.AlignRight)
         self._min_events_spin = QSpinBox()
-        self._min_events_spin.setRange(5, 10000)
-        self._min_events_spin.setValue(50)
+        self._min_events_spin.setRange(1, 100000); self._min_events_spin.setValue(50)
         self._min_events_spin.setMaximumWidth(100)
         cg.addWidget(self._min_events_spin, 0, 1)
-
-        cg.addWidget(QLabel("Max flashes per point:"), 0, 2)
+        cg.addWidget(QLabel("Max flashes per point:"), 0, 2, Qt.AlignRight)
         self._max_flashes_spin = QSpinBox()
-        self._max_flashes_spin.setRange(100, 1000000)
-        self._max_flashes_spin.setValue(10000)
-        self._max_flashes_spin.setMaximumWidth(100)
+        self._max_flashes_spin.setRange(1, 100000000); self._max_flashes_spin.setValue(10000)
+        self._max_flashes_spin.setMaximumWidth(110)
         cg.addWidget(self._max_flashes_spin, 0, 3)
-
-        cg.addWidget(QLabel("Charge limit (e):"), 1, 0)
-        self._charge_limit_spin = QDoubleSpinBox()
-        self._charge_limit_spin.setRange(1.0, 50.0)
-        self._charge_limit_spin.setValue(5.0)
-        self._charge_limit_spin.setDecimals(1)
-        self._charge_limit_spin.setMaximumWidth(100)
-        cg.addWidget(self._charge_limit_spin, 1, 1)
-
-        cg.addWidget(QLabel("Detection threshold (e):"), 1, 2)
-        self._det_thresh_spin = QDoubleSpinBox()
-        self._det_thresh_spin.setRange(0.1, 5.0)
-        self._det_thresh_spin.setValue(0.4)
-        self._det_thresh_spin.setDecimals(2)
-        self._det_thresh_spin.setMaximumWidth(100)
-        cg.addWidget(self._det_thresh_spin, 1, 3)
-
-        cg.addWidget(QLabel("Settle time (s):"), 2, 0)
-        self._settle_spin = QDoubleSpinBox()
-        self._settle_spin.setRange(0.5, 30.0)
-        self._settle_spin.setValue(3.0)
-        self._settle_spin.setDecimals(1)
-        self._settle_spin.setMaximumWidth(100)
-        cg.addWidget(self._settle_spin, 2, 1)
-
+        cg.addWidget(QLabel("Detection threshold (e):"), 1, 0, Qt.AlignRight)
+        self._det_thresh_spin = self._spin(0.05, 50.0, 2, 0.4, " e")
+        cg.addWidget(self._det_thresh_spin, 1, 1)
+        cg.addWidget(QLabel("|charge| limit (e, 0=off):"), 1, 2, Qt.AlignRight)
+        self._charge_limit_spin = self._spin(0.0, 500.0, 1, 0.0, " e")
+        self._charge_limit_spin.setToolTip(
+            "End a step early if |charge| exceeds this (0 = disabled). Safety only —\n"
+            "the reset before each step already sets the starting charge.")
+        cg.addWidget(self._charge_limit_spin, 1, 3)
         cg.setColumnStretch(1, 1)
-        cg.setColumnStretch(3, 1)
-        outer.addWidget(collect_grp)
+        col.addWidget(collect_grp)
 
-        # --- Start / Stop / Progress ---
+        # --- Reset charge before each step (filament ramp) ------------------
+        reset_grp = QGroupBox("Reset charge before each step (filament ramp)")
+        rg = QVBoxLayout(reset_grp)
+        rrow = QGridLayout()
+        rrow.addWidget(QLabel("Reset target (e):"), 0, 0, Qt.AlignRight)
+        self._reset_target_spin = self._spin(-500.0, 500.0, 2, 0.0, " e")
+        self._reset_target_spin.setToolTip(
+            "Charge set point before each flash step. The filament only lowers\n"
+            "charge (more negative), so pick a target at/below the post-flash state.")
+        rrow.addWidget(self._reset_target_spin, 0, 1)
+        rrow.addWidget(QLabel("Tolerance (e):"), 0, 2, Qt.AlignRight)
+        self._reset_tol_spin = self._spin(0.05, 50.0, 2, 0.5, " e")
+        rrow.addWidget(self._reset_tol_spin, 0, 3)
+        rrow.addWidget(QLabel("Read cycle (s):"), 1, 0, Qt.AlignRight)
+        self._cycle_spin = self._spin(0.05, 10.0, 2, 0.5, " s")
+        self._cycle_spin.setToolTip("Spacing between ramp read cycles (one lock-in read).")
+        rrow.addWidget(self._cycle_spin, 1, 1)
+        rrow.addWidget(QLabel("Reset timeout (s):"), 1, 2, Qt.AlignRight)
+        self._reset_timeout_spin = self._spin(1.0, 3600.0, 0, 120.0, " s")
+        rrow.addWidget(self._reset_timeout_spin, 1, 3)
+        rrow.addWidget(QLabel("Settle after reset (s):"), 2, 0, Qt.AlignRight)
+        self._settle_spin = self._spin(0.0, 60.0, 1, 2.0, " s")
+        rrow.addWidget(self._settle_spin, 2, 1)
+        rrow.setColumnStretch(1, 1)
+        rg.addLayout(rrow)
+        from wg_control_tab import FilamentRampConfig
+        self._ramp_config = FilamentRampConfig()
+        self._ramp_config._enable.setChecked(True)
+        self._ramp_config._enable.setVisible(False)   # always on here
+        rg.addWidget(self._ramp_config)
+        col.addWidget(reset_grp)
+
+        # --- Drive setback (per-tool) + nominal drive -----------------------
+        self._setback = DriveSetbackConfig()
+        col.addWidget(self._setback)
+        drive_row = QHBoxLayout()
+        drive_row.addWidget(QLabel("Nominal drive voltage:"))
+        self._nominal_drive_spin = self._spin(0.0, 20.0, 3, 8.0, " Vpp")
+        self._nominal_drive_spin.setToolTip(
+            "Monitored-axis drive applied at sweep start; the setback reduces from it.\n"
+            "0 = leave the current drive amplitude unchanged.")
+        drive_row.addWidget(self._nominal_drive_spin)
+        drive_row.addStretch()
+        col.addLayout(drive_row)
+
+        # --- Safety ---------------------------------------------------------
+        self._overload_cb = QCheckBox("Stop on lock-in overload")
+        self._overload_cb.setChecked(True)
+        self._overload_cb.setToolTip(
+            "End the sweep if the SR530 reports an overload (debounced) — an "
+            "overloaded reading is invalid.")
+        col.addWidget(self._overload_cb)
+
+        # --- DAQ acquire panel ----------------------------------------------
+        daq_grp = QGroupBox("Data acquisition (DAQ) — one run per sweep step")
+        dg = QGridLayout(daq_grp)
+        self._record_cb = QCheckBox("Record data during the sweep")
+        self._record_cb.setChecked(True)
+        self._record_cb.setToolTip(
+            "Start a fresh continuous DAQ run (n_files=0) at each step, stopped when\n"
+            "the step advances; files named {root}_{timestamp}_V{v}_f{f}.")
+        dg.addWidget(self._record_cb, 0, 0, 1, 4)
+        dg.addWidget(QLabel("Output dir:"), 1, 0, Qt.AlignRight)
+        self._dir_edit = QLineEdit()
+        self._dir_edit.setPlaceholderText("required to record — browse or type a full path")
+        dg.addWidget(self._dir_edit, 1, 1, 1, 2)
+        dir_btn = QPushButton("Browse…"); dir_btn.setMaximumWidth(80)
+        dir_btn.clicked.connect(self._browse_dir)
+        dg.addWidget(dir_btn, 1, 3)
+        dg.addWidget(QLabel("Root name:"), 2, 0, Qt.AlignRight)
+        self._root_edit = QLineEdit("psweep")
+        self._root_edit.setMaximumWidth(140)
+        self._root_edit.setToolTip("Saved as {root}_{timestamp}_V{v}_f{f}_NNN.h5")
+        dg.addWidget(self._root_edit, 2, 1)
+        dg.addWidget(QLabel("Sample rate:"), 2, 2, Qt.AlignRight)
+        self._rate_spin = QDoubleSpinBox()
+        self._rate_spin.setRange(1.0, 2e6); self._rate_spin.setDecimals(0)
+        self._rate_spin.setValue(10000.0); self._rate_spin.setSuffix(" Hz")
+        self._rate_spin.setMaximumWidth(120)
+        dg.addWidget(self._rate_spin, 2, 3)
+        dg.addWidget(QLabel("n_bits (2ⁿ samples):"), 3, 0, Qt.AlignRight)
+        self._nbits_spin = QSpinBox()
+        self._nbits_spin.setRange(10, 25); self._nbits_spin.setValue(17)
+        self._nbits_spin.setMaximumWidth(60)
+        dg.addWidget(self._nbits_spin, 3, 1)
+        dg.addWidget(QLabel("DAQ host:"), 3, 2, Qt.AlignRight)
+        self._host_edit = QLineEdit("localhost"); self._host_edit.setMaximumWidth(120)
+        dg.addWidget(self._host_edit, 3, 3)
+        dg.addWidget(QLabel("DAQ rep port:"), 4, 0, Qt.AlignRight)
+        self._port_spin = QSpinBox(); self._port_spin.setRange(1024, 65535)
+        self._port_spin.setValue(5552); self._port_spin.setMaximumWidth(75)
+        dg.addWidget(self._port_spin, 4, 1)
+        ping_btn = QPushButton("Ping DAQ"); ping_btn.setMaximumWidth(90)
+        ping_btn.clicked.connect(self._ping_daq)
+        dg.addWidget(ping_btn, 4, 2)
+        self._daq_status = QLabel("—"); self._daq_status.setStyleSheet("color: gray;")
+        dg.addWidget(self._daq_status, 4, 3)
+        dg.setColumnStretch(1, 1)
+        col.addWidget(daq_grp)
+
+        # --- Start / Abort / Save / status ----------------------------------
         ctrl_row = QHBoxLayout()
-        self._start_btn = QPushButton("Start experiment")
+        self._start_btn = QPushButton("Start sweep")
         self._start_btn.setMinimumWidth(150)
         self._start_btn.setStyleSheet("background-color: #4CAF50; color: white;")
         self._start_btn.clicked.connect(self._on_start)
         ctrl_row.addWidget(self._start_btn)
-
         self._abort_btn = QPushButton("Abort")
-        self._abort_btn.setMinimumWidth(80)
-        self._abort_btn.setEnabled(False)
+        self._abort_btn.setMinimumWidth(80); self._abort_btn.setEnabled(False)
         self._abort_btn.setStyleSheet("background-color: #F44336; color: white;")
         self._abort_btn.clicked.connect(self._on_abort)
         ctrl_row.addWidget(self._abort_btn)
-
         self._save_btn = QPushButton("Save result…")
-        self._save_btn.setMaximumWidth(100)
-        self._save_btn.setEnabled(False)
+        self._save_btn.setMaximumWidth(110); self._save_btn.setEnabled(False)
         self._save_btn.clicked.connect(self._on_save)
         ctrl_row.addWidget(self._save_btn)
-
         ctrl_row.addStretch()
-
         self._status_lbl = QLabel("Idle")
-        self._status_lbl.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: gray;"
-        )
+        self._status_lbl.setStyleSheet("font-size: 14px; font-weight: bold; color: gray;")
         ctrl_row.addWidget(self._status_lbl)
-        outer.addLayout(ctrl_row)
+        col.addLayout(ctrl_row)
 
-        # --- Progress ---
         self._progress_lbl = QLabel("")
-        outer.addWidget(self._progress_lbl)
+        col.addWidget(self._progress_lbl)
 
-        # --- 2-D Heatmap ---
+        # --- Heatmap --------------------------------------------------------
         plot_grp = QGroupBox("Mean charge changes per flash — heatmap")
-        pg = QVBoxLayout(plot_grp)
+        pgl = QVBoxLayout(plot_grp)
         try:
             import pyqtgraph as _pg
             self._pg = _pg
             self._plot_gv = _pg.GraphicsLayoutWidget()
-            self._plot_gv.setMinimumHeight(300)
+            self._plot_gv.setMinimumHeight(260)
             self._heatmap_plot = self._plot_gv.addPlot(
                 title="Mean Δq / flash",
-                labels={"bottom": "Flash rate (Hz)", "left": "Electrode voltage (V)"},
-            )
+                labels={"bottom": "Flash rate index", "left": "Control voltage index"})
             self._heatmap_img = _pg.ImageItem()
             self._heatmap_plot.addItem(self._heatmap_img)
-            self._colorbar = None
-            pg.addWidget(self._plot_gv)
+            pgl.addWidget(self._plot_gv)
             self._has_plot = True
         except ImportError:
-            self._pg = None
-            self._has_plot = False
-            lbl = QLabel("Install pyqtgraph for live heatmap: pip install pyqtgraph")
+            self._pg = None; self._has_plot = False
+            lbl = QLabel("Install pyqtgraph for the live heatmap: pip install pyqtgraph")
             lbl.setStyleSheet("color: gray;")
-            pg.addWidget(lbl)
-        outer.addWidget(plot_grp)
+            pgl.addWidget(lbl)
+        col.addWidget(plot_grp)
 
-        # --- Log ---
-        log_grp = QGroupBox("Experiment log")
-        lg = QVBoxLayout(log_grp)
-        self._log_text = QTextEdit()
-        self._log_text.setReadOnly(True)
+        # --- Log ------------------------------------------------------------
+        log_grp = QGroupBox("Sweep log")
+        lgl = QVBoxLayout(log_grp)
+        self._log_text = QTextEdit(); self._log_text.setReadOnly(True)
         self._log_text.setMaximumHeight(150)
-        lg.addWidget(self._log_text)
-        outer.addWidget(log_grp)
+        lgl.addWidget(self._log_text)
+        col.addWidget(log_grp)
+
+    @staticmethod
+    def _spin(lo, hi, dec, val, suffix):
+        s = QDoubleSpinBox(); s.setRange(lo, hi); s.setDecimals(dec)
+        s.setValue(val); s.setSuffix(suffix); s.setMaximumWidth(110)
+        return s
 
     # ------------------------------------------------------------------
     # Parse helpers
@@ -1413,89 +1577,139 @@ class ExperimentTab(QWidget):
         parts = [s.strip() for s in text.replace(";", ",").split(",")]
         return [float(p) for p in parts if p]
 
+    def _range_to_list(self, edit, start_spin, stop_spin, step_spin):
+        import numpy as np
+        step = step_spin.value()
+        if step <= 0:
+            return
+        vals = np.arange(start_spin.value(), stop_spin.value(), step)
+        edit.setText(", ".join(f"{v:g}" for v in vals))
+
+    def _browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "DAQ output directory",
+                                             self._dir_edit.text().strip())
+        if d:
+            self._dir_edit.setText(d)
+
+    def _ping_daq(self):
+        from photon_order_experiment import DAQRecorder
+        rec = DAQRecorder(host=self._host_edit.text().strip() or "localhost",
+                          rep_port=self._port_spin.value())
+        ok = False
+        try:
+            ok = rec.ping()
+        finally:
+            rec.close()
+        self._daq_status.setText("Connected" if ok else "No response")
+        self._daq_status.setStyleSheet(
+            "color: green; font-weight: bold;" if ok else "color: red;")
+
+    def _set_status(self, text: str, color: str):
+        self._status_lbl.setText(text)
+        self._status_lbl.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {color};")
+
     # ------------------------------------------------------------------
-    # Start / Abort
+    # Start / Abort / Save
     # ------------------------------------------------------------------
 
     def _on_start(self):
         try:
-            rates = self._parse_list(self._rates_edit.text())
             voltages = self._parse_list(self._voltages_edit.text())
+            rates = self._parse_list(self._rates_edit.text())
         except ValueError:
-            self._status_lbl.setText("Invalid rate or voltage list")
-            self._status_lbl.setStyleSheet(
-                "font-size: 14px; font-weight: bold; color: red;"
-            )
+            self._set_status("Invalid voltage or rate list", "red")
+            return
+        if not voltages or not rates:
+            self._set_status("Voltages and rates must be non-empty", "red")
             return
 
-        if not rates or not voltages:
-            self._status_lbl.setText("Rates and voltages must be non-empty")
-            self._status_lbl.setStyleSheet(
-                "font-size: 14px; font-weight: bold; color: red;"
-            )
-            return
+        recorder = None
+        if self._record_cb.isChecked():
+            if not self._dir_edit.text().strip():
+                self._set_status("Recording needs an output directory", "red")
+                return
+            from photon_order_experiment import DAQRecorder
+            recorder = DAQRecorder(
+                host=self._host_edit.text().strip() or "localhost",
+                rep_port=self._port_spin.value(),
+                output_dir=self._dir_edit.text().strip(),
+                sample_rate=self._rate_spin.value(),
+                n_bits=self._nbits_spin.value())
 
-        # Initialize heatmap data
         import numpy as np
-        self._heatmap_data = np.full((len(voltages), len(rates)), np.nan)
-        self._rates = rates
         self._voltages = voltages
-
+        self._rates = rates
+        self._heatmap_data = np.full((len(voltages), len(rates)), np.nan)
         if self._has_plot:
             self._heatmap_img.setImage(self._heatmap_data.T)
-            self._heatmap_plot.setLabel("bottom", "Flash rate index")
-            self._heatmap_plot.setLabel("left", "Voltage index")
 
-        # Get or create experiment
         from photon_order_experiment import PhotonOrderExperiment
         if self._experiment is None:
             self._experiment = PhotonOrderExperiment()
-        self._experiment.set_params(
+        exp = self._experiment
+        exp.set_params(
             flash_rates_hz=rates,
             electrode_voltages_v=voltages,
             min_events=self._min_events_spin.value(),
             max_flashes=self._max_flashes_spin.value(),
             charge_limit=self._charge_limit_spin.value(),
             detection_threshold=self._det_thresh_spin.value(),
+            reset_target=self._reset_target_spin.value(),
+            reset_tolerance=self._reset_tol_spin.value(),
+            cycle_period_s=self._cycle_spin.value(),
+            reset_timeout_s=self._reset_timeout_spin.value(),
             settle_time_s=self._settle_spin.value(),
+            stop_on_overload=self._overload_cb.isChecked(),
+            nominal_drive_vpp=self._nominal_drive_spin.value(),
+            recording_root=self._root_edit.text().strip() or "psweep",
+            setback_params=self._setback.get_params(),
         )
+        exp.set_filament_ramp(self._ramp_config.get_ramp())
+        exp.set_recorder(recorder)
 
-        # Connect signals
-        self._experiment.state_changed.connect(self._on_state_changed)
-        self._experiment.progress.connect(self._on_progress)
-        self._experiment.data_point_ready.connect(self._on_data_point)
-        self._experiment.experiment_done.connect(self._on_done)
+        self._connect_experiment(exp)
+
+        # Apply the nominal drive on the GUI thread BEFORE starting, so the
+        # setback reduces from it (and restore returns to it).
+        nominal = self._nominal_drive_spin.value()
+        if nominal > 0:
+            self.apply_drive_requested.emit(nominal)
 
         self._start_btn.setEnabled(False)
         self._abort_btn.setEnabled(True)
         self._save_btn.setEnabled(False)
         self._log_text.clear()
-
         try:
-            self._experiment.start()
+            exp.start()
         except RuntimeError as e:
-            self._status_lbl.setText(str(e))
-            self._status_lbl.setStyleSheet(
-                "font-size: 14px; font-weight: bold; color: red;"
-            )
+            self._set_status(str(e), "red")
             self._start_btn.setEnabled(True)
             self._abort_btn.setEnabled(False)
+
+    def _connect_experiment(self, exp):
+        for sig, slot in ((exp.state_changed, self._on_state_changed),
+                          (exp.progress, self._on_progress),
+                          (exp.data_point_ready, self._on_data_point),
+                          (exp.experiment_done, self._on_done),
+                          (exp.log_msg, self._on_log)):
+            try:
+                sig.disconnect()
+            except Exception:
+                pass
+            sig.connect(slot)
 
     def _on_abort(self):
         if self._experiment:
             self._experiment.abort()
         self._start_btn.setEnabled(True)
         self._abort_btn.setEnabled(False)
-        self._status_lbl.setText("Aborted")
-        self._status_lbl.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #FF9800;"
-        )
+        self._set_status("Aborted", "#FF9800")
 
     def _on_save(self):
         if self._experiment and self._experiment.result:
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save experiment result", "", "JSON (*.json);;All (*)"
-            )
+                self, "Save sweep result", "", "JSON (*.json);;All (*)")
             if path:
                 self._experiment.result.save(path)
                 self._log_text.append(f"Saved to {path}")
@@ -1504,63 +1718,65 @@ class ExperimentTab(QWidget):
     # Signal handlers
     # ------------------------------------------------------------------
 
+    _TERMINAL_WORDS = ("stopped", "error", "complete", "done", "aborted")
+
     def _on_state_changed(self, msg: str):
-        self._status_lbl.setText(msg)
         color = "gray"
-        if "error" in msg.lower():
+        low = msg.lower()
+        if "error" in low or "overload" in low:
             color = "red"
-        elif "flash" in msg.lower():
+        elif "flash" in low:
             color = "#FF9800"
-        elif "reset" in msg.lower():
+        elif "reset" in low or "settl" in low:
             color = "#2196F3"
-        elif "complete" in msg.lower() or "done" in msg.lower():
+        elif "complete" in low or "done" in low:
             color = "green"
-        self._status_lbl.setStyleSheet(
-            f"font-size: 14px; font-weight: bold; color: {color};"
-        )
+        self._set_status(msg, color)
         self._log_text.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        # Any terminal message (complete / stopped / error / aborted) returns
+        # the buttons to idle — experiment_done (→ _on_done) only fires on the
+        # normal path, so overload/DAQ-failure/error would otherwise leave Start
+        # disabled.  Enable Save if there's any (partial) result to write.
+        if any(w in low for w in self._TERMINAL_WORDS):
+            self._start_btn.setEnabled(True)
+            self._abort_btn.setEnabled(False)
+            has_data = bool(self._experiment and self._experiment.result
+                            and self._experiment.result.data)
+            self._save_btn.setEnabled("complete" in low or has_data)
+
+    def _on_log(self, msg: str):
+        self._log_text.append(msg)
 
     def _on_progress(self, current: int, total: int):
-        self._progress_lbl.setText(
-            f"Progress: {current}/{total} data points"
-        )
+        self._progress_lbl.setText(f"Progress: {current}/{total} grid points")
 
     def _on_data_point(self, dp):
-        """Update heatmap when a new data point arrives."""
         if self._heatmap_data is None:
             return
-
-        # Find indices
         try:
             r_idx = self._rates.index(dp.flash_rate_hz)
             v_idx = self._voltages.index(dp.electrode_voltage_v)
         except ValueError:
             return
-
         self._heatmap_data[v_idx, r_idx] = dp.mean_changes_per_flash
-
         if self._has_plot:
             import numpy as np
-            display = np.nan_to_num(self._heatmap_data, nan=0.0)
-            self._heatmap_img.setImage(display.T)
-
+            self._heatmap_img.setImage(
+                np.nan_to_num(self._heatmap_data, nan=0.0).T)
         self._log_text.append(
-            f"  → rate={dp.flash_rate_hz:.1f} Hz, V={dp.electrode_voltage_v:.1f} V: "
+            f"  → V={dp.electrode_voltage_v:g} f={dp.flash_rate_hz:g} Hz: "
             f"{dp.mean_changes_per_flash:.4f} changes/flash "
             f"({dp.total_events} events / {dp.total_flashes} flashes)"
-        )
+            + (f"  [{dp.basename}]" if dp.basename else ""))
 
     def _on_done(self, result):
         self._start_btn.setEnabled(True)
         self._abort_btn.setEnabled(False)
         self._save_btn.setEnabled(True)
-        self._status_lbl.setText("Experiment complete")
-        self._status_lbl.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: green;"
-        )
+        self._set_status("Sweep complete", "green")
 
     # ------------------------------------------------------------------
-    # Public: set experiment's actuators
+    # Public: experiment handle
     # ------------------------------------------------------------------
 
     @property
@@ -1576,27 +1792,74 @@ class ExperimentTab(QWidget):
 
     def get_config(self) -> dict:
         return {
+            "control_voltages": self._voltages_edit.text(),
             "flash_rates": self._rates_edit.text(),
-            "electrode_voltages": self._voltages_edit.text(),
             "min_events": self._min_events_spin.value(),
             "max_flashes": self._max_flashes_spin.value(),
-            "charge_limit": self._charge_limit_spin.value(),
             "detection_threshold": self._det_thresh_spin.value(),
+            "charge_limit": self._charge_limit_spin.value(),
+            "reset_target": self._reset_target_spin.value(),
+            "reset_tolerance": self._reset_tol_spin.value(),
+            "cycle_period_s": self._cycle_spin.value(),
+            "reset_timeout_s": self._reset_timeout_spin.value(),
             "settle_time_s": self._settle_spin.value(),
+            "nominal_drive_vpp": self._nominal_drive_spin.value(),
+            "stop_on_overload": self._overload_cb.isChecked(),
+            "setback": self._setback.get_config(),
+            "filament_ramp": self._ramp_config.get_config(),
+            "record": self._record_cb.isChecked(),
+            "output_dir": self._dir_edit.text(),
+            "root": self._root_edit.text(),
+            "sample_rate": self._rate_spin.value(),
+            "n_bits": self._nbits_spin.value(),
+            "daq_host": self._host_edit.text(),
+            "daq_port": self._port_spin.value(),
         }
 
     def restore_config(self, cfg: dict):
-        if "flash_rates" in cfg:
-            self._rates_edit.setText(str(cfg["flash_rates"]))
-        if "electrode_voltages" in cfg:
-            self._voltages_edit.setText(str(cfg["electrode_voltages"]))
-        if "min_events" in cfg:
-            self._min_events_spin.setValue(int(cfg["min_events"]))
-        if "max_flashes" in cfg:
-            self._max_flashes_spin.setValue(int(cfg["max_flashes"]))
-        if "charge_limit" in cfg:
-            self._charge_limit_spin.setValue(float(cfg["charge_limit"]))
-        if "detection_threshold" in cfg:
-            self._det_thresh_spin.setValue(float(cfg["detection_threshold"]))
-        if "settle_time_s" in cfg:
-            self._settle_spin.setValue(float(cfg["settle_time_s"]))
+        text_setters = {
+            "control_voltages": self._voltages_edit,
+            "flash_rates": self._rates_edit,
+            "output_dir": self._dir_edit,
+            "root": self._root_edit,
+            "daq_host": self._host_edit,
+        }
+        for key, w in text_setters.items():
+            if key in cfg:
+                w.setText(str(cfg[key]))
+        float_setters = {
+            "detection_threshold": self._det_thresh_spin,
+            "charge_limit": self._charge_limit_spin,
+            "reset_target": self._reset_target_spin,
+            "reset_tolerance": self._reset_tol_spin,
+            "cycle_period_s": self._cycle_spin,
+            "reset_timeout_s": self._reset_timeout_spin,
+            "settle_time_s": self._settle_spin,
+            "nominal_drive_vpp": self._nominal_drive_spin,
+            "sample_rate": self._rate_spin,
+        }
+        for key, w in float_setters.items():
+            if key in cfg:
+                w.setValue(float(cfg[key]))
+        int_setters = {
+            "min_events": self._min_events_spin,
+            "max_flashes": self._max_flashes_spin,
+            "n_bits": self._nbits_spin,
+            "daq_port": self._port_spin,
+        }
+        for key, w in int_setters.items():
+            if key in cfg:
+                w.setValue(int(cfg[key]))
+        if "stop_on_overload" in cfg:
+            self._overload_cb.setChecked(bool(cfg["stop_on_overload"]))
+        if "record" in cfg:
+            self._record_cb.setChecked(bool(cfg["record"]))
+        if "setback" in cfg:
+            self._setback.restore_config(cfg["setback"])
+        if "filament_ramp" in cfg:
+            self._ramp_config.restore_config(cfg["filament_ramp"])
+            self._ramp_config._enable.setChecked(True)
+
+
+# Backward-compatible alias (the tab was previously named ExperimentTab).
+ExperimentTab = PowerSweepTab

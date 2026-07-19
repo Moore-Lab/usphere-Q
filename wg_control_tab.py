@@ -2904,7 +2904,9 @@ class DriveSetbackAdapter:
     def __init__(self, actuator, get_drive_widget, get_params, on_drive_amp=None):
         self._actuator = actuator
         self._get_drive = get_drive_widget   # -> ChannelControlWidget
-        self._get_params = get_params        # -> {"enabled": bool, "charging_vpp": float}
+        # -> {"enabled": bool, "charging_vpp": float, "apply_flash"/"apply_filament": bool}
+        self._default_get_params = get_params
+        self._get_params = get_params
         self._on_drive_amp = on_drive_amp    # callback(absolute_vpp)
         self._lock = _threading.Lock()
         self._reduced = False
@@ -2914,12 +2916,7 @@ class DriveSetbackAdapter:
     # -- actuator protocol ----------------------------------------------
 
     def enable(self):
-        try:
-            params = self._get_params() or {}
-        except Exception:
-            params = {}
-        if params.get("enabled"):
-            self._reduce(float(params.get("charging_vpp", 0.0)))
+        self._park("filament")
         ok = False
         try:
             ok = self._actuator.enable()
@@ -2953,14 +2950,14 @@ class DriveSetbackAdapter:
         """Ramp support: park the drive (like enable) on the first pulse of a
         heating session, then program the filament pulse.  Reduce is idempotent,
         so subsequent ramp steps only reprogram the pulse."""
-        self._park()
+        self._park("filament")
         fn = getattr(self._actuator, "set_pulse", None)
         return fn(freq_hz, width_ms) if fn else False
 
     def fire_pulse(self, width_ms: float):
         """Pulse-wait-read ramp: park the drive (idempotent) then fire one
         hardware-timed filament pulse via the wrapped actuator."""
-        self._park()
+        self._park("filament")
         fn = getattr(self._actuator, "fire_pulse", None)
         return fn(width_ms) if fn else False
 
@@ -2972,7 +2969,7 @@ class DriveSetbackAdapter:
 
     def hold_ssr_on(self):
         """Power ramp: park the drive (idempotent) then hold the SSR closed."""
-        self._park()
+        self._park("filament")
         fn = getattr(self._actuator, "hold_ssr_on", None)
         return fn() if fn else False
 
@@ -2984,22 +2981,39 @@ class DriveSetbackAdapter:
         fn = getattr(self._actuator, "set_power_easyramp", None)
         return fn(duration_ms, enabled) if fn else False
 
-    def park(self):
-        """Park the drive low if the setback is enabled (for the ChargeController
-        to call around flash actuation too).  Idempotent."""
-        self._park()
+    def set_params_source(self, fn):
+        """Temporarily source setback params from `fn` instead of the wired
+        default (the Power-sweep tab uses this so its own setback settings
+        drive the shared adapter during a sweep).  Pass None to restore."""
+        self._get_params = fn or self._default_get_params
+
+    def clear_params_source(self):
+        """Restore the setback params source wired at construction."""
+        self._get_params = self._default_get_params
+
+    def park(self, tool: str = "filament"):
+        """Park the drive low if the setback is enabled for `tool` (the
+        ChargeController calls park("flash") around flash actuation).
+        Idempotent."""
+        self._park(tool)
 
     def restore(self):
         """Restore the drive to the measurement setpoint.  Idempotent."""
         self._restore()
 
-    def _park(self):
+    def _park(self, tool: str = "filament"):
         try:
             params = self._get_params() or {}
         except Exception:
             params = {}
-        if params.get("enabled"):
-            self._reduce(float(params.get("charging_vpp", 0.0)))
+        if not params.get("enabled"):
+            return
+        # per-tool gate; default to applying (True) if the key is absent so an
+        # older two-tool params dict still parks for both.
+        key = "apply_flash" if tool == "flash" else "apply_filament"
+        if not params.get(key, True):
+            return
+        self._reduce(float(params.get("charging_vpp", 0.0)))
 
     def effective_amplitude(self):
         """Current actual drive amplitude (Vpp): the charging value while
