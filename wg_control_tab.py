@@ -2324,12 +2324,22 @@ class FilamentRampConfig(QWidget):
     the heating noise.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_mode: str = "power"):
         super().__init__(parent)
         self._build()
+        # Power ramp is the default: it heats smoothly instead of kicking the
+        # sphere with pulses.  The manual Filament-tab runner passes "pulse"
+        # (it has no NGE power handle).
+        self.set_mode(default_mode)
 
     _MODES = [("pulse", "Pulse the SSR (pulse-wait-read)"),
               ("power", "Ramp the power supply (SSR held on)")]
+
+    def set_mode(self, mode: str):
+        keys = [k for k, _ in self._MODES]
+        if mode in keys:
+            self._mode.setCurrentIndex(keys.index(mode))
+            self._on_mode()
 
     def _build(self):
         g = QGridLayout(self)
@@ -2390,7 +2400,11 @@ class FilamentRampConfig(QWidget):
         self._cycles.setToolTip(
             "Read cycles to wait before reading.  Pulse mode: the filament is off\n"
             "during the wait (clean read).  Power mode: a smooth ramp may not need\n"
-            "a wait — set 1 to read every step.")
+            "a wait — 1 is already 'no wait'.\n\n"
+            "1 is the minimum and means: change the voltage (or fire), then judge\n"
+            "it on the NEXT lock-in reading.  0 is not offered because a reading\n"
+            "taken in the same cycle as the change predates its effect — the\n"
+            "ramp would evaluate stale charge and step again immediately.")
         g.addWidget(self._cycles, 5, 1)
         g.setColumnStretch(4, 1)
         self._on_mode()
@@ -2501,7 +2515,9 @@ class FilamentRampWidget(QGroupBox):
 
     def _build(self):
         v = QVBoxLayout(self)
-        self._cfg = FilamentRampConfig()
+        # This manual runner has no NGE power handle, so it can only pulse —
+        # default it to pulse mode (power mode is rejected in _start).
+        self._cfg = FilamentRampConfig(default_mode="pulse")
         v.addWidget(self._cfg)
         row = QHBoxLayout()
         self._start_btn = QPushButton("Start ramp"); self._start_btn.setStyleSheet(_GREEN)
@@ -2901,12 +2917,21 @@ class DriveSetbackAdapter:
     drive channel after reconnecting.
     """
 
-    def __init__(self, actuator, get_drive_widget, get_params, on_drive_amp=None):
+    #: Seconds to let the lock-in settle after the drive amplitude changes.
+    #: Stepping the drive down (e.g. 8 → 0.1 Vpp) kicks a large transient into
+    #: the lock-in; readings during that window are meaningless, so every
+    #: consumer must hold off acting until settle_remaining() reaches 0.
+    SETTLE_S = 5.0
+
+    def __init__(self, actuator, get_drive_widget, get_params, on_drive_amp=None,
+                 settle_s: float | None = None):
         self._actuator = actuator
         self._get_drive = get_drive_widget   # -> ChannelControlWidget
         # -> {"enabled": bool, "charging_vpp": float, "apply_flash"/"apply_filament": bool}
         self._default_get_params = get_params
         self._get_params = get_params
+        self._settle_s = self.SETTLE_S if settle_s is None else float(settle_s)
+        self._changed_at = 0.0               # monotonic stamp of the last change
         self._on_drive_amp = on_drive_amp    # callback(absolute_vpp)
         self._lock = _threading.Lock()
         self._reduced = False
@@ -2991,29 +3016,49 @@ class DriveSetbackAdapter:
         """Restore the setback params source wired at construction."""
         self._get_params = self._default_get_params
 
-    def park(self, tool: str = "filament"):
+    def park(self, tool: str = "filament") -> bool:
         """Park the drive low if the setback is enabled for `tool` (the
         ChargeController calls park("flash") around flash actuation).
-        Idempotent."""
-        self._park(tool)
+        Idempotent; returns True only if the amplitude actually changed."""
+        return self._park(tool)
 
-    def restore(self):
-        """Restore the drive to the measurement setpoint.  Idempotent."""
-        self._restore()
+    def restore(self) -> bool:
+        """Restore the drive to the measurement setpoint.  Idempotent; returns
+        True only if the amplitude actually changed."""
+        return self._restore()
 
-    def _park(self, tool: str = "filament"):
+    def settle_remaining(self) -> float:
+        """Seconds left before lock-in readings are trustworthy again after the
+        last drive-amplitude change (0.0 when settled).  Callers must not act on
+        a charge reading — nor start/stop a tool — while this is > 0."""
+        if self._changed_at <= 0.0:
+            return 0.0
+        return max(0.0, self._settle_s - (time.monotonic() - self._changed_at))
+
+    def wait_settled(self, sleep_fn=None) -> None:
+        """Blocking settle wait, for worker threads only (never the GUI thread).
+        `sleep_fn(seconds) -> bool` may return False to abort early."""
+        sleep_fn = sleep_fn or (lambda s: (time.sleep(s), True)[1])
+        while True:
+            remaining = self.settle_remaining()
+            if remaining <= 0.0:
+                return
+            if not sleep_fn(min(0.05, remaining)):
+                return
+
+    def _park(self, tool: str = "filament") -> bool:
         try:
             params = self._get_params() or {}
         except Exception:
             params = {}
         if not params.get("enabled"):
-            return
+            return False
         # per-tool gate; default to applying (True) if the key is absent so an
         # older two-tool params dict still parks for both.
         key = "apply_flash" if tool == "flash" else "apply_filament"
         if not params.get(key, True):
-            return
-        self._reduce(float(params.get("charging_vpp", 0.0)))
+            return False
+        return self._reduce(float(params.get("charging_vpp", 0.0)))
 
     def effective_amplitude(self):
         """Current actual drive amplitude (Vpp): the charging value while
@@ -3029,30 +3074,36 @@ class DriveSetbackAdapter:
 
     # -- internal ---------------------------------------------------------
 
-    def _reduce(self, charging_vpp: float):
+    def _reduce(self, charging_vpp: float) -> bool:
+        """Park the drive.  Returns True only if the amplitude actually changed
+        (so callers know to wait out the settle)."""
         with self._lock:
             if self._reduced or charging_vpp <= 0:
-                return
+                return False
             drive = self._get_drive()
             afg, ch = drive.get_afg_ch()
             if afg is None:
-                return                        # no drive connected — nothing to park
+                return False                  # no drive connected — nothing to park
             measure_vpp = drive._amp.value()  # widget = measurement setpoint
             if measure_vpp <= 0 or charging_vpp >= measure_vpp:
-                return                        # nothing to gain by "reducing"
+                return False                  # nothing to gain by "reducing"
             with _afg_lock(afg):
                 afg.set_amplitude(ch, charging_vpp)
             self._measure_vpp = measure_vpp
             self._charging_vpp = charging_vpp
             self._reduced = True
+            self._changed_at = time.monotonic()
             cb, amp = self._on_drive_amp, charging_vpp
         if cb:
             cb(amp)                           # report absolute amplitude (outside lock)
+        return True
 
-    def _restore(self):
+    def _restore(self) -> bool:
+        """Restore the drive.  Returns True only if the amplitude actually
+        changed (so callers know to wait out the settle)."""
         with self._lock:
             if not self._reduced:
-                return
+                return False
             drive = self._get_drive()
             afg, ch = drive.get_afg_ch()
             if afg is not None:
@@ -3062,9 +3113,11 @@ class DriveSetbackAdapter:
                 except Exception:
                     pass
             self._reduced = False
+            self._changed_at = time.monotonic()
             cb, amp = self._on_drive_amp, self._measure_vpp
         if cb:
             cb(amp)                           # report restored amplitude (outside lock)
+        return True
 
 
 # ---------------------------------------------------------------------------

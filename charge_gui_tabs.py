@@ -388,7 +388,10 @@ class ControlTab(QWidget):
         intro = QLabel(
             "Change the sphere's charge with the flash lamp (raises +) or the "
             "filament (lowers −), or set a target and let it pick the tool. Only "
-            "one runs at a time; Cancel turns the outputs off.")
+            "one runs at a time; Cancel turns the outputs off. "
+            "\"Set parameters\" loads every setting below into the loop without "
+            "switching anything on — press it to see exactly what \"Go to "
+            "target\" will use.")
         intro.setStyleSheet("color: #9E9E9E; font-size: 11px;")
         intro.setWordWrap(True)
         outer.addWidget(intro)
@@ -418,9 +421,11 @@ class ControlTab(QWidget):
         fil_grp = QGroupBox("Filament — lower charge (−)")
         flg = QVBoxLayout(fil_grp)
         note = QLabel(
-            "Fires one pulse, waits N read cycles with the filament off (clean "
-            "signal), reads, and increments the pulse width until the target — "
-            "immune to the filament noise.")
+            "Power mode (default): holds the SSR closed and ramps the supply "
+            "voltage smoothly — gentler on the sphere. Pulse mode: fires one "
+            "pulse, waits N read cycles with the filament off (clean signal), "
+            "reads, then widens the pulse. Either way it steps until the target; "
+            "1 cycle/read means \"judge it on the next reading\".")
         note.setStyleSheet("color: #9E9E9E; font-size: 11px;")
         note.setWordWrap(True)
         flg.addWidget(note)
@@ -485,6 +490,16 @@ class ControlTab(QWidget):
         self._status.setStyleSheet("color: gray; font-size: 14px; font-weight: bold;")
         self._status.setWordWrap(True)
         status_row.addWidget(self._status, 1)
+        self._apply_btn = QPushButton("Set parameters")
+        self._apply_btn.setStyleSheet("background-color: #607D8B; color: white;")
+        self._apply_btn.setToolTip(
+            "Push every setting on this tab into the control loop WITHOUT\n"
+            "turning anything on — no flash, no filament, no power-supply\n"
+            "output.  Use it to lock in the parameters that 'Go to target'\n"
+            "(and the manual Flash/Ramp buttons) will use, and to see a\n"
+            "summary of exactly what is loaded.")
+        self._apply_btn.clicked.connect(self._on_set_params)
+        status_row.addWidget(self._apply_btn)
         self._cancel_btn = QPushButton("Cancel / Stop")
         self._cancel_btn.setStyleSheet("background-color: #F44336; color: white;")
         self._cancel_btn.setEnabled(False)
@@ -519,6 +534,52 @@ class ControlTab(QWidget):
         self._ctrl.set_timeout(self._timeout_spin.value() * 60.0)
         self._ctrl.set_stop_on_overload(self._overload_cb.isChecked())
 
+    def _apply_all_params(self):
+        """Push every setting on this tab into the controller.
+
+        Pure configuration: this only writes values onto the ChargeController.
+        It never arms a supply, enables the lamp, or programs an electrode —
+        safe to press with a sphere trapped.  (The drive-setback settings are
+        read live by the setback adapter, so they need no applying.)
+        """
+        self._apply_common()
+        self._ctrl.set_flash_params(rate_hz=self._flash_rate.value(),
+                                    control_v=self._flash_ctrl.value())
+        self._ctrl.set_filament_ramp(self._ramp_config.get_ramp())
+        self._ctrl.set_target(self._target_spin.value(), self._tol_spin.value())
+        self._ctrl.set_policy("auto")
+
+    def _params_summary(self) -> str:
+        """One-line readout of what is currently loaded into the loop."""
+        ramp = self._ramp_config.get_ramp()
+        if ramp.mode == "power":
+            fil = (f"filament POWER {ramp.start_v:g}→{ramp.max_v:g} V "
+                   f"(+{ramp.increment_v:g} V, {ramp.timeout_cycles} cyc/read)")
+        else:
+            fil = (f"filament PULSE {ramp.start_width_ms:g}→{ramp.max_width_ms:g} ms "
+                   f"(+{ramp.increment_ms:g} ms, {ramp.timeout_cycles} cyc/read)")
+        sb = self._setback.get_params()
+        if sb.get("enabled"):
+            tools = [t for t, on in (("flash", sb.get("apply_flash")),
+                                     ("filament", sb.get("apply_filament"))) if on]
+            setback = (f"setback {sb.get('charging_vpp', 0):g} Vpp on "
+                       f"{'+'.join(tools) if tools else 'nothing'}")
+        else:
+            setback = "setback off"
+        return (f"target {self._target_spin.value():+.1f} "
+                f"±{self._tol_spin.value():.1f} e · "
+                f"flash {self._flash_rate.value():g} Hz / "
+                f"{self._flash_ctrl.value():g} V · {fil} · {setback} · "
+                f"timeout {self._timeout_spin.value():g} min")
+
+    def _on_set_params(self):
+        """'Set parameters' — load the settings, actuate nothing."""
+        self._apply_all_params()
+        self._status.setText("Parameters set (nothing switched on) — "
+                             + self._params_summary())
+        self._status.setStyleSheet(
+            "color: #2E7D32; font-size: 12px; font-weight: bold;")
+
     def _on_flash(self):
         self._apply_common()
         self._ctrl.set_flash_params(rate_hz=self._flash_rate.value(),
@@ -534,18 +595,14 @@ class ControlTab(QWidget):
         self._begin()
 
     def _on_target(self):
-        self._apply_common()
-        self._ctrl.set_target(self._target_spin.value(), self._tol_spin.value())
-        self._ctrl.set_policy("auto")
-        self._ctrl.set_flash_params(rate_hz=self._flash_rate.value(),
-                                    control_v=self._flash_ctrl.value())
-        self._ctrl.set_filament_ramp(self._ramp_config.get_ramp())
+        # Same parameters "Set parameters" loads, then start.
+        self._apply_all_params()
         self._begin()
 
     def _begin(self):
         self._ramp_log.clear()
         self._flash_log.clear()
-        for b in (self._flash_btn, self._fil_btn, self._target_btn):
+        for b in (self._flash_btn, self._fil_btn, self._target_btn, self._apply_btn):
             b.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._ctrl.start()
@@ -554,7 +611,7 @@ class ControlTab(QWidget):
         self._ctrl.cancel()
 
     def _on_stopped(self, reason: str):
-        for b in (self._flash_btn, self._fil_btn, self._target_btn):
+        for b in (self._flash_btn, self._fil_btn, self._target_btn, self._apply_btn):
             b.setEnabled(True)
         self._cancel_btn.setEnabled(False)
 

@@ -411,6 +411,15 @@ class PhotonOrderExperiment(QObject):
     # ------------------------------------------------------------------
 
     def on_charge_update(self, result: dict) -> None:
+        # Drive-setback settle gate (mirrors ChargeController).  A drive-
+        # amplitude change saturates the lock-in for a few seconds; those reads
+        # are meaningless AND overloaded.  Without this gate the overload
+        # watcher would trip on the very transient that _wait_drive_settled()
+        # is blocking to wait out, aborting the sweep before any data.  Keep the
+        # last good charge rather than storing the transient.
+        if self._settle_remaining() > 0.0:
+            self._overload_count = 0
+            return
         charge = result.get("charge_e")
         if charge is not None:
             self._current_charge = charge
@@ -423,6 +432,16 @@ class PhotonOrderExperiment(QObject):
                     self._overload_stop = True
             else:
                 self._overload_count = 0
+
+    def _settle_remaining(self) -> float:
+        """Seconds left of the shared drive-setback settle (0 if none/absent)."""
+        fn = getattr(self._filament, "settle_remaining", None)
+        if fn is None:
+            return 0.0
+        try:
+            return float(fn())
+        except Exception:
+            return 0.0
 
     # ------------------------------------------------------------------
     # Start / Stop
@@ -606,13 +625,18 @@ class PhotonOrderExperiment(QObject):
         # the per-tool 'flash' gate.  Without this, "Filament only" would leave
         # the drive parked low through the whole flash-count + DAQ recording.
         self._restore_drive()
+        if not self._wait_drive_settled():   # restoring the drive rings too
+            return dp
         try:
             self._flashlamp.set_flash_rate(rate_hz)
             self._flashlamp.set_electrode_voltage(voltage_v)
         except Exception as e:
             self.log_msg.emit(f"Flash set error: {e}")
         self._park_flash()
-        if not self._sleep_cycles(0.2):     # let the instrument settle
+        if not self._wait_drive_settled():   # parking kicks the biggest spike
+            self._restore_drive()
+            return dp
+        if not self._sleep_cycles(0.2):      # let the instrument settle
             self._restore_drive()
             return dp
 
@@ -722,6 +746,15 @@ class PhotonOrderExperiment(QObject):
         target, tol = self._reset_target, self._reset_tolerance
         cond = lambda q: q <= target + tol       # noqa: E731
 
+        # Park the drive and wait out the transient BEFORE any heating starts.
+        # Doing it first (rather than as a side effect of the first heat action)
+        # means the filament is never on during the blind settle window —
+        # mirrors ChargeController._start_pulse_ramp's park-then-settle-then-heat
+        # ordering.
+        self._park_filament()
+        if not self._wait_drive_settled():
+            return
+
         # Power mode: hold the SSR closed + configure EasyRamp up front.
         if getattr(ramp, "mode", "pulse") == "power":
             if not hasattr(self._filament, "hold_ssr_on"):
@@ -731,9 +764,16 @@ class PhotonOrderExperiment(QObject):
                 if getattr(ramp, "easyramp_ms", 0) > 0 and hasattr(
                         self._filament, "set_power_easyramp"):
                     self._filament.set_power_easyramp(ramp.easyramp_ms, True)
+                # Program the ramp's START voltage BEFORE closing the SSR: the
+                # supply is still sitting at the previous grid point's ceiling
+                # (nothing lowers it between points), so closing first would
+                # heat the filament at max_v until the runner's first step.
+                self._filament.set_power_voltage(ramp.start_v)
                 self._filament.hold_ssr_on()
             except Exception as e:
                 self.log_msg.emit(f"  Filament error: {e}")
+                return
+            if not self._wait_drive_settled():
                 return
             runner = PowerRampRunner(ramp, condition=cond)
         else:
@@ -764,6 +804,10 @@ class PhotonOrderExperiment(QObject):
             except Exception as e:
                 self.log_msg.emit(f"  Filament error: {e}")
                 break
+            # The first pulse-mode fire parks the drive; hold off reading until
+            # the transient has decayed (no-op once settled).
+            if not self._wait_drive_settled():
+                return
             c = r.get("cycle")
             if c is not None:
                 self.log_msg.emit(
@@ -804,6 +848,26 @@ class PhotonOrderExperiment(QObject):
         if fn:
             try:
                 fn()
+            except Exception:
+                pass
+
+    def _wait_drive_settled(self) -> bool:
+        """Block (interruptibly) until the drive-setback settle has elapsed.
+        Changing the drive amplitude kicks a large transient into the lock-in,
+        so no reading may be acted on until it has decayed.  Returns False if a
+        stop was requested meanwhile."""
+        while True:
+            remaining = self._settle_remaining()
+            if remaining <= 0.0:
+                return not self._should_stop()
+            if not self._sleep_cycles(min(0.2, remaining)):
+                return False
+
+    def _park_filament(self):
+        fn = getattr(self._filament, "park", None)
+        if fn:
+            try:
+                fn("filament")
             except Exception:
                 pass
 

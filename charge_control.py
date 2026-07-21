@@ -527,6 +527,18 @@ class ChargeController(QObject):
             return
         self._last_charge = charge
 
+        # Drive-setback settle: changing the drive amplitude (especially
+        # stepping it DOWN, e.g. 8 → 0.1 Vpp) kicks a large transient into the
+        # lock-in.  Readings in that window are meaningless, so take no action
+        # at all — including the overload check, which the transient would
+        # otherwise trip.  The independent watchdog still enforces the timeout.
+        settling = self._settle_remaining()
+        if settling > 0.0:
+            self._overload_count = 0
+            self.action_changed.emit(
+                f"Drive changed — settling {settling:.1f} s before next action")
+            return
+
         # Safety: end the loop on a lock-in overload — an overloaded reading is
         # invalid (e.g. the drive parked low + wrong range → a pinned, bogus
         # charge), so acting on it would run away.  Debounced by 2 reads so a
@@ -572,6 +584,14 @@ class ChargeController(QObject):
         elif dev == "filament":
             if self._flash_on:
                 self._flash_stop()
+                # Tool transition: drop the flash's park so the filament re-parks
+                # under its own per-tool gate ("Flash only" must not leave the
+                # drive low through the ramp).  The settle gate then holds the
+                # next poll off until the drive change has rung out.
+                if self._restore_setback():
+                    self.action_changed.emit(
+                        "Flash off — restoring drive before filament")
+                    return
             self._start_pulse_ramp(charge)
         else:
             # Forced (target-mode) policy can't correct in the needed direction.
@@ -625,7 +645,12 @@ class ChargeController(QObject):
             self.action_changed.emit("Flash lamp not connected!")
             return
         if not self._flash_on:
-            self._park_setback("flash")
+            if self._park_setback("flash"):
+                # The drive just stepped down — let the lock-in settle before
+                # firing.  A later poll re-enters here with the park already
+                # done (idempotent) and proceeds to enable.
+                self.action_changed.emit("Drive parked — settling before flash")
+                return
             # Program the device settings, then turn on.
             for name, arg in (("set_flash_rate", self._flash_rate_hz),
                               ("set_electrode_voltage", self._flash_ctrl_v)):
@@ -638,8 +663,12 @@ class ChargeController(QObject):
             try:
                 self._flashlamp.enable()
             except Exception as e:
-                self.action_changed.emit(f"Flash lamp error: {e}")
-                self._restore_setback()
+                # Treat a failed actuation as unrecoverable and end the run:
+                # stop() restores the drive once and disarms.  Retrying instead
+                # would park → settle → fail → restore → settle → park … and
+                # oscillate the drive (kicking the lock-in each cycle) until the
+                # watchdog timeout, making no progress.
+                self.stop(f"Flash lamp error: {e}")
                 return
             self._flash_on = True
             self._flash_ref_charge = charge
@@ -687,7 +716,11 @@ class ChargeController(QObject):
             if not hasattr(self._filament, "hold_ssr_on"):
                 self.action_changed.emit("Filament actuator has no power-ramp support")
                 return
-            self._park_setback()
+            if self._park_setback():
+                # Drive just stepped down — settle before heating.  A later poll
+                # re-enters with the park already done and starts the ramp.
+                self.action_changed.emit("Drive parked — settling before filament")
+                return
             try:
                 if ramp.easyramp_ms > 0 and hasattr(self._filament, "set_power_easyramp"):
                     self._filament.set_power_easyramp(ramp.easyramp_ms, True)
@@ -706,7 +739,9 @@ class ChargeController(QObject):
         if not hasattr(self._filament, "fire_pulse"):
             self.action_changed.emit("Filament actuator has no pulse support")
             return
-        self._park_setback()
+        if self._park_setback():
+            self.action_changed.emit("Drive parked — settling before filament")
+            return
         self._pulse_runner = PulseRampRunner(ramp, condition=cond)
         self._current_action = Action.HEAT
         self.action_changed.emit(
@@ -754,8 +789,12 @@ class ChargeController(QObject):
                           f"{self._target_charge:+.1f} e — filament can't raise it")
             elif self._mode == "target":
                 # Auto: overshot below the band; the next poll re-decides and
-                # flashes the charge back up toward the target.
+                # flashes the charge back up toward the target.  Restore the
+                # drive first so the correcting flash re-parks under its OWN
+                # per-tool gate — otherwise a "Filament only" setback would
+                # leave the drive parked low through the whole flash.
                 self._current_action = Action.NONE
+                self._restore_setback()
                 self.action_changed.emit(
                     f"Filament overshot to {charge:+.1f} e — correcting with flash")
             else:
@@ -818,19 +857,35 @@ class ChargeController(QObject):
             self.stop(f"Reached target: {charge:+.1f} e "
                       f"(target {self._target_charge:+.1f})")
 
-    def _park_setback(self, tool: str = "filament"):
+    def _park_setback(self, tool: str = "filament") -> bool:
+        """Park the drive for `tool`.  True if the amplitude actually changed —
+        the caller must then defer actuation until the settle has elapsed."""
         if self._setback is not None:
             try:
-                self._setback.park(tool)
+                return bool(self._setback.park(tool))
             except Exception:
                 pass
+        return False
 
-    def _restore_setback(self):
+    def _restore_setback(self) -> bool:
         if self._setback is not None:
             try:
-                self._setback.restore()
+                return bool(self._setback.restore())
             except Exception:
                 pass
+        return False
+
+    def _settle_remaining(self) -> float:
+        """Seconds left of the post-drive-change lock-in settle (0 if none)."""
+        if self._setback is None:
+            return 0.0
+        fn = getattr(self._setback, "settle_remaining", None)
+        if fn is None:
+            return 0.0
+        try:
+            return float(fn())
+        except Exception:
+            return 0.0
 
     def _stop_all_actuators(self):
         """Disable both actuators (safe to call even if not active)."""
